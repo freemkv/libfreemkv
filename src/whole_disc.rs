@@ -43,6 +43,7 @@ pub(crate) fn prepare_decrypted_names<S: SectorSource>(
     mut reader: PreparedReader<S>,
     require_udf: bool,
 ) -> Result<PreparedReader<S>> {
+    reader.decrypted_names = true;
     // Clear/CSS readers also accept generic sector sources. Only a known positive
     // capacity can rule out the anchor at LBA 256; zero means unknown.
     if !require_udf && matches!(reader.capacity_sectors(), 1..=256) {
@@ -249,6 +250,8 @@ pub struct UnitAligned<S> {
     inner: S,
     spans: Vec<UnitSpan>,
     name_patches: Vec<crate::udf::SectorBytePatch>,
+    // Under the decrypted-name policy (`prepare_decrypted_names`), applied or not.
+    decrypted_names: bool,
     scratch: Vec<u8>,
     policy: crate::sector::read_stage::ReadPolicy,
     unit: u64,
@@ -260,6 +263,7 @@ impl<S: SectorSource> UnitAligned<S> {
             inner,
             spans,
             name_patches: Vec::new(),
+            decrypted_names: false,
             scratch: Vec::new(),
             unit: UNIT,
             policy: crate::sector::read_stage::ReadPolicy::Recover {
@@ -289,6 +293,10 @@ impl<S: SectorSource> UnitAligned<S> {
     pub(crate) fn with_name_patches(mut self, patches: Vec<crate::udf::SectorBytePatch>) -> Self {
         self.name_patches = patches;
         self
+    }
+
+    pub(crate) fn decrypted_names(&self) -> bool {
+        self.decrypted_names
     }
 
     pub(crate) fn walk(
@@ -329,9 +337,6 @@ impl<S: SectorSource> UnitAligned<crate::sector::DecryptingSectorSource<S>> {
     }
     pub(crate) fn observe(&mut self, ctx: &crate::ctx::Ctx) {
         self.inner.observe(ctx);
-    }
-    pub(crate) fn decrypts_aacs(&self) -> bool {
-        self.inner.decrypts_aacs()
     }
     pub(crate) fn blanked_counter(&self) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
         self.inner.blanked_counter()

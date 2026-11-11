@@ -76,6 +76,13 @@ fn clear_whole_disc_names_extraction_preserves_payload() {
     assert!(result.complete);
     assert_eq!(result.bytes_lost(), 0);
     assert_eq!(result.files.len(), 2);
+    assert_eq!(
+        result.names,
+        Some(crate::whole_disc::DecryptedNames::Renamed {
+            mirror_sectors_restored: 0
+        }),
+        "the rename is reported"
+    );
     assert!(!dest.path().join("AACS").exists());
     assert_eq!(
         std::fs::read(dest.path().join("SCAA/Unit_Key_RO.inf")).unwrap(),

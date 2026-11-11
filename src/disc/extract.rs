@@ -233,8 +233,8 @@ impl Disc {
             }
         }
 
-        // Only a decrypted AACS copy renames.
-        if !result.halted && self.aacs.is_some() && reader.decrypts_aacs() {
+        // Only a copy read under the decrypted-name policy renames (never a raw one).
+        if !result.halted && reader.decrypted_names() {
             result.names = host_names(&fs, sink.dest(), &mut result.files);
         }
         result.complete = !result.halted
