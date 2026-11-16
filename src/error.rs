@@ -328,6 +328,8 @@ pub const E_STAGED_COPY_SIZE_MISMATCH: u16 = 9080;
 pub const E_WORKER_LOST: u16 = 9081;
 /// A requested audio/subtitle language tag resolves to no known language.
 pub const E_STREAM_LANGUAGE_UNKNOWN: u16 = 9083;
+/// Requested stream position is outside the scanned class list.
+pub const E_STREAM_INDEX_OUT_OF_RANGE: u16 = 9087;
 /// A remux target already exists and replacing it was not requested.
 pub const E_REMUX_TARGET_EXISTS: u16 = 9084;
 /// A mux was opened with a zero read batch (`MuxOptions::default()`), which reads nothing.
@@ -968,6 +970,12 @@ pub enum Error {
     WorkerLost {
         op: &'static str,
     },
+    /// One-based stream position outside the scanned class list.
+    StreamIndexOutOfRange {
+        class: String,
+        requested: usize,
+        count: usize,
+    },
     /// `tag` is the caller's unresolvable language tag, verbatim.
     StreamLanguageUnknown {
         tag: String,
@@ -1157,6 +1165,7 @@ impl Error {
             Error::RemuxStagingInvalid => E_REMUX_STAGING_INVALID,
             Error::StagedCopySizeMismatch { .. } => E_STAGED_COPY_SIZE_MISMATCH,
             Error::WorkerLost { .. } => E_WORKER_LOST,
+            Error::StreamIndexOutOfRange { .. } => E_STREAM_INDEX_OUT_OF_RANGE,
             Error::StreamLanguageUnknown { .. } => E_STREAM_LANGUAGE_UNKNOWN,
             Error::RemuxTargetExists { .. } => E_REMUX_TARGET_EXISTS,
             Error::MuxBatchSectorsZero => E_MUX_BATCH_SECTORS_ZERO,
@@ -1368,6 +1377,11 @@ impl std::fmt::Display for Error {
                 write!(f, "E{}: {have}/{want}", self.code())
             }
             // `tag` is raw user input: escape control characters.
+            Error::StreamIndexOutOfRange {
+                class,
+                requested,
+                count,
+            } => write!(f, "E{}: {class} {requested} ({count})", self.code()),
             Error::StreamLanguageUnknown { tag } => {
                 write!(f, "E{}: {}", self.code(), tag.escape_debug())
             }
@@ -1506,6 +1520,7 @@ impl From<Error> for std::io::Error {
             // Remux/engine codes keep the kinds their io::Error texts carried.
             E_REMUX_VERIFY_FAILED | E_STAGED_COPY_SIZE_MISMATCH => std::io::ErrorKind::InvalidData,
             E_REMUX_STAGING_INVALID
+            | E_STREAM_INDEX_OUT_OF_RANGE
             | E_STREAM_LANGUAGE_UNKNOWN
             | E_MUX_BATCH_SECTORS_ZERO
             | E_SELECTION_REVIEW_REQUIRED => std::io::ErrorKind::InvalidInput,

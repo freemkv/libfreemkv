@@ -1197,3 +1197,16 @@ fn mux_track_range_display_is_track_slash_tracks() {
     let expected = format!("E{}: 5/3", E_MUX_TRACK_RANGE);
     assert_eq!(e.to_string(), expected);
 }
+
+#[test]
+fn stream_index_range_error_is_invalid_input() {
+    let error = Error::StreamIndexOutOfRange {
+        class: "audio".into(),
+        requested: 99,
+        count: 2,
+    };
+    assert_eq!(error.code(), 9087);
+    assert_eq!(error.to_string(), "E9087: audio 99 (2)");
+    let io: std::io::Error = error.into();
+    assert_eq!(io.kind(), std::io::ErrorKind::InvalidInput);
+}
