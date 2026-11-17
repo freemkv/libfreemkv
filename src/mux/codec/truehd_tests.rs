@@ -1341,3 +1341,51 @@ fn an_access_unit_carries_the_source_of_the_packet_it_began_in() {
         "the unit belongs to the packet its FIRST byte came from"
     );
 }
+
+#[test]
+fn major_sync_header_size_needs_every_declared_byte() {
+    let ms = |len: usize, ext: bool, n: u8| {
+        let mut v = vec![0u8; len];
+        if ext && len > 26 {
+            v[25] = 1;
+            v[26] = n << 4;
+        }
+        v
+    };
+    assert_eq!(mlp_major_sync_header_size(&ms(27, false, 0)), None);
+    assert_eq!(mlp_major_sync_header_size(&ms(28, false, 0)), Some(28));
+    assert_eq!(mlp_major_sync_header_size(&ms(40, false, 0)), Some(28));
+    // Extension flag: 28 + 2 + 2 * extensions.
+    assert_eq!(mlp_major_sync_header_size(&ms(33, true, 2)), None);
+    assert_eq!(mlp_major_sync_header_size(&ms(34, true, 2)), Some(34));
+    assert_eq!(mlp_major_sync_header_size(&ms(30, true, 0)), Some(30));
+}
+
+#[test]
+fn major_sync_crc_needs_the_whole_header_present() {
+    let au = valid_major_sync();
+    let ms = &au[4..32];
+    assert!(
+        mlp_major_sync_crc_ok(ms, 28),
+        "exactly the header, nothing after"
+    );
+    assert!(!mlp_major_sync_crc_ok(&ms[..27], 28), "one byte short");
+    assert!(!mlp_major_sync_crc_ok(ms, 3), "no room for a trailer");
+    assert!(
+        mlp_major_sync_crc_ok(&au[4..], 28),
+        "bytes after the header are ignored"
+    );
+}
+
+#[test]
+fn au_parity_window_must_lie_inside_the_au() {
+    // Header nibble check: [0x0F, 0, 0, 0] with an all-zero 2-byte directory folds to 0xF.
+    let au = [0x0F, 0, 0, 0, 0, 0];
+    assert!(mlp_parity_ok(&au, 4, 2));
+    assert!(!mlp_parity_ok(&au[..5], 4, 2), "directory cut short");
+    assert!(!mlp_parity_ok(&[0u8; 6], 4, 2), "nibbles that fold to zero");
+    assert!(
+        mlp_parity_ok(&[0x0F, 0, 0, 0, 0, 0, 9, 9], 4, 2),
+        "trailing payload is outside"
+    );
+}
