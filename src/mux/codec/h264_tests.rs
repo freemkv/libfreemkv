@@ -1844,7 +1844,7 @@ fn vui_bits(
     match reorder {
         Some(r) => {
             s += &format!(
-                "100{}{}{}",
+                "10{}{}{}",
                 ue_bits(0).repeat(4),
                 ue_bits(r),
                 ue_bits(r + 2)
