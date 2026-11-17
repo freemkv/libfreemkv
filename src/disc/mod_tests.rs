@@ -6107,3 +6107,81 @@ fn clear_dvd_aliases_scan_and_prepare_whole_disc() {
     );
     assert_eq!(sector, [0; 2048]);
 }
+
+#[test]
+fn audio_layout_names_every_full_and_lfe_pair() {
+    use AudioChannels as A;
+    for (full, lfe, want) in [
+        (1, 0, A::Mono),
+        (2, 0, A::Stereo),
+        (2, 1, A::Stereo21),
+        (3, 0, A::Surround30),
+        (3, 1, A::Surround31),
+        (4, 0, A::Quad),
+        (4, 1, A::Surround41),
+        (5, 0, A::Surround50),
+        (5, 1, A::Surround51),
+        (6, 0, A::Surround60),
+        (6, 1, A::Surround61),
+        (7, 0, A::Surround70),
+        (7, 1, A::Surround71),
+        (0, 0, A::Unknown),
+        (1, 1, A::Unknown),
+        (8, 0, A::Unknown),
+        (7, 2, A::Unknown),
+    ] {
+        assert_eq!(A::from_layout(full, lfe), want, "{full}.{lfe}");
+    }
+}
+
+#[test]
+fn only_mpeg_program_stream_formats_are_program_streams() {
+    assert!(ContentFormat::MpegPs.is_program_stream());
+    assert!(ContentFormat::DvdPs.is_program_stream());
+    assert!(!ContentFormat::BdTs.is_program_stream());
+}
+
+fn chaptered(dur: f64, marks: &[f64]) -> DiscTitle {
+    DiscTitle {
+        duration_secs: dur,
+        chapters: marks
+            .iter()
+            .enumerate()
+            .map(|(i, &t)| Chapter {
+                time_secs: t,
+                name: (i + 1).to_string(),
+            })
+            .collect(),
+        ..bd_title("00800.mpls", 800, dur, 1, &["00001"])
+    }
+}
+
+#[test]
+fn a_complete_feature_has_a_chapter_table_spanning_half_its_runtime() {
+    assert!(is_complete_feature_presentation(&chaptered(
+        100.0,
+        &[0.0, 50.0]
+    )));
+    assert!(is_complete_feature_presentation(&chaptered(
+        100.0,
+        &[10.0, 60.0, 99.0]
+    )));
+    // Span just under half the runtime.
+    assert!(!is_complete_feature_presentation(&chaptered(
+        100.0,
+        &[0.0, 49.0]
+    )));
+    // Late clustered marks span nothing even though their times are large.
+    assert!(!is_complete_feature_presentation(&chaptered(
+        100.0,
+        &[40.0, 50.0]
+    )));
+    // One mark, or none, is not a chapter table.
+    assert!(!is_complete_feature_presentation(&chaptered(100.0, &[0.0])));
+    assert!(!is_complete_feature_presentation(&chaptered(100.0, &[])));
+    // No runtime: nothing to span.
+    assert!(!is_complete_feature_presentation(&chaptered(
+        0.0,
+        &[0.0, 0.0]
+    )));
+}
