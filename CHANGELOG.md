@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.8.10] — UNRELEASED
+
+### Added
+
+- Structured E9087 errors carry the stream class, requested position and available count.
+
+### Changed
+
+- Updated the locked rustix dependency to 1.1.6.
+
+### Testing
+
+- Guarded encrypted folders with no complete probe unit and MP2 frames with differing prediction modes across subband groups.
+
 ## [1.8.9] — 2026-11-11
 
 ### Added
