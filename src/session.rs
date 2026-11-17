@@ -625,10 +625,7 @@ fn probe_folder_encryption(reader: &mut dyn SectorSource, disc: &Disc) -> Result
     // Nothing was sampled (title shorter than one aligned unit) — no evidence either
     // way. "Not encrypted" is the dangerous default: it would clear an `AACS`-directory
     // verdict and rip ciphertext as video at exit 0. Keep the structural verdict instead.
-    if sampled == 0 {
-        return Ok(true);
-    }
-    Ok(false)
+    Ok(sampled == 0)
 }
 
 #[cfg(test)]
