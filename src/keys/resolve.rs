@@ -1434,3 +1434,7 @@ fn build(
     ranges.sort_unstable_by_key(|r| r.0);
     inner.map = Arc::new(AacsKeyMap::from_ranges_phased(ranges));
 }
+
+#[cfg(test)]
+#[path = "resolve_tests.rs"]
+mod tests;

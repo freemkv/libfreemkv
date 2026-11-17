@@ -399,3 +399,23 @@ fn an_audio_frame_that_fits_goes_whole() {
         "a frame no PES holds spans"
     );
 }
+
+#[test]
+fn lpcm_unit_is_the_packed_byte_size_of_one_unit() {
+    use crate::mux::codec::lpcm::dvd_unit_frames;
+    for ch in [1usize, 2, 3, 5, 6, 8] {
+        let f = dvd_unit_frames(ch, 24);
+        assert_eq!(lpcm_unit_for_test(ch, 16), 2 * ch, "16-bit, {ch} ch");
+        assert_eq!(lpcm_unit_for_test(ch, 24), f * ch * 3, "24-bit, {ch} ch");
+        assert_eq!(
+            lpcm_unit_for_test(ch, 20),
+            f * ch * 5 / 2,
+            "20-bit, {ch} ch"
+        );
+    }
+}
+
+#[test]
+fn a_non_lpcm_payload_has_unit_one() {
+    assert_eq!(lpcm_unit(Payload::Plain, 24), 1);
+}

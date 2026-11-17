@@ -4312,3 +4312,240 @@ fn icb_extents_reject_an_aed_whose_l_ad_overruns_the_block() {
     let res = fs.read_icb_extents(&mut reader, 5);
     assert!(res.is_err(), "overrunning L_AD accepted: {res:?}");
 }
+
+// ── decode_metadata_file_extents ────────────────────────────────────────────
+
+const MD_PART: u32 = 1000;
+const MD_FE_LBA: u32 = 77;
+
+fn md_read(fe: &[u8; 2048]) -> Result<(Vec<(u32, u32)>, u32)> {
+    decode_metadata_file_extents(fe, MD_PART, MD_FE_LBA, false)
+}
+
+fn md_bounded(fe: &[u8; 2048]) -> Result<(Vec<(u32, u32)>, u32)> {
+    decode_metadata_file_extents(fe, MD_PART, MD_FE_LBA, true)
+}
+
+fn assert_bad(r: Result<(Vec<(u32, u32)>, u32)>) {
+    match r {
+        Err(Error::DiscRead { sector, .. }) => assert_eq!(sector, u64::from(MD_FE_LBA)),
+        other => panic!("expected DiscRead, got {other:?}"),
+    }
+}
+
+#[test]
+fn metadata_extents_short_ads_are_absolute_and_rounded_up() {
+    let fe = build_efe(0, &[(0, 4096, 10), (0, 3000, 30)]);
+    assert_eq!(md_read(&fe).unwrap(), (vec![(1010, 2), (1030, 2)], 4096));
+}
+
+#[test]
+fn metadata_extents_first_ad_may_be_empty_a_later_empty_ad_ends_the_map() {
+    let fe = build_efe(0, &[(0, 0, 10)]);
+    assert_eq!(md_read(&fe).unwrap(), (vec![(1010, 0)], 0));
+    let fe = build_efe(0, &[(0, 2048, 10), (0, 0, 20), (0, 2048, 30)]);
+    assert_eq!(md_read(&fe).unwrap(), (vec![(1010, 1)], 2048));
+}
+
+#[test]
+fn metadata_extents_hold_only_recorded_ads() {
+    assert_bad(md_read(&build_efe(0, &[(1, 2048, 10)])));
+    let fe = build_efe(0, &[(0, 2048, 10), (1, 2048, 20), (0, 2048, 30)]);
+    assert_eq!(md_read(&fe).unwrap(), (vec![(1010, 1)], 2048));
+}
+
+#[test]
+fn metadata_extents_position_overflow_is_refused() {
+    let fe = build_efe(0, &[(0, 2048, u32::MAX)]);
+    match md_read(&fe) {
+        Err(Error::DiscRead { sector, .. }) => assert_eq!(sector, u64::from(MD_PART)),
+        other => panic!("expected DiscRead, got {other:?}"),
+    }
+}
+
+#[test]
+fn metadata_extents_read_path_honours_l_ad_but_keeps_the_first_ad() {
+    let mut fe = build_efe(0, &[(0, 2048, 10), (0, 2048, 20)]);
+    fe[212..216].copy_from_slice(&0u32.to_le_bytes());
+    assert_eq!(
+        md_read(&fe).unwrap().0,
+        vec![(1010, 1)],
+        "L_AD 0 still reads one AD"
+    );
+    fe[212..216].copy_from_slice(&8u32.to_le_bytes());
+    assert_eq!(
+        md_read(&fe).unwrap().0,
+        vec![(1010, 1)],
+        "L_AD names one AD"
+    );
+    fe[212..216].copy_from_slice(&16u32.to_le_bytes());
+    assert_eq!(md_read(&fe).unwrap().0.len(), 2);
+}
+
+#[test]
+fn metadata_extents_read_path_clamps_l_ad_to_the_sector() {
+    let ads: Vec<(u32, u32, u32)> = (0..229).map(|i| (0, 2048, i + 1)).collect();
+    let mut fe = build_efe(0, &ads);
+    fe[212..216].copy_from_slice(&u32::MAX.to_le_bytes());
+    let (ex, _) = md_read(&fe).unwrap();
+    assert_eq!(ex.len(), 229, "(2048 - 216) / 8 descriptors fit");
+    assert_eq!(ex[228], (MD_PART + 229, 1));
+}
+
+#[test]
+fn metadata_extents_ad_types() {
+    // Type 3 (embedded) never carries extents.
+    let mut fe = build_efe(0, &[(0, 2048, 10)]);
+    fe[34] = 3;
+    assert_bad(md_read(&fe));
+    assert_bad(md_bounded(&fe));
+    // Unknown types read as short ADs on the read path, and are refused when bounded.
+    fe[34] = 5;
+    assert_eq!(md_read(&fe).unwrap().0, vec![(1010, 1)]);
+    assert_bad(md_bounded(&fe));
+    // Type 2 (extended AD, 20 bytes, position at +12) only on the read path.
+    let mut fe = build_efe(0, &[]);
+    fe[34] = 2;
+    fe[212..216].copy_from_slice(&20u32.to_le_bytes());
+    fe[216..220].copy_from_slice(&4096u32.to_le_bytes());
+    fe[228..232].copy_from_slice(&55u32.to_le_bytes());
+    assert_eq!(md_read(&fe).unwrap(), (vec![(1055, 2)], 4096));
+    assert_bad(md_bounded(&fe));
+}
+
+#[test]
+fn metadata_extents_reject_an_ea_region_past_the_sector() {
+    let mut fe = build_efe(0, &[(0, 2048, 10)]);
+    fe[208..212].copy_from_slice(&5000u32.to_le_bytes());
+    assert_bad(md_read(&fe));
+    fe[208..212].copy_from_slice(&u32::MAX.to_le_bytes());
+    assert_bad(md_read(&fe));
+    // The first AD must fit exactly: one byte more of EA pushes it off the end.
+    fe[208..212].copy_from_slice(&(2048u32 - 216 - 8).to_le_bytes());
+    assert!(md_read(&fe).is_ok());
+    fe[208..212].copy_from_slice(&(2048u32 - 216 - 7).to_le_bytes());
+    assert_bad(md_read(&fe));
+}
+
+#[test]
+fn metadata_extents_bounded_tags_and_l_ad() {
+    let fe = build_efe(2048, &[(0, 2048, 10)]);
+    assert_eq!(md_bounded(&fe).unwrap(), (vec![(1010, 1)], 2048));
+    let mut bad_tag = fe;
+    bad_tag[0..2].copy_from_slice(&100u16.to_le_bytes());
+    assert_bad(md_bounded(&bad_tag));
+    let mut zero = fe;
+    zero[212..216].copy_from_slice(&0u32.to_le_bytes());
+    assert_bad(md_bounded(&zero));
+    let mut ragged = fe;
+    ragged[212..216].copy_from_slice(&7u32.to_le_bytes());
+    assert_bad(md_bounded(&ragged));
+    let mut past = fe;
+    past[212..216].copy_from_slice(&(2048u32 - 216 + 8).to_le_bytes());
+    assert_bad(md_bounded(&past));
+    // L_AD reaching exactly the end of the sector is in bounds.
+    let mut exact = fe;
+    exact[212..216].copy_from_slice(&(2048u32 - 216).to_le_bytes());
+    assert!(md_bounded(&exact).is_ok());
+}
+
+#[test]
+fn metadata_extents_bounded_tag_261_has_its_ads_at_176() {
+    let mut s = [0u8; 2048];
+    s[0..2].copy_from_slice(&261u16.to_le_bytes());
+    s[56..64].copy_from_slice(&2048u64.to_le_bytes());
+    s[168..172].copy_from_slice(&0u32.to_le_bytes());
+    s[172..176].copy_from_slice(&8u32.to_le_bytes());
+    s[176..180].copy_from_slice(&2048u32.to_le_bytes());
+    s[180..184].copy_from_slice(&9u32.to_le_bytes());
+    assert_eq!(md_bounded(&s).unwrap(), (vec![(1009, 1)], 2048));
+}
+
+#[test]
+fn metadata_extents_bounded_clip_to_the_information_length() {
+    // Three sectors recorded across two ADs; the second AD's run is clipped to what is left.
+    let fe = build_efe(3 * 2048, &[(0, 2048, 10), (0, 8192, 20)]);
+    assert_eq!(md_bounded(&fe).unwrap().0, vec![(1010, 1), (1020, 2)]);
+    // A single AD longer than the file is clipped.
+    let fe = build_efe(2048, &[(0, 8192, 10)]);
+    assert_eq!(md_bounded(&fe).unwrap().0, vec![(1010, 1)]);
+    // Remaining runs out after the first AD: the second is never read.
+    let fe = build_efe(2048, &[(0, 2048, 10), (0, 2048, 20)]);
+    assert_eq!(md_bounded(&fe).unwrap().0, vec![(1010, 1)]);
+}
+
+#[test]
+fn metadata_extents_bounded_stop_at_a_partial_or_empty_sector() {
+    let fe = build_efe(5 * 2048, &[(0, 3000, 10), (0, 2048, 20)]);
+    assert_eq!(
+        md_bounded(&fe).unwrap().0,
+        vec![(1010, 1)],
+        "ragged length ends the map"
+    );
+    let fe = build_efe(5 * 2048, &[(0, 100, 10), (0, 2048, 20)]);
+    assert!(
+        md_bounded(&fe).unwrap().0.is_empty(),
+        "under a sector ends the map"
+    );
+}
+
+#[test]
+fn metadata_extents_bounded_long_ads_must_address_partition_zero() {
+    let mut fe = build_efe_long(2048, &[(0, 2048, 10)]);
+    assert_eq!(md_bounded(&fe).unwrap().0, vec![(1010, 1)]);
+    fe[216 + 8] = 1;
+    assert!(
+        md_bounded(&fe).unwrap().0.is_empty(),
+        "another partition's AD ends the map"
+    );
+    let mut fe = build_efe_long(2048, &[(0, 2048, 10)]);
+    fe[216 + 9] = 1;
+    assert!(md_bounded(&fe).unwrap().0.is_empty());
+}
+
+fn lvd_with_map(map: usize) -> [u8; SECTOR_BYTES] {
+    let mut l = [0u8; SECTOR_BYTES];
+    l[map] = 2;
+    l[map + 1] = 64;
+    l[map + 5..map + 28].copy_from_slice(b"*UDF Metadata Partition");
+    l[map + 40..map + 44].copy_from_slice(&0x0102_0304u32.to_le_bytes());
+    l
+}
+
+#[test]
+fn metadata_file_location_reads_the_le_block_at_offset_40() {
+    let l = lvd_with_map(100);
+    assert_eq!(metadata_file_location(&l, 100), Some(0x0102_0304));
+    assert_eq!(
+        metadata_file_location(&l, 101),
+        None,
+        "identifier not at +5"
+    );
+}
+
+#[test]
+fn metadata_file_location_needs_the_whole_64_byte_map_in_the_sector() {
+    let last = SECTOR_BYTES - 64;
+    let l = lvd_with_map(last);
+    assert_eq!(metadata_file_location(&l, last), Some(0x0102_0304));
+    assert_eq!(metadata_file_location(&l, last + 1), None);
+    assert_eq!(metadata_file_location(&l, usize::MAX), None);
+}
+
+#[test]
+fn metadata_partition_map_checks_type_length_and_identifier() {
+    let l = lvd_with_map(100);
+    assert!(metadata_partition_map(&l, 100));
+    let mut t = l;
+    t[100] = 1;
+    assert!(!metadata_partition_map(&t, 100), "not a Type 2 map");
+    let mut n = l;
+    n[101] = 63;
+    assert!(!metadata_partition_map(&n, 100), "not 64 bytes long");
+    let mut id = l;
+    id[105] = b'X';
+    assert!(
+        !metadata_partition_map(&id, 100),
+        "not the metadata identifier"
+    );
+}
