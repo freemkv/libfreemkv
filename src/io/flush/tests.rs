@@ -1015,3 +1015,86 @@ fn every_wait_failure_is_a_distinct_error() {
     let lost = wait_failure(BoundedError::WorkerLost, "t");
     assert_eq!(error_code(&lost), Some(E_SYNC_WORKER_LOST));
 }
+
+#[test]
+fn next_size_halves_when_slow_doubles_when_fast_and_holds_between() {
+    let slow = Duration::from_secs(8);
+    let (min, max) = (1000, 16_000);
+    // Slower than `slow` halves, never below the floor.
+    assert_eq!(
+        next_size(8000, slow + Duration::from_millis(1), slow, min, max),
+        4000
+    );
+    assert_eq!(
+        next_size(1500, Duration::from_secs(60), slow, min, max),
+        1000
+    );
+    // Exactly `slow` is not slow: it falls in the hold band.
+    assert_eq!(next_size(8000, slow, slow, min, max), 8000);
+    // Under a quarter of `slow` doubles, never above the ceiling.
+    assert_eq!(
+        next_size(4000, Duration::from_secs(1), slow, min, max),
+        8000
+    );
+    assert_eq!(
+        next_size(12_000, Duration::from_secs(1), slow, min, max),
+        16_000
+    );
+    assert_eq!(next_size(u64::MAX, Duration::ZERO, slow, min, max), 16_000);
+    // Exactly a quarter holds; between a quarter and `slow` holds.
+    assert_eq!(next_size(4000, slow / 4, slow, min, max), 4000);
+    assert_eq!(
+        next_size(4000, Duration::from_secs(5), slow, min, max),
+        4000
+    );
+    // A ceiling under the floor never shrinks the size below the floor.
+    assert_eq!(next_size(1000, Duration::ZERO, slow, 1000, 10), 1000);
+}
+
+struct SeqOps(Mutex<std::collections::VecDeque<Option<u64>>>);
+
+impl FlushOps for SeqOps {
+    fn chunk(&self, _: &File) -> io::Result<()> {
+        Ok(())
+    }
+    fn range(&self, _: &File, _: u64, _: u64) -> Option<io::Result<()>> {
+        None
+    }
+    fn finish(&self, _: &File) -> io::Result<()> {
+        Ok(())
+    }
+    fn sample(&self) -> Option<u64> {
+        self.0.lock().unwrap().pop_front().flatten()
+    }
+}
+
+#[test]
+fn sampler_reports_only_increases_between_samples() {
+    let ops = SeqOps(Mutex::new(
+        [Some(100), Some(130), Some(130), None, Some(120), Some(125)].into(),
+    ));
+    let mut s = Sampler::new(Duration::ZERO, Duration::from_secs(3600));
+    assert_eq!(
+        s.tick(&ops),
+        None,
+        "the first sample has nothing to compare to"
+    );
+    assert_eq!(s.tick(&ops), Some(30));
+    assert_eq!(s.tick(&ops), None, "no movement");
+    assert_eq!(s.tick(&ops), None, "no counter available");
+    assert_eq!(s.tick(&ops), None, "a counter that went down");
+    assert_eq!(s.tick(&ops), Some(5), "measured from the last sample");
+}
+
+#[test]
+fn sampler_waits_out_its_interval() {
+    let ops = SeqOps(Mutex::new([Some(1), Some(9)].into()));
+    let mut s = Sampler::new(Duration::from_secs(3600), Duration::from_secs(3600));
+    assert_eq!(s.tick(&ops), None);
+    assert_eq!(s.tick(&ops), None);
+    assert_eq!(
+        ops.0.lock().unwrap().len(),
+        2,
+        "the counter was not sampled early"
+    );
+}
