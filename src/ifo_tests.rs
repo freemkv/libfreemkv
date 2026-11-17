@@ -2731,3 +2731,54 @@ fn command_work_bound_shared_256_pgc_table_keeps_all_99_titles() {
     }
     assert_eq!(data, before);
 }
+
+// ── PGC command flow ────────────────────────────────────────────────────────
+
+const NOP: [u8; 8] = [0; 8];
+const BREAK: [u8; 8] = [0x00, 0x02, 0, 0, 0, 0, 0, 0];
+// LinkPGN 5: picks an entry point other than the first.
+const LINK_ELSEWHERE: [u8; 8] = [0x20, 0x06, 0, 0, 0, 0, 0, 5];
+
+#[test]
+fn set_nvtmr_leaves_but_other_set_commands_only_link() {
+    // Set-command type 2 with op 2 (SetNVTMR) sends playback to another PGC.
+    assert!(command_flow(&[0x42, 0, 0, 0, 0, 0, 0, 0]) == Flow::Leaves);
+    // Any other op of that type does nothing unless its link nibble says so.
+    assert!(command_flow(&[0x41, 0, 0, 0, 0, 0, 0, 0]) == Flow::Stays);
+    assert!(command_flow(&[0x41, 0x06, 0, 0, 0, 0, 0, 5]) == Flow::EntersPgc);
+}
+
+#[test]
+fn a_conditional_or_tmp_pml_command_can_fall_through_to_the_next() {
+    // A conditional goto may not be taken, so the command after it is reachable.
+    let cond_goto = [0x00, 0x11, 0, 0, 0, 0, 0, 3];
+    assert!(may_start_at_first_cell(&[cond_goto, BREAK, LINK_ELSEWHERE]));
+    // SetTmpPML (goto nibble 3) always continues, whatever its line says.
+    let tmp_pml = [0x00, 0x03, 0, 0, 0, 0, 0, 3];
+    assert!(may_start_at_first_cell(&[tmp_pml, BREAK, LINK_ELSEWHERE]));
+    // An unconditional goto only jumps.
+    let goto = [0x00, 0x01, 0, 0, 0, 0, 0, 3];
+    assert!(!may_start_at_first_cell(&[goto, BREAK, LINK_ELSEWHERE]));
+    // Break ends the commands, as does running off the end.
+    assert!(may_start_at_first_cell(&[BREAK]));
+    assert!(may_start_at_first_cell(&[]));
+    assert!(may_start_at_first_cell(&[NOP]));
+    // An unconditional link to another entry point is a dead end; to program 1 it is not.
+    assert!(!may_start_at_first_cell(&[LINK_ELSEWHERE, BREAK]));
+    assert!(may_start_at_first_cell(&[[0x20, 0x06, 0, 0, 0, 0, 0, 1]]));
+}
+
+#[test]
+fn command_table_must_fit_the_data() {
+    // One pre and one post command, no cell commands, table at PGC + 0x100.
+    let mut data = vec![0u8; 0x100 + 8 + 16];
+    data[0xE4..0xE6].copy_from_slice(&0x100u16.to_be_bytes());
+    data[0x100..0x106].copy_from_slice(&[0, 1, 0, 1, 0, 0]);
+    data[0x108..0x110].copy_from_slice(&BREAK);
+    assert_eq!(command_flow_in_order(&data, 0), Some(false));
+    // One byte short of the post command.
+    assert_eq!(command_flow_in_order(&data[..data.len() - 1], 0), None);
+    // No command table at all: the PGC plays no commands.
+    data[0xE4..0xE6].copy_from_slice(&0u16.to_be_bytes());
+    assert_eq!(command_flow_in_order(&data, 0), Some(false));
+}
