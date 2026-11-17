@@ -1210,3 +1210,171 @@ fn stream_index_range_error_is_invalid_input() {
     let io: std::io::Error = error.into();
     assert_eq!(io.kind(), std::io::ErrorKind::InvalidInput);
 }
+
+#[test]
+fn display_carries_each_variants_structured_fields() {
+    let p = || "/dev/sr0".to_string();
+    let cases: Vec<(Error, String)> = vec![
+        (Error::DeviceNotFound { path: p() }, ": /dev/sr0".into()),
+        (Error::DevicePermission { path: p() }, ": /dev/sr0".into()),
+        (Error::DeviceNotReady { path: p() }, ": /dev/sr0".into()),
+        (Error::DeviceResetFailed { path: p() }, ": /dev/sr0".into()),
+        (
+            Error::ScsiInterfaceUnavailable { path: p() },
+            ": /dev/sr0".into(),
+        ),
+        (
+            Error::DeviceLocked {
+                path: p(),
+                kr: 0x1234,
+            },
+            ": /dev/sr0 0x00001234".into(),
+        ),
+        (
+            Error::IoKitPluginFailed {
+                path: p(),
+                kr: 0xab,
+            },
+            ": /dev/sr0 0x000000ab".into(),
+        ),
+        (
+            Error::UnsupportedPlatform {
+                target: "plan9".into(),
+            },
+            ": plan9".into(),
+        ),
+        (
+            Error::PlatformNotImplemented {
+                platform: "beos".into(),
+            },
+            ": beos".into(),
+        ),
+        (Error::MapfileInvalid { kind: "header" }, ": header".into()),
+        (
+            Error::UnsupportedDrive {
+                vendor_id: " ACME ".into(),
+                product_id: "BD-1 ".into(),
+                product_revision: " 1.0".into(),
+            },
+            ": ACME BD-1 1.0".into(),
+        ),
+        (Error::Halted, "".into()),
+        (
+            Error::SeamPlanDroppedMost {
+                dropped: 9,
+                written: 3,
+            },
+            " 9/3".into(),
+        ),
+        (
+            Error::ShortImageRead {
+                lba: 5,
+                expected: 4,
+                got: 2,
+            },
+            " 5 4 2".into(),
+        ),
+        (Error::DirWriteFailed { errno: None }, "".into()),
+        (Error::DirWriteFailed { errno: Some(28) }, ": 28".into()),
+        (
+            Error::StreamUrlInvalid { url: "x://".into() },
+            ": x://".into(),
+        ),
+        (
+            Error::StreamUrlMissingPath {
+                scheme: "tcp".into(),
+            },
+            ": tcp".into(),
+        ),
+        (
+            Error::StreamUrlMissingPort { addr: "h".into() },
+            ": h".into(),
+        ),
+        (
+            Error::NetworkAddrBlocked {
+                addr: "0.0.0.0".into(),
+            },
+            ": 0.0.0.0".into(),
+        ),
+        (Error::PesFrameTooLarge { size: 77 }, ": 77".into()),
+        (Error::PesTrackTooLarge { track: 300 }, ": 300".into()),
+        (
+            Error::IsoTooLarge {
+                path: "a.iso".into(),
+            },
+            ": a.iso".into(),
+        ),
+        (
+            Error::InvalidCdbLength { len: 17, max: 16 },
+            ": 17/16".into(),
+        ),
+        (
+            Error::SelectionPidUnknown { pid: 0x1100 },
+            ": 0x1100".into(),
+        ),
+    ];
+    for (e, tail) in cases {
+        assert_eq!(e.to_string(), format!("E{}{}", e.code(), tail), "{e:?}");
+    }
+}
+
+#[test]
+fn io_error_display_is_the_errno_or_kind_name() {
+    let e = Error::IoError {
+        source: std::io::Error::from_raw_os_error(13),
+    };
+    assert_eq!(e.to_string(), format!("E{}: 13", e.code()));
+    let k = Error::IoError {
+        source: std::io::ErrorKind::TimedOut.into(),
+    };
+    assert_eq!(k.to_string(), format!("E{}: TimedOut", k.code()));
+}
+
+#[test]
+fn only_io_error_has_a_source() {
+    let e = Error::IoError {
+        source: std::io::Error::from_raw_os_error(5),
+    };
+    assert!(std::error::Error::source(&e).is_some());
+    assert!(std::error::Error::source(&Error::Halted).is_none());
+}
+
+#[test]
+fn io_kind_mapping_covers_code_blocks_and_named_codes() {
+    use std::io::ErrorKind as K;
+    let kind = |e: Error| std::io::Error::from(e).kind();
+    assert_eq!(kind(Error::UnlockFailed), K::PermissionDenied);
+    assert_eq!(kind(Error::PesTrackTooLarge { track: 1 }), K::InvalidInput);
+    assert_eq!(kind(Error::DiscCapacityOverflow), K::InvalidData);
+    assert_eq!(
+        kind(Error::NetworkAddrBlocked { addr: "x".into() }),
+        K::PermissionDenied
+    );
+    assert_eq!(
+        kind(Error::MuxHeaderBufferExceeded { bytes: 1 }),
+        K::InvalidData
+    );
+    assert_eq!(kind(Error::DirRawRejected), K::InvalidInput);
+    assert_eq!(kind(Error::DirNotEmpty), K::InvalidInput);
+    assert_eq!(kind(Error::DirImageTooLarge), K::InvalidInput);
+    assert_eq!(
+        kind(Error::DirImageFileChanged { path: "p".into() }),
+        K::InvalidData
+    );
+}
+
+#[test]
+fn disc_read_with_a_non_standard_status_is_bridge_degradation() {
+    let e = Error::DiscRead {
+        sector: 7,
+        status: Some(0x05),
+        sense: None,
+    };
+    assert!(e.is_bridge_degradation());
+    let ok = Error::DiscRead {
+        sector: 7,
+        status: Some(0x02),
+        sense: None,
+    };
+    assert!(!ok.is_bridge_degradation());
+}

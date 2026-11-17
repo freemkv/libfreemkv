@@ -691,3 +691,117 @@ fn frame_sizes_cover_versions_layers_and_padding() {
         assert_eq!((h.bytes, h.samples, h.rate), (bytes, samples, rate));
     }
 }
+
+// A free-format header (bitrate_index 0) followed by zeros: no successor sync exists.
+fn free_no_successor(version: u8, layer: u8, len: usize) -> Vec<u8> {
+    let mut f = mpa(version, layer, 0, 0, 0, 0);
+    f.resize(len, 0);
+    f
+}
+
+#[test]
+fn free_format_search_ceilings_are_exact_per_layer() {
+    // (version, layer code, largest legal free-format frame in bytes)
+    for (version, layer, max) in [
+        (3, 3, 1536),
+        (3, 2, 4608),
+        (3, 1, 2597),
+        (2, 1, 1302),
+        (2, 3, 1536),
+    ] {
+        assert!(
+            hdr(&free_no_successor(version, layer, max + 3)).is_none(),
+            "v{version} l{layer}: no successor within {max} is not a header"
+        );
+        let h = hdr(&free_no_successor(version, layer, max + 2));
+        assert_eq!(
+            h.map(|h| h.bytes),
+            Some(max + 3),
+            "v{version} l{layer}: one byte short of the ceiling still waits"
+        );
+    }
+}
+
+#[test]
+fn free_format_bytes_learned_size_waits_then_relearns() {
+    let sync = [0xFF, 0, 0];
+    let with_sync_at = |len: usize, at: usize| {
+        let mut d = vec![0u8; len];
+        d[at..at + 3].copy_from_slice(&sync);
+        d
+    };
+    // Learned size 10: two bytes short of the predicted next header, wait.
+    let mut fs = Some(10);
+    assert_eq!(
+        free_format_bytes(&with_sync_at(12, 6), &mut fs, 0, 100, false),
+        Some(13)
+    );
+    assert_eq!(fs, Some(10), "the learned size stands while waiting");
+    // A full header-width past the prediction with no header there: relearn.
+    let mut fs = Some(10);
+    assert_eq!(
+        free_format_bytes(&with_sync_at(13, 6), &mut fs, 0, 100, false),
+        Some(6)
+    );
+    assert_eq!(fs, Some(6));
+    // Header exactly where predicted.
+    let mut fs = Some(10);
+    assert_eq!(
+        free_format_bytes(&with_sync_at(13, 10), &mut fs, 0, 100, false),
+        Some(10)
+    );
+}
+
+#[test]
+fn free_format_bytes_learned_size_includes_padding_and_eos() {
+    let mut fs = Some(10);
+    let d = vec![0u8; 12];
+    assert_eq!(free_format_bytes(&d, &mut fs, 2, 100, true), Some(12));
+    let mut fs = Some(10);
+    assert_eq!(
+        free_format_bytes(&d[..11], &mut fs, 2, 100, true),
+        Some(12),
+        "at eos, fewer than a frame's bytes waits"
+    );
+}
+
+#[test]
+fn free_format_bytes_learns_size_without_padding() {
+    let mut d = vec![0u8; 20];
+    d[8..11].copy_from_slice(&[0xFF, 0, 0]);
+    let mut fs = None;
+    assert_eq!(free_format_bytes(&d, &mut fs, 2, 100, false), Some(8));
+    assert_eq!(fs, Some(6), "padding is not part of the learned size");
+}
+
+#[test]
+fn free_format_bytes_ceiling_and_eos_boundaries() {
+    let d = |n: usize| vec![0u8; n];
+    assert_eq!(free_format_bytes(&d(23), &mut None, 0, 20, false), None);
+    assert_eq!(free_format_bytes(&d(22), &mut None, 0, 20, false), Some(23));
+    // eos: a lone frame must be longer than its padding plus a header.
+    assert_eq!(free_format_bytes(&d(6), &mut None, 2, 100, true), Some(7));
+    assert_eq!(free_format_bytes(&d(7), &mut None, 2, 100, true), Some(7));
+    assert_eq!(free_format_bytes(&d(9), &mut None, 2, 100, true), Some(9));
+}
+
+#[test]
+fn stream_key_ignores_the_protection_bit() {
+    let a = mpa(3, 1, 9, 0, 0, 0);
+    let mut b = a.clone();
+    b[1] &= !1;
+    assert_ne!(a[1], b[1]);
+    assert_eq!(mpa_stream_key(&a), mpa_stream_key(&b));
+}
+
+#[test]
+fn measured_drop_duration_is_reported_by_the_parser() {
+    let mut p = MpegAudioParser::new();
+    p.parse(&make_pes(mp3_frame(), Some(0)));
+    let mut bad = mp3_frame();
+    bad[1] &= !0b0000_0110;
+    p.parse(&make_pes(bad, None));
+    p.parse(&make_pes(mp3_frame(), Some(3 * 2352)));
+    assert_eq!(p.dropped_frames(), 1);
+    assert!(p.dropped_duration_ns() > 0, "the timestamp gap is measured");
+}
