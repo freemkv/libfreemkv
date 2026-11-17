@@ -1758,3 +1758,319 @@ fn sps_reader_read_ue_thirty_one_leading_zeros_is_still_valid() {
     let mut r = super::SpsReader::new(&data);
     assert_eq!(r.read_ue(), Some(u32::MAX >> 1));
 }
+
+// ── SPS reader / DTS-info parsing, built from bit strings ──────────────────────
+
+fn ue_bits(v: u32) -> String {
+    let code = v + 1;
+    let k = 31 - code.leading_zeros();
+    let suffix = if k == 0 {
+        String::new()
+    } else {
+        format!("{:0w$b}", code & ((1 << k) - 1), w = k as usize)
+    };
+    format!("{}1{}", "0".repeat(k as usize), suffix)
+}
+
+fn se_bits(v: i32) -> String {
+    ue_bits(if v > 0 {
+        2 * v as u32 - 1
+    } else {
+        (-2 * v) as u32
+    })
+}
+
+fn bits_to_bytes(bits: &str) -> Vec<u8> {
+    let padded = format!("{bits:0<w$}", w = bits.len().div_ceil(8) * 8 + 16);
+    padded
+        .as_bytes()
+        .chunks(8)
+        .map(|c| u8::from_str_radix(std::str::from_utf8(c).unwrap(), 2).unwrap())
+        .collect()
+}
+
+fn sps_nal(profile: u8, constraints: u8, level: u8, bits: &str) -> Vec<u8> {
+    let mut v = vec![0x67, profile, constraints, level];
+    v.extend(bits_to_bytes(bits));
+    v
+}
+
+// Everything after the (optional) chroma block, with `vui` appended: sps POC type 2, one
+// ref frame, a 1x1 macroblock frame, no crop.
+fn sps_tail(log2_minus4: u32, vui: Option<&str>) -> String {
+    format!(
+        "{}{}{}{}{}{}{}{}{}",
+        ue_bits(log2_minus4),
+        ue_bits(2),
+        ue_bits(1),
+        "0",
+        ue_bits(0),
+        ue_bits(0),
+        "1",
+        "00",
+        vui.map_or("0".to_string(), |v| format!("1{v}")),
+    )
+}
+
+fn hrd_bits(cpb_cnt_minus1: u32) -> String {
+    let mut s = ue_bits(cpb_cnt_minus1) + "00000000";
+    for _ in 0..=cpb_cnt_minus1 {
+        s += "110";
+    }
+    s + &"0".repeat(20)
+}
+
+fn vui_bits(
+    timing: Option<(u64, u64)>,
+    nal: Option<u32>,
+    vcl: Option<u32>,
+    reorder: Option<u32>,
+) -> String {
+    let mut s = "0000".to_string();
+    match timing {
+        Some((n, t)) => s += &format!("1{n:032b}{t:032b}0"),
+        None => s += "0",
+    }
+    for h in [nal, vcl] {
+        match h {
+            Some(c) => s += &format!("1{}", hrd_bits(c)),
+            None => s += "0",
+        }
+    }
+    if nal.is_some() || vcl.is_some() {
+        s += "0";
+    }
+    s += "0";
+    match reorder {
+        Some(r) => {
+            s += &format!(
+                "100{}{}{}",
+                ue_bits(0).repeat(4),
+                ue_bits(r),
+                ue_bits(r + 2)
+            )
+        }
+        None => s += "0",
+    }
+    s
+}
+
+fn info_of(profile: u8, level: u8, bits: &str) -> Option<SpsDtsInfo> {
+    parse_sps_dts_info(&sps_nal(profile, 0, level, bits))
+}
+
+#[test]
+fn sps_reader_signed_exp_golomb() {
+    for (k, want) in [(0, 0), (1, 1), (2, -1), (3, 2), (4, -2), (5, 3), (6, -3)] {
+        let mut r = SpsReader::new(&bits_to_bytes(&ue_bits(k)));
+        assert_eq!(r.read_se(), Some(want), "code_num {k}");
+    }
+}
+
+#[test]
+fn sps_reader_reads_msb_first_across_bytes() {
+    let mut r = SpsReader::new(&[0xA5, 0x0F]);
+    assert_eq!(r.read_bits(4), Some(0xA));
+    assert_eq!(r.read_bits(8), Some(0x50));
+    assert_eq!(r.read_bits(4), Some(0xF));
+    assert_eq!(r.read_bit(), None);
+}
+
+#[test]
+fn scaling_list_stops_at_a_zero_next_scale() {
+    // delta -8 from 8 makes next_scale 0: the other entries are not coded.
+    let bits = format!("{}1", se_bits(-8));
+    let mut r = SpsReader::new(&bits_to_bytes(&bits));
+    skip_scaling_list(&mut r, 3).unwrap();
+    assert_eq!(
+        r.read_bit(),
+        Some(1),
+        "the marker after the list is untouched"
+    );
+    // +1 then -9 returns next_scale to 0 on the second entry.
+    let bits = format!("{}{}1", se_bits(1), se_bits(-9));
+    let mut r = SpsReader::new(&bits_to_bytes(&bits));
+    skip_scaling_list(&mut r, 3).unwrap();
+    assert_eq!(r.read_bit(), Some(1));
+    // Non-zero deltas read every entry.
+    let bits = format!("{}0", "1".repeat(4));
+    let mut r = SpsReader::new(&bits_to_bytes(&bits));
+    skip_scaling_list(&mut r, 4).unwrap();
+    assert_eq!(r.read_bit(), Some(0));
+}
+
+#[test]
+fn max_dpb_frames_follows_table_a1() {
+    let levels: [(u32, u32); 17] = [
+        (10, 396),
+        (11, 900),
+        (12, 2376),
+        (13, 2376),
+        (20, 2376),
+        (21, 4752),
+        (22, 8100),
+        (30, 8100),
+        (31, 18000),
+        (32, 20480),
+        (40, 32768),
+        (41, 32768),
+        (42, 34816),
+        (50, 110_400),
+        (51, 184_320),
+        (52, 184_320),
+        (60, 696_320),
+    ];
+    for (level, mbs) in levels {
+        // A frame of mbs/8 macroblocks holds eight (and a bit) of them.
+        assert_eq!(
+            max_dpb_frames(100, false, level, mbs / 8, 1),
+            8,
+            "level {level}"
+        );
+        assert_eq!(
+            max_dpb_frames(100, false, level, mbs / 4, 1),
+            4,
+            "level {level}"
+        );
+    }
+    assert_eq!(max_dpb_frames(100, false, 61, 87_040, 1), 8);
+    assert_eq!(max_dpb_frames(100, false, 62, 87_040, 1), 8);
+    assert_eq!(max_dpb_frames(100, false, 99, 4000, 1), 16, "unknown level");
+    assert_eq!(max_dpb_frames(100, false, 40, 0, 1), 16, "empty frame");
+}
+
+#[test]
+fn max_dpb_frames_level_1b() {
+    assert_eq!(max_dpb_frames(66, false, 9, 99, 1), 4);
+    assert_eq!(max_dpb_frames(66, true, 11, 99, 1), 4);
+    assert_eq!(max_dpb_frames(77, true, 11, 99, 1), 4);
+    assert_eq!(max_dpb_frames(88, true, 11, 99, 1), 4);
+    assert_eq!(
+        max_dpb_frames(66, false, 11, 99, 1),
+        9,
+        "set3 clear: level 1.1"
+    );
+    assert_eq!(
+        max_dpb_frames(100, true, 11, 99, 1),
+        9,
+        "High profile has no 1b"
+    );
+}
+
+#[test]
+fn dts_info_frame_num_width_limit() {
+    let ok = format!("1{}", sps_tail(12, None));
+    assert_eq!(info_of(66, 40, &ok).map(|i| i.log2_max_frame_num), Some(16));
+    let bad = format!("1{}", sps_tail(13, None));
+    assert_eq!(info_of(66, 40, &bad), None);
+}
+
+#[test]
+fn dts_info_poc_type_1_cycle_limit() {
+    let sps = |cycle: u32| {
+        let mut b = format!(
+            "1{}{}0{}{}{}",
+            ue_bits(0),
+            ue_bits(1),
+            se_bits(0),
+            se_bits(0),
+            ue_bits(cycle)
+        );
+        b += &"1".repeat(cycle as usize);
+        b += &format!("{}0{}{}1000", ue_bits(1), ue_bits(0), ue_bits(0));
+        b
+    };
+    assert!(info_of(66, 40, &sps(255)).is_some());
+    assert_eq!(info_of(66, 40, &sps(256)), None);
+}
+
+#[test]
+fn dts_info_scaling_matrix_list_sizes_and_count() {
+    let lists = |present: &[usize], n: usize, vui: Option<&str>| {
+        let mut b = format!("1{}{}{}0{}", ue_bits(1), ue_bits(0), ue_bits(0), "1");
+        for i in 0..n {
+            if present.contains(&i) {
+                b += "1";
+                b += &"1".repeat(if i < 6 { 16 } else { 64 });
+            } else {
+                b += "0";
+            }
+        }
+        b + &sps_tail(0, vui)
+    };
+    let want = |reorder| SpsDtsInfo {
+        reorder,
+        log2_max_frame_num: 4,
+        frame_mbs_only: true,
+        separate_colour_plane: false,
+        frame_period_ticks: None,
+    };
+    // Lists 5 (16 entries) and 6 (64 entries): a mis-sized list shifts every later field.
+    assert_eq!(info_of(100, 40, &lists(&[5, 6], 8, None)), Some(want(0)));
+    // A stream that ends right after the 8th list flag is still complete.
+    assert_eq!(info_of(100, 40, &lists(&[], 8, None)), Some(want(0)));
+}
+
+#[test]
+fn dts_info_separate_colour_plane_and_444_scaling_lists() {
+    let head = |plane: &str, scaling: &str| {
+        format!(
+            "1{}{plane}{}{}0{scaling}",
+            ue_bits(3),
+            ue_bits(0),
+            ue_bits(0)
+        )
+    };
+    let plane = |p| info_of(100, 40, &(head(p, "0") + &sps_tail(0, None))).unwrap();
+    assert!(plane("1").separate_colour_plane);
+    assert!(!plane("0").separate_colour_plane);
+    // 4:4:4 codes twelve scaling list flags; the last one present holds 64 entries.
+    let mut b = head("0", "1") + &"0".repeat(11) + "1" + &"1".repeat(64);
+    b += &sps_tail(0, None);
+    let i = info_of(100, 40, &b).unwrap();
+    assert_eq!((i.reorder, i.log2_max_frame_num), (0, 4));
+    // Four:two:zero codes only eight flags.
+    let b = format!("1{}{}{}0{}", ue_bits(1), ue_bits(0), ue_bits(0), "1")
+        + &"0".repeat(8)
+        + &sps_tail(0, None);
+    let i = info_of(100, 40, &b).unwrap();
+    assert_eq!(
+        (i.reorder, i.log2_max_frame_num, i.frame_mbs_only),
+        (0, 4, true)
+    );
+}
+
+#[test]
+fn dts_info_vui_timing_gives_the_field_period() {
+    let period = |t: Option<(u64, u64)>| {
+        let v = vui_bits(t, None, None, None);
+        info_of(66, 40, &format!("1{}", sps_tail(0, Some(&v))))
+            .unwrap()
+            .frame_period_ticks
+    };
+    assert_eq!(period(Some((1001, 60_000))), Some(3003));
+    assert_eq!(period(Some((1, 11))), Some(16_364), "rounded to nearest");
+    assert_eq!(period(Some((0, 60_000))), None);
+    assert_eq!(period(Some((1001, 0))), None);
+    assert_eq!(period(None), None);
+}
+
+#[test]
+fn dts_info_vui_reorder_survives_hrd_and_low_delay_fields() {
+    let reorder = |nal: Option<u32>, vcl: Option<u32>| {
+        let v = vui_bits(None, nal, vcl, Some(2));
+        info_of(66, 40, &format!("1{}", sps_tail(0, Some(&v))))
+            .unwrap()
+            .reorder
+    };
+    assert_eq!(reorder(None, None), 2);
+    assert_eq!(reorder(Some(0), None), 2, "low_delay follows a NAL HRD");
+    assert_eq!(reorder(None, Some(0)), 2, "low_delay follows a VCL HRD");
+    assert_eq!(reorder(Some(1), Some(1)), 2);
+    assert_eq!(reorder(Some(31), None), 2, "32 CPBs is the most");
+    assert_eq!(
+        reorder(Some(32), None),
+        0,
+        "33 CPBs is not an HRD: VUI abandoned"
+    );
+}
