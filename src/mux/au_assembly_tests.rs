@@ -763,3 +763,28 @@ fn for_codec_routes_each_video_codec_to_its_reassembly_mode() {
         assert!(a.flush().is_empty(), "{codec:?} buffers nothing at EOF");
     }
 }
+
+#[test]
+fn buffer_and_mark_caps_have_their_documented_values() {
+    assert_eq!(MAX_AU_BUFFER, 8 * 1024 * 1024);
+    assert_eq!(MAX_MARKS, 64 * 1024);
+}
+
+#[test]
+fn a_passthrough_assembler_reserves_no_buffer() {
+    assert_eq!(AuAssembler::for_codec(Codec::Ac3).buf.capacity(), 0);
+    assert!(AuAssembler::for_codec(Codec::H264).buf.capacity() >= 256 * 1024);
+}
+
+#[test]
+fn a_start_code_must_be_contiguous_to_open_an_au() {
+    let marker = 0x09;
+    assert_eq!(find_start_code(&[0, 0xFF, 1, marker], 0, marker), None);
+    assert_eq!(find_start_code(&[0xFF, 0, 1, marker], 0, marker), None);
+    assert_eq!(find_start_code(&[0, 0, 2, marker], 0, marker), None);
+    assert_eq!(find_start_code(&[0, 0, 1, 0x10], 0, marker), None);
+    assert_eq!(
+        find_start_code(&[7, 7, 7, 0, 0, 1, marker], 0, marker),
+        Some(3)
+    );
+}
