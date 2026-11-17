@@ -182,16 +182,23 @@ fn writer_npred(mc: &Mc, mode: usize) -> usize {
 
 // The value transmission channel `t` (2..=4) holds in subband `sb`, and whether it is sent:
 // '-' = not sent; a "Tij" term = copied from Ti; otherwise from Lo/Ro (the base, `base`).
-fn writer_channel(mc: &Mc, rows: &[&str], t: usize, sb: usize, base: u8) -> (bool, u8) {
+fn writer_channel(
+    mc: &Mc,
+    rows: &[&str],
+    mode: Option<u8>,
+    t: usize,
+    sb: usize,
+    base: u8,
+) -> (bool, u8) {
     if mc.centre == 0b11 && sb >= 12 && t == 2 {
         return (false, 0); // §2.5.2.13 centre '11': "subbands above subband 11 are not transmitted"
     }
     let r2 = if mc.centre != 0 { 4 } else { 3 };
-    let dyn_rows_apply = mc.dyn_mode.is_some() && !rows.is_empty();
-    if mc.surround == 0b11 && mc.dyn_mode.is_some() && mc.second_stereo && t == r2 {
+    let dyn_rows_apply = mode.is_some() && !rows.is_empty();
+    if mc.surround == 0b11 && mode.is_some() && mc.second_stereo && t == r2 {
         return (false, mc.mc_alloc); // dyn_second_stereo: R2 "copied from L2"
     }
-    let mode = mc.dyn_mode.unwrap_or(0) as usize;
+    let mode = mode.unwrap_or(0) as usize;
     if !dyn_rows_apply || t - 2 >= rows[mode].split(' ').count() {
         return (true, mc.mc_alloc);
     }
@@ -207,6 +214,13 @@ fn writer_channel(mc: &Mc, rows: &[&str], t: usize, sb: usize, base: u8) -> (boo
 /// Writes `s` per 11172-3 §2.4.1.6 and 13818-3 §2.5.1.3/13/14/15/17; returns the frame and the
 /// bit offset of each field (for truncation tests). The frame is padded to its §2.4.3.1 size.
 pub(crate) fn write(s: Spec) -> (Vec<u8>, Vec<(&'static str, usize)>) {
+    write_with_dyn_modes(s, None)
+}
+
+fn write_with_dyn_modes(
+    s: Spec,
+    dyn_modes: Option<[u8; 12]>,
+) -> (Vec<u8>, Vec<(&'static str, usize)>) {
     let mut w = Writer::default();
     let mut at = Vec::new();
     w.put(0xFFF, 12);
@@ -280,6 +294,7 @@ pub(crate) fn write(s: Spec) -> (Vec<u8>, Vec<(&'static str, usize)>) {
         w.put(0, 12 * granule);
     }
     if let Some(mc) = s.mc {
+        let dyn_modes = dyn_modes.or_else(|| mc.dyn_mode.map(|mode| [mode; 12]));
         let mc_start = w.bits.len();
         at.push(("ext_bit_stream_present", mc_start));
         w.put(u32::from(mc.ext), 1);
@@ -301,7 +316,7 @@ pub(crate) fn write(s: Spec) -> (Vec<u8>, Vec<(&'static str, usize)>) {
         let (nmch, tc_bits, dyn_bits, rows) = writer_config(&mc);
         at.push(("tc_sbgr_select", w.bits.len()));
         w.put(u32::from(mc.tc_sbgr_select), 1);
-        w.put(u32::from(mc.dyn_mode.is_some()), 1);
+        w.put(u32::from(dyn_modes.is_some()), 1);
         w.put(u32::from(mc.prediction), 1);
         if tc_bits > 0 {
             at.push(("tc_allocation", w.bits.len()));
@@ -309,10 +324,10 @@ pub(crate) fn write(s: Spec) -> (Vec<u8>, Vec<(&'static str, usize)>) {
         for _ in 0..if mc.tc_sbgr_select { 1 } else { 12 } {
             w.put(u32::from(mc.tc), tc_bits);
         }
-        if let Some(mode) = mc.dyn_mode {
+        if let Some(modes) = dyn_modes {
             at.push(("dyn_cross_LR", w.bits.len()));
             w.put(u32::from(mc.dyn_lr), 1);
-            for _ in 0..12 {
+            for mode in modes {
                 w.put(u32::from(mode), dyn_bits);
                 if mc.surround == 0b11 {
                     w.put(u32::from(mc.second_stereo), 1);
@@ -321,9 +336,10 @@ pub(crate) fn write(s: Spec) -> (Vec<u8>, Vec<(&'static str, usize)>) {
         }
         if mc.prediction {
             at.push(("mc_prediction", w.bits.len()));
-            for _ in 0..8 {
+            for group in 0..8 {
                 w.put(1, 1);
-                w.put(0, 2 * writer_npred(&mc, mc.dyn_mode.unwrap_or(0) as usize));
+                let mode = dyn_modes.map_or(0, |modes| modes[group]);
+                w.put(0, 2 * writer_npred(&mc, mode as usize));
             }
         }
         if mc.lfe {
@@ -334,9 +350,19 @@ pub(crate) fn write(s: Spec) -> (Vec<u8>, Vec<(&'static str, usize)>) {
         let mut scfsi = 0;
         let alloc_at = w.bits.len();
         for (sb, &nbal) in NBAL_AB.iter().enumerate().take(msblimit) {
+            // §2.5.2.15: groups 0..7 each span one subband, then 8..9, 10..11,
+            // 12..15 and 16..31. Keep this independent of the parser's sbgr().
+            let group = match sb {
+                0..=7 => sb,
+                8..=9 => 8,
+                10..=11 => 9,
+                12..=15 => 10,
+                _ => 11,
+            };
             for t in 2..2 + nmch {
                 let base = if sb < sblimit { s.alloc } else { 0 };
-                let (sent, value) = writer_channel(&mc, rows, t, sb, base);
+                let (sent, value) =
+                    writer_channel(&mc, rows, dyn_modes.map(|modes| modes[group]), t, sb, base);
                 if sent {
                     w.put(u32::from(value), nbal as usize);
                 }
@@ -980,6 +1006,35 @@ fn every_dyn_cross_mode_verifies() {
         }
     }
     assert_eq!(n, 3 * (15 + 5 + 2 + 2 + 5 + 2));
+}
+
+/// Prediction lengths follow each subband group's mode within one CRC-valid frame.
+#[test]
+fn prediction_uses_each_subband_groups_dyn_cross_mode() {
+    // §2.5.2.15 3/2: mode 0 has six predsi fields; mode 7 has none.
+    for modes in [
+        [0, 7, 0, 7, 0, 7, 0, 7, 0, 7, 0, 7],
+        [7, 0, 7, 0, 7, 0, 7, 0, 7, 0, 7, 0],
+    ] {
+        let m = Mc {
+            prediction: true,
+            ..MC_3_2_LFE
+        };
+        let (f, _) = write_with_dyn_modes(with_mc(STEREO_256, m), Some(modes));
+        assert_eq!(
+            inspect(&f),
+            ChannelFrame::Multichannel {
+                nch: 2,
+                mc: McHeader {
+                    ext_bit_stream_present: false,
+                    centre: 0b01,
+                    surround: 0b10,
+                    lfe: true,
+                },
+            },
+            "dyn_cross_mode per group: {modes:?}"
+        );
+    }
 }
 
 /// "'1111' forbidden" (3/2) and "'101' forbidden" (3/1, 2/2) never verify as multichannel.
