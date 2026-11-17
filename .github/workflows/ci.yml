@@ -273,8 +273,12 @@ jobs:
         with:
           workspaces: libfreemkv
       - uses: taiki-e/install-action@72f835688cb6c15903b796f704b01e652a2b8835 # cargo-llvm-cov
-      - run: cargo llvm-cov --workspace --ignore-run-fail --lcov --output-path lcov.info
+      - run: cargo llvm-cov --workspace --lcov --output-path lcov.info
         working-directory: libfreemkv
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: coverage-lcov
+          path: libfreemkv/lcov.info
       - uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
