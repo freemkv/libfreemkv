@@ -730,3 +730,141 @@ fn encrypted_units_in_uses_the_title_format() {
     let ts = encrypted_units_in(&mut Fill, &ext, crate::disc::ContentFormat::BdTs, 8);
     assert_eq!(ts.len(), 8);
 }
+
+// Records every read and serves encrypted BD units (CPI set on each unit's first byte).
+struct LoggedSource {
+    reads: Vec<(u32, u16)>,
+    fail_at: Option<u32>,
+    fail_with: fn() -> Error,
+}
+
+impl LoggedSource {
+    fn new() -> Self {
+        Self {
+            reads: Vec::new(),
+            fail_at: None,
+            fail_with: || Error::DiscRead {
+                sector: 0,
+                status: None,
+                sense: None,
+            },
+        }
+    }
+}
+
+impl crate::sector::SectorSource for LoggedSource {
+    fn read_sectors(
+        &mut self,
+        lba: u32,
+        count: u16,
+        buf: &mut [u8],
+        _recovery: bool,
+    ) -> Result<usize, Error> {
+        self.reads.push((lba, count));
+        if self.fail_at == Some(lba) {
+            return Err((self.fail_with)());
+        }
+        let n = count as usize * 2048;
+        buf[..n].fill(0);
+        for u in buf[..n].chunks_mut(crate::aacs::content::ALIGNED_UNIT_LEN) {
+            u[0] = 0xC0;
+        }
+        Ok(n)
+    }
+}
+
+fn bd_extent(start_lba: u32, units: u32) -> crate::disc::Extent {
+    crate::disc::Extent {
+        start_lba,
+        sector_count: units * 3,
+    }
+}
+
+#[test]
+fn encrypted_units_probe_eight_spread_windows_without_overlap() {
+    let mut src = LoggedSource::new();
+    let out = encrypted_units_outside(
+        &mut src,
+        &[bd_extent(1000, 90)],
+        crate::disc::ContentFormat::BdTs,
+        1000,
+        &[],
+    );
+    // Probes at p/9 of 90 units: 10, 20, ... each moved past the unit the last window ended on.
+    assert_eq!(
+        src.reads,
+        vec![
+            (1030, 45),
+            (1075, 45),
+            (1120, 45),
+            (1165, 45),
+            (1210, 45),
+            (1255, 15)
+        ]
+    );
+    assert_eq!(out.len(), 15 * 5 + 5);
+    assert!(
+        out.iter()
+            .all(|u| u.len() == crate::aacs::content::ALIGNED_UNIT_LEN)
+    );
+}
+
+#[test]
+fn encrypted_units_stop_at_n_and_for_no_extent_or_n() {
+    let f = crate::disc::ContentFormat::BdTs;
+    let mut src = LoggedSource::new();
+    assert!(encrypted_units_outside(&mut src, &[bd_extent(0, 90)], f, 0, &[]).is_empty());
+    assert!(src.reads.is_empty());
+    let out = encrypted_units_outside(&mut src, &[bd_extent(0, 90)], f, 20, &[]);
+    assert_eq!(out.len(), 20);
+    assert_eq!(
+        src.reads.len(),
+        2,
+        "the second window supplies the last five"
+    );
+    let mut src = LoggedSource::new();
+    assert!(encrypted_units_outside(&mut src, &[bd_extent(0, 0)], f, 5, &[]).is_empty());
+    assert!(src.reads.is_empty(), "an extent under one unit is not read");
+}
+
+#[test]
+fn encrypted_units_skip_ranges_drop_overlapping_units_only() {
+    let f = crate::disc::ContentFormat::BdTs;
+    let mut src = LoggedSource::new();
+    // First window reads units 10..25 (LBA 1030..1075); skip LBAs [1033, 1036): exactly unit 11.
+    let out = encrypted_units_outside(&mut src, &[bd_extent(1000, 90)], f, 15, &[(1033, 1036)]);
+    assert_eq!(out.len(), 15);
+    assert_eq!(src.reads[0], (1030, 45));
+    assert_eq!(
+        src.reads[1],
+        (1075, 45),
+        "one unit short of n: the next window is read"
+    );
+    // A range ending where a unit starts (end exclusive) or starting where one ends skips nothing.
+    let mut src = LoggedSource::new();
+    let out = encrypted_units_outside(
+        &mut src,
+        &[bd_extent(1000, 90)],
+        f,
+        15,
+        &[(1027, 1030), (1075, 1080)],
+    );
+    assert_eq!(out.len(), 15);
+    assert_eq!(src.reads.len(), 1);
+}
+
+#[test]
+fn encrypted_units_a_bad_probe_is_skipped_but_a_halt_or_dead_bus_ends_sampling() {
+    let f = crate::disc::ContentFormat::BdTs;
+    let mut src = LoggedSource::new();
+    src.fail_at = Some(1030);
+    let out = encrypted_units_outside(&mut src, &[bd_extent(1000, 90)], f, 1000, &[]);
+    assert_eq!(src.reads.len(), 6, "the rest of the extent is still probed");
+    assert_eq!(out.len(), 15 * 4 + 5);
+    let mut src = LoggedSource::new();
+    src.fail_at = Some(1075);
+    src.fail_with = || Error::Halted;
+    let out = encrypted_units_outside(&mut src, &[bd_extent(1000, 90)], f, 1000, &[]);
+    assert_eq!(src.reads.len(), 2);
+    assert_eq!(out.len(), 15, "what was read before the stop is kept");
+}
