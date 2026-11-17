@@ -51,7 +51,7 @@ pub const VERSION_LABEL: &str = concat!(env!("FREEMKV_VERSION"), env!("GIT_SUFFI
 /// The muxing/writing-application string written into MKV output
 /// (`"freemkv <version> (g<hash>)"`). Only the ripping tree muxes, so this is
 /// gated with it — a transport-only build has no MKV writer to stamp.
-#[cfg(feature = "rip")]
+#[cfg(all(feature = "rip", any(test, not(feature = "test-util"))))]
 pub(crate) const MUX_APP: &str = concat!("freemkv ", env!("FREEMKV_VERSION"), env!("GIT_SUFFIX"));
 
 // ─── Always compiled ────────────────────────────────────────────────────────
