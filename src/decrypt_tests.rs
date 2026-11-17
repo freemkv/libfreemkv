@@ -1623,3 +1623,52 @@ fn content_gate_is_per_unit_within_a_multi_unit_buffer() {
     assert_eq!(&buf[ul..2 * ul], enc.as_slice(), "unit 1 sits in the gap");
     assert_eq!(&buf[2 * ul..], plain.as_slice(), "unit 2 is content");
 }
+
+#[test]
+fn unit_parity_is_counted_in_whole_units_from_the_range_start() {
+    // Four-sector units: unit 1 of the range starts 4 sectors in.
+    assert!(unit_is_our_phase(100, 100, 4, Phase::Even));
+    assert!(!unit_is_our_phase(100, 100, 4, Phase::Odd));
+    assert!(unit_is_our_phase(104, 100, 4, Phase::Odd));
+    assert!(!unit_is_our_phase(104, 100, 4, Phase::Even));
+    assert!(unit_is_our_phase(108, 100, 4, Phase::Even));
+    // A unit below its range start, or a zero unit size, counts as unit 0 (even).
+    assert!(unit_is_our_phase(10, 100, 4, Phase::Even));
+    assert!(unit_is_our_phase(101, 100, 0, Phase::Odd));
+    // Both unconditional phases keep every unit.
+    assert!(unit_is_our_phase(104, 100, 4, Phase::All));
+    assert!(unit_is_our_phase(104, 100, 4, Phase::Verify));
+}
+
+#[test]
+fn key_map_ranges_are_sorted_disjoint_and_merge_across_empty_ranges() {
+    // An empty range only adds a boundary: the stretches either side of it rejoin.
+    let m = AacsKeyMap::from_ranges_phased(vec![
+        (200, 300, 1, Phase::All),
+        (0, 100, 0, Phase::All),
+        (30, 30, 9, Phase::All),
+    ]);
+    assert_eq!(
+        m.ranges(),
+        &[(0, 100, 0, Phase::All), (200, 300, 1, Phase::All)]
+    );
+    assert_eq!(m.key_indices(), &[0, 1]);
+    assert_eq!(m.entry_for(50), Some((0, Phase::All, 0)));
+    assert_eq!(m.entry_for(100), None);
+}
+
+#[test]
+fn key_map_later_starting_range_wins_an_overlap_and_keeps_its_anchor() {
+    let m = AacsKeyMap::from_ranges_phased(vec![(0, 100, 0, Phase::Even), (40, 70, 1, Phase::Odd)]);
+    assert_eq!(
+        m.ranges(),
+        &[
+            (0, 40, 0, Phase::Even),
+            (40, 70, 1, Phase::Odd),
+            (70, 100, 0, Phase::Even)
+        ]
+    );
+    // Parity is measured from each range's own original start.
+    assert_eq!(m.entry_for(80), Some((0, Phase::Even, 0)));
+    assert_eq!(m.entry_for(50), Some((1, Phase::Odd, 40)));
+}
