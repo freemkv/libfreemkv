@@ -54,10 +54,19 @@ pub(crate) fn record_tree(g: &mut Golden, prefix: &str, dir: &Path) {
     for f in files {
         let rel = f.strip_prefix(dir).unwrap().display().to_string();
         let mut bytes = replace(&std::fs::read(&f).unwrap(), &root, b"<TMP>");
-        // The build stamp (version and commit) changes with every commit: same-length mask.
-        for stamp in [crate::MUX_APP, super::videomap::FVI_GENERATOR] {
-            bytes = replace(&bytes, stamp.as_bytes(), &vec![b'#'; stamp.len()]);
-        }
+        // MKV fixture stamps are fixed before writing: changing their width here
+        // would leave EBML sizes and seek offsets inconsistent. FVI is JSON text,
+        // so its real generator can be normalized to the same historical width.
+        bytes = replace(
+            &bytes,
+            super::mkv::FIXTURE_MUX_APP.as_bytes(),
+            b"#######################",
+        );
+        bytes = replace(
+            &bytes,
+            super::videomap::FVI_GENERATOR.as_bytes(),
+            b"#######################",
+        );
         g.bytes(&format!("{prefix} out {rel}"), &bytes);
     }
 }

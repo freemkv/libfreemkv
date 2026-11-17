@@ -2443,6 +2443,57 @@ fn duration_backpatched_from_timeline_when_source_gives_none() {
 }
 
 #[test]
+fn application_stamp_width_preserves_frames_and_seek_offsets() {
+    let tracks = [make_video_track()];
+    // Cross the one-byte EBML string-size boundary, and cover a build without git.
+    for app in [
+        "freemkv 1.8.9".to_owned(),
+        format!("freemkv 123.456.789 (g{})", "a".repeat(128)),
+    ] {
+        let shared = Arc::new(Mutex::new(Cursor::new(Vec::new())));
+        let mut muxer = MkvMuxer::new_with_app(
+            SharedWriter(shared.clone()),
+            &tracks,
+            &[],
+            None,
+            0.0,
+            &[],
+            &app,
+        )
+        .unwrap();
+        let frames = [
+            (0, true, vec![0xAB; 64]),
+            (1_000_000_000, false, vec![0xCD; 32]),
+        ];
+        for (pts, keyframe, data) in &frames {
+            muxer
+                .write_frame(0, *pts, *keyframe, data, None, None)
+                .unwrap();
+        }
+        muxer.finish().unwrap();
+        let data = shared.lock().unwrap().clone().into_inner();
+        let probe = crate::mux::probe_mkv_with_cues(Cursor::new(&data)).unwrap();
+        assert_eq!(probe.muxing_app.as_deref(), Some(app.as_str()));
+        assert_eq!(probe.writing_app.as_deref(), Some(app.as_str()));
+        assert_eq!(probe.last_cue_secs, Some(0.0));
+        let (_, segment_start) = locate_segment(&data);
+        let entries = parse_seekhead(&data);
+        assert_eq!(entries.len(), 3);
+        for (id, offset) in entries {
+            let mut cursor = Cursor::new(&data[segment_start + offset as usize..]);
+            assert_eq!(ebml::read_element_header(&mut cursor).unwrap().0, id);
+        }
+        let mut source = crate::mux::mkvstream::MkvStream::open(Cursor::new(data)).unwrap();
+        for (_, keyframe, expected) in frames {
+            let frame = crate::pes::PesSource::read(&mut source).unwrap().unwrap();
+            assert_eq!(frame.keyframe, keyframe);
+            assert_eq!(frame.data, expected);
+        }
+        assert!(crate::pes::PesSource::read(&mut source).unwrap().is_none());
+    }
+}
+
+#[test]
 fn probe_round_trips_the_writer_header() {
     let tracks = [make_video_track(), make_audio_track()];
     let (data, _) = mux_to_bytes(&tracks, &[], &frames_for(10.0, 1.0));

@@ -945,6 +945,10 @@ fn track_vint(track_num: usize) -> ([u8; 3], usize) {
     }
 }
 
+// Parity fixtures must not change their EBML layout when the build label grows.
+#[cfg(test)]
+pub(super) const FIXTURE_MUX_APP: &str = "freemkv 0.0.0 (g0000000)";
+
 impl<W: Write + Seek> MkvMuxer<W> {
     /// Create a new MKV muxer: writes EBML header, Segment start, Info, Tracks, Chapters.
     #[cfg(test)]
@@ -955,16 +959,41 @@ impl<W: Write + Seek> MkvMuxer<W> {
         duration_secs: f64,
         chapters: &[Chapter],
     ) -> io::Result<Self> {
-        Self::new_with_timing(writer, tracks, &[], title, duration_secs, chapters)
+        // Direct writer tests retain coverage of the actual production stamp.
+        Self::new_with_app(
+            writer,
+            tracks,
+            &[],
+            title,
+            duration_secs,
+            chapters,
+            crate::MUX_APP,
+        )
     }
 
     pub(crate) fn new_with_timing(
+        writer: W,
+        tracks: &[MkvTrack],
+        timings: &[crate::pes::TrackTiming],
+        title: Option<&str>,
+        duration_secs: f64,
+        chapters: &[Chapter],
+    ) -> io::Result<Self> {
+        #[cfg(test)]
+        let app = FIXTURE_MUX_APP;
+        #[cfg(not(test))]
+        let app = crate::MUX_APP;
+        Self::new_with_app(writer, tracks, timings, title, duration_secs, chapters, app)
+    }
+
+    fn new_with_app(
         mut writer: W,
         tracks: &[MkvTrack],
         timings: &[crate::pes::TrackTiming],
         title: Option<&str>,
         duration_secs: f64,
         chapters: &[Chapter],
+        app: &str,
     ) -> io::Result<Self> {
         // EBML Header
         let ebml_pos = ebml::start_master(&mut writer, ebml::EBML)?;
@@ -1040,8 +1069,8 @@ impl<W: Write + Seek> MkvMuxer<W> {
         // Stamp the freemkv version so any muxed file is traceable to the build
         // that produced it (surfaced as a media analyzer's "Writing
         // application"/"library" field).
-        ebml::write_string(&mut writer, ebml::MUXING_APP, crate::MUX_APP)?;
-        ebml::write_string(&mut writer, ebml::WRITING_APP, crate::MUX_APP)?;
+        ebml::write_string(&mut writer, ebml::MUXING_APP, app)?;
+        ebml::write_string(&mut writer, ebml::WRITING_APP, app)?;
         if let Some(t) = title {
             ebml::write_string(&mut writer, ebml::TITLE, t)?;
         }
