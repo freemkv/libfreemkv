@@ -2115,3 +2115,85 @@ fn au_channels_finds_an_exss_after_core_padding() {
     au.extend(exss_with_total(0, 8));
     assert_eq!(au_channels(&au), Some(8));
 }
+
+// Packs `(value, width)` fields MSB-first after an EXSS sync, zero-padded to `len` bytes.
+fn exss_bits(fields: &[(u32, u32)], len: usize) -> Vec<u8> {
+    let mut bits = Vec::new();
+    for &(v, w) in fields {
+        for i in (0..w).rev() {
+            bits.push((v >> i) & 1 == 1);
+        }
+    }
+    let mut out = DTS_HD_EXT_SYNC.to_vec();
+    for c in bits.chunks(8) {
+        let mut b = 0u8;
+        for (i, &bit) in c.iter().enumerate() {
+            b |= u8::from(bit) << (7 - i);
+        }
+        out.push(b);
+    }
+    out.resize(len, 0);
+    out
+}
+
+#[test]
+fn drop_reason_labels_are_the_logged_names() {
+    for (r, s) in [
+        (DropReason::DeficitSamples, "deficit-samples"),
+        (DropReason::PcmBlocks, "pcm-blocks"),
+        (DropReason::FrameSize, "frame-size"),
+        (DropReason::Amode, "audio-mode"),
+        (DropReason::SampleRate, "sample-rate"),
+        (DropReason::LfeFlag, "lfe-flag"),
+        (DropReason::PcmRes, "pcm-resolution"),
+        (DropReason::TrackPoisoned, "track-poisoned"),
+    ] {
+        assert_eq!(r.as_str(), s);
+    }
+}
+
+#[test]
+fn exss_frame_size_needs_the_long_form_header_bytes_buffered() {
+    // Short form: user 8, index 2, type 0, header size 8, fsize-1 16 (= 999).
+    let short = [(0, 8), (0, 2), (0, 1), (0x55, 8), (999, 16)];
+    assert_eq!(EXSS_HEADER_MIN_BYTES, 10);
+    assert_eq!(exss_frame_size(&exss_bits(&short, 9)), None);
+    assert_eq!(exss_frame_size(&exss_bits(&short, 10)), Some(1000));
+    // Long form: header size 12, fsize-1 20 (= 70_000).
+    let long = [(0, 8), (0, 2), (1, 1), (0x123, 12), (70_000, 20)];
+    assert_eq!(exss_frame_size(&exss_bits(&long, 10)), Some(70_001));
+}
+
+#[test]
+fn exss_timing_reads_rate_code_and_duration_code() {
+    let t = |hdr_long: bool, rc: u32, dc: u32| {
+        let (hb, fb) = if hdr_long { (12, 20) } else { (8, 16) };
+        let f = [
+            (0, 8),
+            (0, 2),
+            (u32::from(hdr_long), 1),
+            (0, hb),
+            (0, fb),
+            (1, 1),
+            (rc, 2),
+            (dc, 3),
+        ];
+        exss_timing(&exss_bits(&f, 16))
+    };
+    assert_eq!(t(false, 0, 0), Some((512, 32_000)));
+    assert_eq!(t(false, 1, 1), Some((1024, 44_100)));
+    assert_eq!(t(false, 2, 7), Some((4096, 48_000)));
+    assert_eq!(t(true, 0, 3), Some((2048, 32_000)));
+    // No static fields: no timing.
+    let none = [
+        (0, 8),
+        (0, 2),
+        (0, 1),
+        (0, 8),
+        (0, 16),
+        (0, 1),
+        (0, 2),
+        (0, 3),
+    ];
+    assert_eq!(exss_timing(&exss_bits(&none, 16)), None);
+}
