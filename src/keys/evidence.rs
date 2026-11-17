@@ -550,3 +550,7 @@ fn in_segment(segments: &[(u32, u32)], lba: u32) -> bool {
     let i = segments.partition_point(|s| s.0 <= lba);
     i > 0 && lba < segments[i - 1].1
 }
+
+#[cfg(test)]
+#[path = "evidence_tests.rs"]
+mod tests;
