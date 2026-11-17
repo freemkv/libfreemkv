@@ -381,3 +381,7 @@ impl Arrival {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "arrival_tests.rs"]
+mod tests;
