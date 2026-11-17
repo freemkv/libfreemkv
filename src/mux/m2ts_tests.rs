@@ -1030,3 +1030,66 @@ fn stream_types_read_back_as_their_codecs() {
     want.push(Codec::Pgs);
     assert_eq!(got, want);
 }
+
+fn video_of(codec: Codec, label: &str) -> DiscStream {
+    let DiscStream::Video(v) = make_title().streams[0].clone() else {
+        unreachable!()
+    };
+    DiscStream::Video(VideoStream {
+        codec,
+        label: label.to_string(),
+        ..v
+    })
+}
+
+fn secondary_audio(codec: Codec) -> DiscStream {
+    let DiscStream::Audio(a) = audio(0x1100, codec) else {
+        unreachable!()
+    };
+    DiscStream::Audio(crate::disc::AudioStream {
+        secondary: true,
+        ..a
+    })
+}
+
+#[test]
+fn pmt_stream_types_follow_the_hdmv_table() {
+    for (codec, want) in [
+        (Codec::H264, 0x1B),
+        (Codec::Hevc, 0x24),
+        (Codec::Vc1, 0xEA),
+        (Codec::Mpeg2, 0x02),
+        (Codec::Mpeg1, 0x01),
+        (Codec::Pgs, 0x06),
+    ] {
+        assert_eq!(stream_type(&video_of(codec, "")), want, "{codec:?}");
+    }
+    assert_eq!(
+        stream_type(&video_of(Codec::H264, crate::disc::MVC_DEPENDENT_LABEL)),
+        0x20,
+        "the MVC dependent view"
+    );
+    assert_eq!(
+        stream_type(&video_of(Codec::Hevc, crate::disc::MVC_DEPENDENT_LABEL)),
+        0x24,
+        "only H.264 carries the dependent view"
+    );
+    for (codec, want) in [
+        (Codec::Lpcm, 0x80),
+        (Codec::Ac3, 0x81),
+        (Codec::Dts, 0x82),
+        (Codec::TrueHd, 0x83),
+        (Codec::Ac3Plus, 0x84),
+        (Codec::DtsHdHr, 0x85),
+        (Codec::DtsHdMa, 0x86),
+        (Codec::Aac, 0x0F),
+        (Codec::Mp2, 0x03),
+        (Codec::Mp3, 0x03),
+        (Codec::Flac, 0x06),
+    ] {
+        assert_eq!(stream_type(&audio(0x1100, codec)), want, "{codec:?}");
+    }
+    assert_eq!(stream_type(&secondary_audio(Codec::Ac3Plus)), 0xA1);
+    assert_eq!(stream_type(&secondary_audio(Codec::DtsHdHr)), 0xA2);
+    assert_eq!(stream_type(&secondary_audio(Codec::Ac3)), 0x81);
+}
