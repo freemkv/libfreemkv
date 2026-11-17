@@ -5602,3 +5602,48 @@ fn vobsub_display_ns_rejects_malformed_chains() {
     ];
     assert_eq!(vobsub_display_ns(&ok), Some(10 * SPU_DELAY_NS));
 }
+
+// SPU: size, first DCSQ at 4, then each `(delay, commands)` DCSQ chained to the next (the last
+// to itself); `pad` trailing bytes.
+fn spu_chain(dcsqs: &[(u16, &[u8])], pad: usize) -> Vec<u8> {
+    let mut out = vec![0, 0, 0, 4];
+    let mut at = 4usize;
+    for (i, (delay, cmds)) in dcsqs.iter().enumerate() {
+        let len = 4 + cmds.len();
+        let next = if i + 1 == dcsqs.len() { at } else { at + len };
+        out.extend(delay.to_be_bytes());
+        out.extend((next as u16).to_be_bytes());
+        out.extend(*cmds);
+        at += len;
+    }
+    out.extend(std::iter::repeat_n(0xEE, pad));
+    out
+}
+
+#[test]
+fn vobsub_display_walks_a_long_dcsq_chain_to_its_stop() {
+    let spu = spu_chain(&[(1, &[0xFF]), (2, &[0xFF]), (3, &[0xFF]), (9, &[0x02])], 0);
+    assert_eq!(vobsub_display_ns(&spu), Some(9 * SPU_DELAY_NS));
+    // A size that is a multiple of five still allows every DCSQ to be visited.
+    let spu = spu_chain(&[(1, &[0xFF]), (4, &[0x02])], 1);
+    assert_eq!(spu.len() % 5, 0);
+    assert_eq!(vobsub_display_ns(&spu), Some(4 * SPU_DELAY_NS));
+}
+
+#[test]
+fn vobsub_display_skips_the_sized_colour_change_command() {
+    // CHG_COLCON (0x07): its 2-byte size counts itself and its parameters.
+    let spu = spu_chain(&[(5, &[0x07, 0x00, 0x04, 0xAA, 0xBB, 0x02, 0xFF])], 0);
+    assert_eq!(vobsub_display_ns(&spu), Some(5 * SPU_DELAY_NS));
+    // Fixed-size commands before the stop.
+    let spu = spu_chain(
+        &[(
+            6,
+            &[
+                0x03, 1, 2, 0x04, 3, 4, 0x05, 1, 2, 3, 4, 5, 6, 0x06, 1, 2, 3, 4, 0x02,
+            ],
+        )],
+        0,
+    );
+    assert_eq!(vobsub_display_ns(&spu), Some(6 * SPU_DELAY_NS));
+}
