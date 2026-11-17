@@ -2312,3 +2312,31 @@ fn header_remaining_decrements_correctly_across_two_continuations() {
              in order, with none mistaken for header spillover"
     );
 }
+
+// ES_info_length is 12 bits: a high nibble of 1 skips 256 descriptor bytes, so an entry-shaped
+// run inside them is descriptor data, not a stream.
+#[test]
+fn scan_streams_honours_the_high_nibble_of_es_info_length() {
+    use crate::disc::Stream;
+    let pmt_pid = 0x0100;
+    let mut pmt = pmt_packet(pmt_pid, &[(0x1B, 0x1011), (0x81, 0x1100)]);
+    // Packet = 4-byte timecode + 4-byte TS header + pointer_field + table: the first entry
+    // starts 12 bytes into the table, its ES_info_length 3 bytes after that.
+    let first = 8 + 1 + 12;
+    pmt[first + 3] = 0xF1;
+    let mut data = pat_packet(pmt_pid);
+    data.extend(pmt);
+    data.extend(pat_packet(pmt_pid));
+    let streams = scan_streams(&data).expect("PMT should parse");
+    assert!(
+        streams
+            .iter()
+            .any(|s| matches!(s, Stream::Video(v) if v.pid == 0x1011))
+    );
+    assert!(
+        !streams
+            .iter()
+            .any(|s| matches!(s, Stream::Audio(a) if a.pid == 0x1100)),
+        "the second entry sits inside the first's descriptors"
+    );
+}
