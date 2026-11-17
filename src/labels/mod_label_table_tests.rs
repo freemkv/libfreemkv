@@ -395,3 +395,30 @@ fn read_jar_file_skips_empty_copies_and_matches_names_without_case() {
     let got = read_jar_file(&mut disc, &udf, "playlists.xml");
     assert_eq!(got.as_deref(), Some(&b"<p/>"[..]));
 }
+
+#[test]
+fn the_public_audio_codec_label_names_codec_and_channels() {
+    assert_eq!(
+        audio_codec_label(&Codec::Ac3, &AudioChannels::Surround51),
+        "Dolby Digital 5.1"
+    );
+    assert_eq!(
+        audio_codec_label(&Codec::DtsHdMa, &AudioChannels::Surround71),
+        "DTS-HD Master Audio 7.1"
+    );
+}
+
+#[test]
+fn a_playlist_hint_is_empty_only_without_id_and_filename() {
+    assert!(FeaturePlaylistHint::default().is_empty());
+    let id = FeaturePlaylistHint {
+        playlist_id: Some(222),
+        filename: None,
+    };
+    let name = FeaturePlaylistHint {
+        playlist_id: None,
+        filename: Some("00222.mpls".into()),
+    };
+    assert!(!id.is_empty());
+    assert!(!name.is_empty());
+}
