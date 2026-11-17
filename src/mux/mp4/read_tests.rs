@@ -2803,3 +2803,73 @@ fn frame_rate_and_duration_are_derived() {
         "1000 ticks at 1000 Hz"
     );
 }
+
+#[test]
+fn mpeg_audio_layer_reads_the_frame_header_directly() {
+    let layer = |bytes: &[u8], offset: u64| {
+        let mut c = std::io::Cursor::new(bytes.to_vec());
+        mpeg_audio_layer(&mut c, bytes.len() as u64, offset)
+    };
+    assert_eq!(layer(&[0xFF, 0xFD], 0), Some(Codec::Mp2));
+    assert_eq!(layer(&[0xFF, 0xFB], 0), Some(Codec::Mp3));
+    assert_eq!(layer(&[0xFF, 0xFF], 0), None, "Layer I is not labelled");
+    assert_eq!(layer(&[0xFF, 0xF9], 0), None, "reserved layer");
+    assert_eq!(layer(&[0xFE, 0xFB], 0), None, "first sync byte");
+    assert_eq!(layer(&[0xFF, 0x1B], 0), None, "second sync byte");
+    assert_eq!(
+        layer(&[0, 0xFF, 0xFB], 1),
+        Some(Codec::Mp3),
+        "header at an offset"
+    );
+    assert_eq!(layer(&[0xFF, 0xFB], 1), None, "header runs past the file");
+}
+
+#[test]
+fn stts_mean_delta_names_every_standard_frame_rate() {
+    for (timescale, delta, want) in [
+        (24000, 1001, FrameRate::F23_976),
+        (24, 1, FrameRate::F24),
+        (25, 1, FrameRate::F25),
+        (30000, 1001, FrameRate::F29_97),
+        (30, 1, FrameRate::F30),
+        (50, 1, FrameRate::F50),
+        (60000, 1001, FrameRate::F59_94),
+        (60, 1, FrameRate::F60),
+    ] {
+        assert_eq!(
+            frame_rate_from_stts(timescale, &[delta; 7]),
+            want,
+            "{timescale}/{delta}"
+        );
+    }
+    // Zero-length deltas are ignored; no usable delta is unknown.
+    assert_eq!(frame_rate_from_stts(30, &[0, 1, 0, 1, 1]), FrameRate::F30);
+    assert_eq!(frame_rate_from_stts(30, &[0, 0]), FrameRate::Unknown);
+    assert_eq!(frame_rate_from_stts(30, &[]), FrameRate::Unknown);
+}
+
+#[test]
+fn colour_codes_map_to_hdr_and_primaries() {
+    let cicp = |transfer| {
+        Some(MeasuredCicp {
+            primaries: 9,
+            transfer,
+            matrix: 9,
+            range: 1,
+        })
+    };
+    assert_eq!(hdr_from_cicp(cicp(16), false), HdrFormat::Hdr10);
+    assert_eq!(hdr_from_cicp(cicp(18), false), HdrFormat::Hlg);
+    assert_eq!(hdr_from_cicp(cicp(1), false), HdrFormat::Sdr);
+    assert_eq!(hdr_from_cicp(None, false), HdrFormat::Sdr);
+    assert_eq!(hdr_from_cicp(cicp(18), true), HdrFormat::DolbyVision);
+    for (code, want) in [
+        (1, ColorSpace::Bt709),
+        (5, ColorSpace::Bt470bg),
+        (6, ColorSpace::Smpte170m),
+        (9, ColorSpace::Bt2020),
+        (2, ColorSpace::Unknown),
+    ] {
+        assert_eq!(color_space_from_primaries(code), want, "primaries {code}");
+    }
+}
