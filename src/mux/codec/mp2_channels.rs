@@ -644,10 +644,9 @@ fn mc_extension(frame: &[u8], h: &Header, base: &Base, end: usize) -> Result<McH
     if mc_prediction_on {
         // "for (sbgr=0; sbgr<8; sbgr++) { mc_prediction[sbgr] 1 ... for (px=0; px<npred; px++)
         // predsi[sbgr][px] 2", npred per §2.5.2.15's table.
-        // TEMPORARY LIB-T2 MUTANT: do not merge before restoring per-group mode lookup.
-        for &_mode in st.dyn_mode.iter().take(8) {
+        for &mode in st.dyn_mode.iter().take(8) {
             if b.read(1, "mc_prediction")? == 1 {
-                let npred = cfg.npred.get(st.dyn_mode[0] as usize).copied().unwrap_or(0);
+                let npred = cfg.npred.get(mode as usize).copied().unwrap_or(0);
                 b.skip(2 * npred as usize, "predsi")?;
             }
         }
