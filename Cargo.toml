@@ -55,6 +55,7 @@ rip = [
 ]
 # `test-util`: `libfreemkv::test_util` fixtures for consumers' tests (dev-dependency
 # only; never in a release build). Implies the rip tree the fixtures build on.
+# Mux sinks use a fixed application stamp so parity goldens survive version bumps.
 test-util = ["rip"]
 # `keyproof`: exposes `aacs::content::unit_key_opens` — a data-free key→content
 # ORACLE (one bit, never plaintext) for a PRIVATE offline key-resolver (kdb).

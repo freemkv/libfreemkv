@@ -945,9 +945,10 @@ fn track_vint(track_num: usize) -> ([u8; 3], usize) {
     }
 }
 
-// Parity fixtures must not change their EBML layout when the build label grows.
-#[cfg(test)]
-pub(super) const FIXTURE_MUX_APP: &str = "freemkv 0.0.0 (g0000000)";
+// Preserve the existing goldens' 24-byte masked stamp, including in consumers'
+// dev-dependency builds. Writing the mask itself makes their normalizers inert.
+#[cfg(any(test, feature = "test-util"))]
+pub(super) const FIXTURE_MUX_APP: &str = "########################";
 
 impl<W: Write + Seek> MkvMuxer<W> {
     /// Create a new MKV muxer: writes EBML header, Segment start, Info, Tracks, Chapters.
@@ -979,9 +980,9 @@ impl<W: Write + Seek> MkvMuxer<W> {
         duration_secs: f64,
         chapters: &[Chapter],
     ) -> io::Result<Self> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-util"))]
         let app = FIXTURE_MUX_APP;
-        #[cfg(not(test))]
+        #[cfg(not(any(test, feature = "test-util")))]
         let app = crate::MUX_APP;
         Self::new_with_app(writer, tracks, timings, title, duration_secs, chapters, app)
     }

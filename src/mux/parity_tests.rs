@@ -59,13 +59,8 @@ pub(crate) fn record_tree(g: &mut Golden, prefix: &str, dir: &Path) {
         // so its real generator can be normalized to the same historical width.
         bytes = replace(
             &bytes,
-            super::mkv::FIXTURE_MUX_APP.as_bytes(),
-            b"#######################",
-        );
-        bytes = replace(
-            &bytes,
             super::videomap::FVI_GENERATOR.as_bytes(),
-            b"#######################",
+            super::mkv::FIXTURE_MUX_APP.as_bytes(),
         );
         g.bytes(&format!("{prefix} out {rel}"), &bytes);
     }
