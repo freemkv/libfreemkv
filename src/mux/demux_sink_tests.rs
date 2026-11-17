@@ -1473,3 +1473,79 @@ fn a_disc_label_with_a_separator_cannot_write_outside_the_output_directory() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+fn plain_frame(data: Vec<u8>) -> PesFrame {
+    PesFrame {
+        discard_padding_ns: 0,
+        coding: None,
+        source: None,
+        track: 0,
+        pts: 0,
+        keyframe: true,
+        data,
+        duration_ns: None,
+    }
+}
+
+#[test]
+fn es_writer_for_picks_a_reframing_writer_per_codec() {
+    let nal = vec![0, 0, 0, 2, 0xAA, 0xBB];
+    for codec in [Codec::H264, Codec::Hevc] {
+        let mut w = es_writer_for(codec, None, None, "eng");
+        let mut out = Vec::new();
+        w.write_frame(&mut out, &plain_frame(nal.clone()), 0)
+            .unwrap();
+        assert_eq!(out, vec![0, 0, 0, 1, 0xAA, 0xBB], "{codec:?} is Annex B");
+    }
+    // Everything else passes through byte for byte.
+    let mut w = es_writer_for(Codec::Ac3, None, None, "eng");
+    let mut out = Vec::new();
+    w.write_frame(&mut out, &plain_frame(nal.clone()), 0)
+        .unwrap();
+    assert_eq!(out, nal);
+    // PGS frames get a `PG` header.
+    let mut w = es_writer_for(Codec::Pgs, None, None, "eng");
+    let mut out = Vec::new();
+    w.write_frame(&mut out, &plain_frame(vec![0x16, 0, 0]), 0)
+        .unwrap();
+    assert_eq!(&out[..2], b"PG");
+}
+
+#[test]
+fn annexb_param_sets_come_from_the_codecs_own_record() {
+    let avcc = [
+        1, 0x42, 0x00, 0x1F, 0xFF, 0xE1, 0, 2, 0x67, 0x42, 1, 0, 1, 0x68,
+    ];
+    assert_eq!(
+        annexb_param_sets(Codec::H264, &avcc),
+        vec![0, 0, 0, 1, 0x67, 0x42, 0, 0, 0, 1, 0x68]
+    );
+    assert!(annexb_param_sets(Codec::Ac3, &avcc).is_empty());
+    // An hvcC is not an avcC: the HEVC path does not read the H.264 record.
+    assert!(annexb_param_sets(Codec::Hevc, &avcc).is_empty());
+}
+
+#[test]
+fn pgs_pcs_dimensions_are_read_only_from_a_whole_pcs() {
+    let mut pcs = vec![0u8; PCS_WIDTH_OFFSET + 4];
+    pcs[0] = SEG_PCS;
+    pcs[PCS_WIDTH_OFFSET..PCS_WIDTH_OFFSET + 4].copy_from_slice(&[0x07, 0x80, 0x04, 0x38]);
+    assert_eq!(PgsSupWriter::pcs_dimensions(&pcs), (1920, 1080));
+    assert_eq!(
+        PgsSupWriter::pcs_dimensions(&pcs[..pcs.len() - 1]),
+        (0, 0),
+        "height cut short"
+    );
+    let mut other = pcs.clone();
+    other[0] = 0x17;
+    assert_eq!(PgsSupWriter::pcs_dimensions(&other), (0, 0), "not a PCS");
+}
+
+#[test]
+fn idx_timestamps_split_into_hours_minutes_seconds_and_millis() {
+    let ms = ((2 * 3600 + 5 * 60 + 7) * 1000 + 9) as i64;
+    assert_eq!(fmt_idx_timestamp(ms * 1_000_000), "02:05:07:009");
+    assert_eq!(fmt_idx_timestamp(59_999 * 1_000_000), "00:00:59:999");
+    assert_eq!(fmt_idx_timestamp(3_600_000 * 1_000_000), "01:00:00:000");
+    assert_eq!(fmt_idx_timestamp(-5), "00:00:00:000");
+}

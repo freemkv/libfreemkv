@@ -1842,14 +1842,7 @@ fn vui_bits(
     }
     s += "0";
     match reorder {
-        Some(r) => {
-            s += &format!(
-                "10{}{}{}",
-                ue_bits(0).repeat(4),
-                ue_bits(r),
-                ue_bits(r + 2)
-            )
-        }
+        Some(r) => s += &format!("10{}{}{}", ue_bits(0).repeat(4), ue_bits(r), ue_bits(r + 2)),
         None => s += "0",
     }
     s
