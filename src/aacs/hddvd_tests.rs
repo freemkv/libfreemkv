@@ -215,7 +215,9 @@ fn ac3_sync_is_not_checked_without_a_usable_pointer() {
     no_flags[126] = 0x00;
     assert_eq!(ac3_sync_check(&no_flags, 120, 200), None);
     // Pointer zero: no access unit starts in this packet.
-    let zero = ac3_pes_pack(120, 0, 0x80, 0, [0x0B, 0x77]);
+    let mut zero = ac3_pes_pack(120, 0, 0x80, 10, [0x0B, 0x77]);
+    zero[131] = 0;
+    zero[132] = 0;
     assert_eq!(ac3_sync_check(&zero, 120, 200), None);
     // Sub-stream ids: 0x80-0x87 and 0xC0-0xC7 only.
     for (sub, want) in [

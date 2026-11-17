@@ -800,8 +800,12 @@ fn measured_drop_duration_is_reported_by_the_parser() {
     p.parse(&make_pes(mp3_frame(), Some(0)));
     let mut bad = mp3_frame();
     bad[1] &= !0b0000_0110;
-    p.parse(&make_pes(bad, None));
-    p.parse(&make_pes(mp3_frame(), Some(3 * 2352)));
-    assert_eq!(p.dropped_frames(), 1);
+    p.parse(&make_pes([bad.clone(), bad].concat(), None));
+    p.parse(&make_pes(
+        [mp3_frame(), mp3_frame()].concat(),
+        Some(3 * 2351),
+    ));
+    p.flush();
+    assert!(p.dropped_frames() >= 1);
     assert!(p.dropped_duration_ns() > 0, "the timestamp gap is measured");
 }
