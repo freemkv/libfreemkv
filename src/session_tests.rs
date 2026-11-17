@@ -151,6 +151,57 @@ fn inputs_with_samples_fills_encrypted_units_from_the_main_title() {
     assert_eq!(inputs.samples.len(), crate::keysource::MIN_SAMPLE_UNITS);
 }
 
+#[test]
+fn folder_verdict_keeps_aacs_when_the_first_extent_has_no_complete_unit() {
+    use crate::disc::{DiscTitle, Extent};
+
+    struct RejectReads {
+        calls: usize,
+    }
+    impl SectorSource for RejectReads {
+        fn read_sectors(&mut self, _: u32, _: u16, _: &mut [u8], _: bool) -> Result<usize> {
+            self.calls += 1;
+            Err(Error::DeviceNotReady {
+                path: "short-folder".into(),
+            })
+        }
+    }
+
+    // An AACS unit needs three sectors; a shorter extent supplies no evidence
+    // that the structurally encrypted folder has already been decrypted.
+    for sector_count in [0, 1, 2] {
+        let mut disc = aacs_disc();
+        let mut title = DiscTitle::empty();
+        title.size_bytes = u64::from(sector_count) * 2048;
+        title.extents = vec![Extent {
+            start_lba: 3_000,
+            sector_count,
+        }];
+        disc.titles = vec![title];
+        disc.aacs_error = Some(Error::AacsNoHostCert {
+            path: "<no host cert>".into(),
+        });
+        let mut reader = RejectReads { calls: 0 };
+
+        apply_folder_encryption_verdict(&mut reader, &mut disc)
+            .expect("a short extent must not require a content read");
+
+        assert_eq!(reader.calls, 0, "extent length {sector_count}");
+        assert!(disc.encrypted, "extent length {sector_count}");
+        assert_eq!(
+            disc.aacs.as_ref().expect("keep the AACS state").disc_hash,
+            "0xabc"
+        );
+        assert!(
+            matches!(
+                disc.aacs_error.as_ref(),
+                Some(Error::AacsNoHostCert { path }) if path == "<no host cert>"
+            ),
+            "keep the AACS error and its path for extent length {sector_count}"
+        );
+    }
+}
+
 // `identify` after the drive has left the session (both `stage_drive_as_reader`
 // and `into_drive` permit that ordering) must return `DeviceNotReady`, not
 // reach `drive_mut`'s `.expect(...)` and panic. Sibling of scan.
