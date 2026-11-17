@@ -1855,7 +1855,8 @@ fn info_of(profile: u8, level: u8, bits: &str) -> Option<SpsDtsInfo> {
 #[test]
 fn sps_reader_signed_exp_golomb() {
     for (k, want) in [(0, 0), (1, 1), (2, -1), (3, 2), (4, -2), (5, 3), (6, -3)] {
-        let mut r = SpsReader::new(&bits_to_bytes(&ue_bits(k)));
+        let bytes = bits_to_bytes(&ue_bits(k));
+        let mut r = SpsReader::new(&bytes);
         assert_eq!(r.read_se(), Some(want), "code_num {k}");
     }
 }
@@ -1873,7 +1874,8 @@ fn sps_reader_reads_msb_first_across_bytes() {
 fn scaling_list_stops_at_a_zero_next_scale() {
     // delta -8 from 8 makes next_scale 0: the other entries are not coded.
     let bits = format!("{}1", se_bits(-8));
-    let mut r = SpsReader::new(&bits_to_bytes(&bits));
+    let bytes = bits_to_bytes(&bits);
+    let mut r = SpsReader::new(&bytes);
     skip_scaling_list(&mut r, 3).unwrap();
     assert_eq!(
         r.read_bit(),
@@ -1882,12 +1884,14 @@ fn scaling_list_stops_at_a_zero_next_scale() {
     );
     // +1 then -9 returns next_scale to 0 on the second entry.
     let bits = format!("{}{}1", se_bits(1), se_bits(-9));
-    let mut r = SpsReader::new(&bits_to_bytes(&bits));
+    let bytes = bits_to_bytes(&bits);
+    let mut r = SpsReader::new(&bytes);
     skip_scaling_list(&mut r, 3).unwrap();
     assert_eq!(r.read_bit(), Some(1));
     // Non-zero deltas read every entry.
     let bits = format!("{}0", "1".repeat(4));
-    let mut r = SpsReader::new(&bits_to_bytes(&bits));
+    let bytes = bits_to_bytes(&bits);
+    let mut r = SpsReader::new(&bytes);
     skip_scaling_list(&mut r, 4).unwrap();
     assert_eq!(r.read_bit(), Some(0));
 }
