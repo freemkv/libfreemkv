@@ -1200,8 +1200,8 @@ fn the_replayer_rejects_tampered_streams() {
     // MS-17: an SCR gap over 0.7 s.
     let mut p = replay::parse(&r.out).unwrap();
     let n = p.packs.len();
-    for k in n / 2..n {
-        p.packs[k].scr += super::pstd::MAX_SCR_GAP27 + 1;
+    for pack in p.packs.iter_mut().take(n).skip(n / 2) {
+        pack.scr += super::pstd::MAX_SCR_GAP27 + 1;
     }
     assert!(replay::replay(&p, &fx.aus).unwrap_err().contains("SCR gap"));
     // MS-19: a DTS equal to its PTS.
