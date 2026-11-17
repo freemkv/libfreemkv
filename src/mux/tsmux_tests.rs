@@ -1769,3 +1769,35 @@ fn pes_order(packets: &[TsPacket]) -> Vec<u8> {
         .flat_map(|p| p.pid.to_be_bytes())
         .collect()
 }
+
+#[test]
+fn start_up_hold_and_pmt_limits_have_their_documented_values() {
+    assert_eq!(HOLD_CAP_BYTES, 64 * 1024 * 1024);
+    assert_eq!(HOLD_CAP_TICKS, 90_000);
+    assert_eq!(ORIGIN_HEADROOM_TICKS, 90_000);
+    assert_eq!(
+        MAX_PMT_ENTRIES, 200,
+        "(1021 - 13 - 6) / 5 entries fit one section"
+    );
+    assert_eq!(
+        PACKET_STC, 317,
+        "one 188-byte packet at 128 Mb/s in 27 MHz ticks"
+    );
+}
+
+#[test]
+fn psi_repeats_exactly_when_100ms_of_pts_have_passed() {
+    let pats = |second_ns: i64| {
+        let mut sink: Vec<u8> = Vec::new();
+        {
+            let mut mux = TsMuxer::new(&mut sink, &[AUDIO_PID]);
+            mux.set_program(vec![0x81]).unwrap();
+            mux.write_frame(0, 0, true, &[0x0B, 0x77]).unwrap();
+            mux.write_frame(0, second_ns, true, &[0x0B, 0x77]).unwrap();
+            mux.finish().unwrap();
+        }
+        parse_bd_ts(&sink).iter().filter(|p| p.pid == 0).count()
+    };
+    assert_eq!(pats(99_000_000), 1, "99 ms later is not due");
+    assert_eq!(pats(100_000_000), 2, "exactly 9000 ticks later is due");
+}
