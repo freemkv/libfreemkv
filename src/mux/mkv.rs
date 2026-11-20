@@ -2419,15 +2419,17 @@ impl<W: Write + Seek> MkvMuxer<W> {
         let flags: u8 = if keyframe { 0x80 } else { 0x00 };
 
         let block_size = track_vint.len() + 2 + 1 + data.len(); // vint + ts(2) + flags(1) + data
+        // The header (at most 1 + 8 + 3 + 2 + 1 bytes) goes out in one write, not five.
+        let mut head = io::Cursor::new([0u8; 16]);
+        ebml::write_id(&mut head, ebml::SIMPLE_BLOCK)?;
+        ebml::write_size(&mut head, block_size as u64)?;
+        head.write_all(track_vint)?;
+        head.write_all(&relative_ts.to_be_bytes())?;
+        head.write_all(&[flags])?;
+        let head_len = head.position() as usize;
         let mut out = self.out();
-        ebml::write_id(&mut out, ebml::SIMPLE_BLOCK)?;
-        ebml::write_size(&mut out, block_size as u64)?;
-        out.write_all(track_vint)?;
-        out.write_all(&relative_ts.to_be_bytes())?;
-        out.write_all(&[flags])?;
-        out.write_all(data)?;
-
-        Ok(())
+        out.write_all(&head.get_ref()[..head_len])?;
+        out.write_all(data)
     }
 
     // Write a BlockGroup with no seek and no payload copy: its small head and trailer are
