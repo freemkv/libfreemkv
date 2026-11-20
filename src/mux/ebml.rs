@@ -208,6 +208,12 @@ pub fn start_master_buf(buf: &mut Vec<u8>, id: u32) -> io::Result<usize> {
 /// Errors rather than panicking if `size_pos` does not name a placeholder that
 /// is still inside the buffer, or if the body exceeds the 7-byte VINT payload.
 pub fn end_master_buf(buf: &mut [u8], size_pos: usize) -> io::Result<()> {
+    end_master_buf_with(buf, size_pos, 0)
+}
+
+/// [`end_master_buf`] for a body that continues past the buffer: `outside` more body
+/// bytes are written straight from their own slice after the buffer (scatter write).
+pub(crate) fn end_master_buf_with(buf: &mut [u8], size_pos: usize, outside: u64) -> io::Result<()> {
     let end = buf.len();
     let Some(body_start) = size_pos.checked_add(8) else {
         return Err(crate::error::Error::MkvUnencodable.into());
@@ -215,7 +221,9 @@ pub fn end_master_buf(buf: &mut [u8], size_pos: usize) -> io::Result<()> {
     if end < body_start {
         return Err(crate::error::Error::MkvUnencodable.into());
     }
-    let data_size = (end - body_start) as u64;
+    let Some(data_size) = ((end - body_start) as u64).checked_add(outside) else {
+        return Err(crate::error::Error::MkvUnencodable.into());
+    };
     if data_size >= 0x0100_0000_0000_0000 {
         return Err(crate::error::Error::MkvUnencodable.into());
     }

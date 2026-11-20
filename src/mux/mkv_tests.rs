@@ -5647,3 +5647,81 @@ fn vobsub_display_skips_the_sized_colour_change_command() {
     );
     assert_eq!(vobsub_display_ns(&spu), Some(6 * SPU_DELAY_NS));
 }
+
+// The pre-scatter BlockGroup: the whole element, payloads included, in one buffer.
+#[allow(clippy::too_many_arguments)]
+fn contiguous_block_group(
+    track_num: usize,
+    relative_ts: i16,
+    data: &[u8],
+    reference: Option<i64>,
+    duration_ticks: Option<u64>,
+    additional: Option<&[u8]>,
+    discard_padding_ns: i64,
+) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let (tv, tv_len) = track_vint(track_num);
+    let bg_pos = ebml::start_master_buf(&mut buf, ebml::BLOCK_GROUP).unwrap();
+    ebml::write_id(&mut buf, ebml::BLOCK).unwrap();
+    ebml::write_size(&mut buf, (tv_len + 3 + data.len()) as u64).unwrap();
+    buf.extend_from_slice(&tv[..tv_len]);
+    buf.extend_from_slice(&relative_ts.to_be_bytes());
+    buf.push(0);
+    buf.extend_from_slice(data);
+    if discard_padding_ns != 0 {
+        ebml::write_int(&mut buf, ebml::DISCARD_PADDING, discard_padding_ns).unwrap();
+    }
+    if let Some(dt) = duration_ticks {
+        ebml::write_uint(&mut buf, ebml::BLOCK_DURATION, dt).unwrap();
+    }
+    if let Some(r) = reference {
+        ebml::write_int(&mut buf, ebml::REFERENCE_BLOCK, r).unwrap();
+    }
+    if let Some(a) = additional {
+        let adds = ebml::start_master_buf(&mut buf, ebml::BLOCK_ADDITIONS).unwrap();
+        let more = ebml::start_master_buf(&mut buf, ebml::BLOCK_MORE).unwrap();
+        ebml::write_uint(&mut buf, ebml::BLOCK_ADD_ID, BLOCK_ADD_ID_VALUE_MVC).unwrap();
+        ebml::write_binary(&mut buf, ebml::BLOCK_ADDITIONAL, a).unwrap();
+        ebml::end_master_buf(&mut buf, more).unwrap();
+        ebml::end_master_buf(&mut buf, adds).unwrap();
+    }
+    ebml::end_master_buf(&mut buf, bg_pos).unwrap();
+    buf
+}
+
+// The scatter-written BlockGroup (head, frame, trailer, dependent AU) is byte-identical
+// to the contiguous one, across size-VINT widths, track numbers and every optional child.
+#[test]
+fn scatter_block_group_matches_the_contiguous_build() {
+    let payload: Vec<u8> = (0..70_000u32).map(|i| (i * 7) as u8).collect();
+    let mut n = 0;
+    for len in [0usize, 1, 120, 125, 16_380, 16_400, 70_000] {
+        for add_len in [None, Some(0usize), Some(3), Some(200), Some(20_000)] {
+            for (reference, duration, pad) in [
+                (None, None, 0i64),
+                (Some(-1234i64), Some(1001u64), 0),
+                (None, Some(48_000), -5_000_000),
+                (Some(0), None, 3_000),
+            ] {
+                for track in [1usize, 127, 300] {
+                    let data = &payload[..len];
+                    let add = add_len.map(|l| &payload[1000..1000 + l]);
+                    let want =
+                        contiguous_block_group(track, -7, data, reference, duration, add, pad);
+                    let mut buf = Vec::new();
+                    let head = MkvMuxer::<Cursor<Vec<u8>>>::build_block_group(
+                        &mut buf, track, -7, len, reference, duration, add_len, pad,
+                    )
+                    .unwrap();
+                    let mut got = buf[..head].to_vec();
+                    got.extend_from_slice(data);
+                    got.extend_from_slice(&buf[head..]);
+                    got.extend_from_slice(add.unwrap_or(&[]));
+                    assert!(got == want, "len {len} add {add_len:?} track {track}");
+                    n += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(n, 7 * 5 * 4 * 3);
+}

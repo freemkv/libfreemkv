@@ -1827,11 +1827,11 @@ impl<W: Write + Seek> MkvMuxer<W> {
                     .unwrap_or(0),
             )
         };
-        if discard_padding_ns != 0 {
-            let mut buf = std::mem::take(&mut self.block_group_buf);
-            buf.clear();
-            let result = Self::build_block_group(
-                &mut buf,
+        // A BlockGroup carries DiscardPadding, BlockDuration (PGS, AC-3, every MPEG-2
+        // picture) or an MVC dependent view (a non-key base frame also gets its
+        // ReferenceBlock, so a player never seeks to a P/B frame); else a SimpleBlock.
+        if discard_padding_ns != 0 || block_additional.is_some() || duration_ticks.is_some() {
+            self.write_block_group(
                 track_idx + 1,
                 relative_ts,
                 data,
@@ -1839,36 +1839,9 @@ impl<W: Write + Seek> MkvMuxer<W> {
                 duration_ticks,
                 block_additional,
                 discard_padding_ns,
-            )
-            .and_then(|()| self.writer.write_all(&buf));
-            self.block_group_buf = buf;
-            result?;
+            )?;
         } else {
-            match block_additional {
-                // MVC: base view Block + dependent-view BlockAdditional, always a BlockGroup;
-                // non-keyframe base frames get a ReferenceBlock so a player never treats
-                // a P/B frame as a seek point.
-                Some(additional) => {
-                    self.write_block_group_mvc(
-                        track_idx + 1,
-                        relative_ts,
-                        data,
-                        additional,
-                        reference,
-                        duration_ticks,
-                    )?;
-                }
-                None => match duration_ticks {
-                    // BlockDuration present (PGS subtitles, AC-3 audio, and EVERY
-                    // MPEG-2 video frame) → BlockGroup.
-                    Some(dt) => {
-                        self.write_block_group(track_idx + 1, relative_ts, data, reference, dt)?;
-                    }
-                    None => {
-                        self.write_simple_block(track_idx + 1, relative_ts, keyframe, data)?;
-                    }
-                },
-            }
+            self.write_simple_block(track_idx + 1, relative_ts, keyframe, data)?;
         }
         // BlockDuration is the group's last element: its 3 value bytes end the write.
         if vobsub_open {
@@ -2347,41 +2320,12 @@ impl<W: Write + Seek> MkvMuxer<W> {
         Ok(())
     }
 
-    // Write a BlockGroup (Block + BlockDuration, plus ReferenceBlock when not a keyframe). Not
-    // subtitle-only: every MPEG-2 I/P/B frame arrives here.
+    // Write a BlockGroup with no seek and no payload copy: its small head and trailer are
+    // built in the reused scratch buffer, the frame and MVC dependent AU are written
+    // straight from their slices in between: the same bytes as one contiguous write.
+    #[allow(clippy::too_many_arguments)]
     fn write_block_group(
         &mut self,
-        track_num: usize,
-        relative_ts: i16,
-        data: &[u8],
-        reference: Option<i64>,
-        duration_ticks: u64,
-    ) -> io::Result<()> {
-        let mut buf = std::mem::take(&mut self.block_group_buf);
-        buf.clear();
-        let res = Self::build_block_group(
-            &mut buf,
-            track_num,
-            relative_ts,
-            data,
-            reference,
-            Some(duration_ticks),
-            None,
-            0,
-        )
-        .and_then(|()| self.writer.write_all(&buf));
-        // Hand the (now grown) scratch buffer back so the next frame reuses the
-        // allocation, on the error path too.
-        self.block_group_buf = buf;
-        res
-    }
-
-    // Assemble a complete BlockGroup into `buf` (one write_all at the call
-    // site, no seek). `additional` = Some(dependent AU) for MVC, appending
-    // BlockAdditions > BlockMore { BlockAddID=2, BlockAdditional }.
-    #[allow(clippy::too_many_arguments)]
-    fn build_block_group(
-        buf: &mut Vec<u8>,
         track_num: usize,
         relative_ts: i16,
         data: &[u8],
@@ -2390,13 +2334,53 @@ impl<W: Write + Seek> MkvMuxer<W> {
         additional: Option<&[u8]>,
         discard_padding_ns: i64,
     ) -> io::Result<()> {
+        let mut buf = std::mem::take(&mut self.block_group_buf);
+        buf.clear();
+        let res = Self::build_block_group(
+            &mut buf,
+            track_num,
+            relative_ts,
+            data.len(),
+            reference,
+            duration_ticks,
+            additional.map(<[u8]>::len),
+            discard_padding_ns,
+        )
+        .and_then(|head| {
+            self.writer.write_all(&buf[..head])?;
+            self.writer.write_all(data)?;
+            self.writer.write_all(&buf[head..])?;
+            match additional {
+                Some(a) => self.writer.write_all(a),
+                None => Ok(()),
+            }
+        });
+        // Hand the scratch buffer back so the next frame reuses it, on error too.
+        self.block_group_buf = buf;
+        res
+    }
+
+    // Assemble a BlockGroup into `buf` minus its two payloads: the frame (`data_len`
+    // bytes) goes at the returned split, the MVC dependent AU (`additional_len`, as
+    // BlockAdditions > BlockMore { BlockAddID=2, BlockAdditional }) after the buffer.
+    #[allow(clippy::too_many_arguments)]
+    fn build_block_group(
+        buf: &mut Vec<u8>,
+        track_num: usize,
+        relative_ts: i16,
+        data_len: usize,
+        reference: Option<i64>,
+        duration_ticks: Option<u64>,
+        additional_len: Option<usize>,
+        discard_padding_ns: i64,
+    ) -> io::Result<usize> {
         let (tv, tv_len) = track_vint(track_num);
         let track_vint = &tv[..tv_len];
         // The 0x80 Keyframe flag is SimpleBlock-only; inside a BlockGroup Block
         // it is reserved and MUST be 0 — keyframe-ness is signalled by the
         // presence/absence of ReferenceBlock.
         let flags: u8 = 0x00;
-        let block_size = track_vint.len() + 2 + 1 + data.len();
+        let block_size = track_vint.len() + 2 + 1 + data_len;
 
         let bg_pos = ebml::start_master_buf(buf, ebml::BLOCK_GROUP)?;
         ebml::write_id(buf, ebml::BLOCK)?;
@@ -2404,7 +2388,7 @@ impl<W: Write + Seek> MkvMuxer<W> {
         buf.extend_from_slice(track_vint);
         buf.extend_from_slice(&relative_ts.to_be_bytes());
         buf.push(flags);
-        buf.extend_from_slice(data);
+        let head = buf.len();
         if discard_padding_ns != 0 {
             ebml::write_int(buf, ebml::DISCARD_PADDING, discard_padding_ns)?;
         }
@@ -2414,44 +2398,18 @@ impl<W: Write + Seek> MkvMuxer<W> {
         if let Some(ref_off) = reference {
             ebml::write_int(buf, ebml::REFERENCE_BLOCK, ref_off)?;
         }
-        if let Some(additional) = additional {
+        let outside = additional_len.unwrap_or(0) as u64;
+        if let Some(len) = additional_len {
             let adds_pos = ebml::start_master_buf(buf, ebml::BLOCK_ADDITIONS)?;
             let more_pos = ebml::start_master_buf(buf, ebml::BLOCK_MORE)?;
             ebml::write_uint(buf, ebml::BLOCK_ADD_ID, BLOCK_ADD_ID_VALUE_MVC)?;
-            ebml::write_binary(buf, ebml::BLOCK_ADDITIONAL, additional)?;
-            ebml::end_master_buf(buf, more_pos)?;
-            ebml::end_master_buf(buf, adds_pos)?;
+            ebml::write_id(buf, ebml::BLOCK_ADDITIONAL)?;
+            ebml::write_size(buf, len as u64)?;
+            ebml::end_master_buf_with(buf, more_pos, outside)?;
+            ebml::end_master_buf_with(buf, adds_pos, outside)?;
         }
-        ebml::end_master_buf(buf, bg_pos)?;
-        Ok(())
-    }
-
-    // Write a BlockGroup: base view Block + MVC dependent AU as a BlockAdditional
-    // (BlockAddID=2) per the track's mvcC mapping.
-    fn write_block_group_mvc(
-        &mut self,
-        track_num: usize,
-        relative_ts: i16,
-        data: &[u8],
-        additional: &[u8],
-        reference: Option<i64>,
-        duration_ticks: Option<u64>,
-    ) -> io::Result<()> {
-        let mut buf = std::mem::take(&mut self.block_group_buf);
-        buf.clear();
-        let res = Self::build_block_group(
-            &mut buf,
-            track_num,
-            relative_ts,
-            data,
-            reference,
-            duration_ticks,
-            Some(additional),
-            0,
-        )
-        .and_then(|()| self.writer.write_all(&buf));
-        self.block_group_buf = buf;
-        res
+        ebml::end_master_buf_with(buf, bg_pos, data_len as u64 + outside)?;
+        Ok(head)
     }
 }
 
