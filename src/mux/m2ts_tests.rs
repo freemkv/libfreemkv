@@ -24,7 +24,7 @@ fn make_title() -> DiscTitle {
             color_space: ColorSpace::Bt709,
             display_aspect: None,
             secondary: false,
-            label: String::new(),
+            label: Default::default(),
             measured_cicp: None,
         })],
         chapters: Vec::new(),
@@ -257,7 +257,7 @@ fn lpcm_round_trips_through_m2ts_write_and_read() {
             sample_rate: SampleRate::S48,
             secondary: false,
             purpose: LabelPurpose::Normal,
-            label: String::new(),
+            label: Default::default(),
         }));
         let shared = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
         let mut stream = M2tsStream::create(SharedSink(shared.clone()), &title).unwrap();
@@ -324,7 +324,7 @@ fn lpcm_title(channels: crate::disc::AudioChannels, rate: crate::disc::SampleRat
             sample_rate: rate,
             secondary: false,
             purpose: crate::disc::LabelPurpose::Normal,
-            label: String::new(),
+            label: Default::default(),
         }));
     title
 }
@@ -653,7 +653,7 @@ fn mvc_dependent_dts(dependent_first: bool) {
         pid: VIDEO_PID + 1,
         codec: Codec::H264,
         secondary: true,
-        label: crate::disc::MVC_DEPENDENT_LABEL.to_string(),
+        label: std::borrow::Cow::Borrowed(crate::disc::MVC_DEPENDENT_LABEL),
         ..base
     }));
     title.codec_privates = vec![Some(es::avcc(&sps.nal())), None];
@@ -717,7 +717,7 @@ fn ac3_audio(pid: u16) -> DiscStream {
         sample_rate: crate::disc::SampleRate::S48,
         secondary: false,
         purpose: crate::disc::LabelPurpose::Normal,
-        label: String::new(),
+        label: Default::default(),
     })
 }
 
@@ -962,7 +962,7 @@ fn an_mp2_extension_track_is_left_out_and_reported() {
     };
     let ext = crate::disc::AudioStream {
         pid: 0x00D0,
-        label: crate::disc::MP2_EXTENSION_LABEL.into(),
+        label: std::borrow::Cow::Borrowed(crate::disc::MP2_EXTENSION_LABEL),
         ..base.clone()
     };
     title.streams.push(DiscStream::Audio(base));
@@ -1037,7 +1037,7 @@ fn video_of(codec: Codec, label: &str) -> DiscStream {
     };
     DiscStream::Video(VideoStream {
         codec,
-        label: label.to_string(),
+        label: label.to_string().into(),
         ..v
     })
 }

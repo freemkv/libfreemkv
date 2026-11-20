@@ -271,7 +271,7 @@ fn probe_evo_streams(
             color_space: ColorSpace::Bt709,
             display_aspect: None,
             secondary: false,
-            label: String::new(),
+            label: Default::default(),
             measured_cicp: None,
         }));
     }
@@ -289,11 +289,11 @@ fn probe_evo_streams(
             // scan time, so this is a default (a 2.0 track is over-stated as
             // 5.1 in the header — the compressed audio itself is unaffected).
             channels: AudioChannels::Surround51,
-            language: String::new(),
+            language: Default::default(),
             sample_rate: SampleRate::S48,
             secondary: false,
             purpose: crate::disc::LabelPurpose::Normal,
-            label: String::new(),
+            label: Default::default(),
         }));
     }
     Ok(streams)
@@ -787,11 +787,7 @@ fn compose_xpl_titles(
                 extents.extend_from_slice(exts);
                 size_bytes = size_bytes.saturating_add(*size);
             }
-            let clip_id = orig
-                .rsplit_once('.')
-                .map(|(b, _)| b)
-                .unwrap_or(orig)
-                .to_string();
+            let clip_id: ClipId = orig.rsplit_once('.').map(|(b, _)| b).unwrap_or(orig).into();
             let ticks = |secs: f64| (secs * 45000.0).clamp(0.0, u32::MAX as f64) as u32;
             match (own_range.as_mut(), c.clip_begin_secs) {
                 (Some(v), Some(cb)) => v.push(Clip {
@@ -1028,11 +1024,7 @@ impl Disc {
                     parts.push(Clip {
                         feed_span: None,
                         marks_on_pes_clock: false,
-                        clip_id: orig
-                            .rsplit_once('.')
-                            .map(|(b, _)| b)
-                            .unwrap_or(orig)
-                            .to_string(),
+                        clip_id: orig.rsplit_once('.').map(|(b, _)| b).unwrap_or(orig).into(),
                         in_time: 0,
                         out_time: 0,
                         duration_secs: 0.0,
@@ -1074,10 +1066,10 @@ impl Disc {
             // Probe the clip head for its elementary streams so the mux path
             // builds a non-empty `pid_to_track` and actually routes packets.
             let streams = probes.streams(reader, extents, halt)?;
-            let clip_id = orig
+            let clip_id: ClipId = orig
                 .rsplit_once('.')
-                .map(|(base, _)| base.to_string())
-                .unwrap_or_else(|| orig.clone());
+                .map_or(orig.as_str(), |(base, _)| base)
+                .into();
             titles.push(DiscTitle {
                 // An untimed clip has no exact content segments.
                 selection_evidence: Default::default(),

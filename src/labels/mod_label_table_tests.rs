@@ -180,7 +180,7 @@ fn ordinal_binding_needs_a_stated_subtitle_language() {
         streams: vec![Stream::Subtitle(SubtitleStream {
             pid: 0x12A0,
             codec: Codec::Pgs,
-            language: String::new(),
+            language: Default::default(),
             forced: false,
             qualifier: LabelQualifier::None,
             codec_data: None,
@@ -421,4 +421,60 @@ fn a_playlist_hint_is_empty_only_without_id_and_filename() {
     };
     assert!(!id.is_empty());
     assert!(!name.is_empty());
+}
+
+// The allocation-free comparisons answer as the lowercasing forms they replaced: language
+// equality across /B and /T codes and case, and codec-hint substring checks.
+#[test]
+fn allocation_free_label_compares_match_the_lowercasing_forms() {
+    let lowered = |a: &str, b: &str| a.eq_ignore_ascii_case(b) || to_iso639_t(a) == to_iso639_t(b);
+    let codes = [
+        "ger", "DEU", "Ger", "fre", "fra", "eng", "ENG", "", "x", "zho", "CHI", "gér",
+    ];
+    for a in codes {
+        for b in codes {
+            assert_eq!(same_language(a, b), lowered(a, b), "{a:?} vs {b:?}");
+        }
+    }
+    for hint in [
+        "Dolby TrueHD Atmos",
+        "DTS:X",
+        "dts-hd MASTER AUDIO",
+        "Écoute dd+",
+        "",
+        "pcm",
+    ] {
+        for needle in ["atmos", "dts:x", "master audio", "dd+", "pcm", "truehd"] {
+            assert_eq!(
+                AsciiFolded(hint).contains(needle),
+                hint.to_ascii_lowercase().contains(needle),
+                "{hint:?} / {needle:?}"
+            );
+        }
+    }
+}
+
+// Generated labels come from the static table: the same text is one shared &'static str,
+// never an allocation per stream, and the text is what the generators always produced.
+#[test]
+fn generated_labels_are_shared_static_text() {
+    let a = generate_audio_label(&Codec::TrueHd, &AudioChannels::Surround71, false);
+    let b = generate_audio_label(&Codec::TrueHd, &AudioChannels::Surround71, false);
+    assert_eq!(a, "Dolby TrueHD 7.1");
+    assert!(matches!(a, std::borrow::Cow::Borrowed(_)));
+    assert!(
+        std::ptr::eq(a.as_ref(), b.as_ref()),
+        "label allocated per call"
+    );
+    let v1 = generate_video_label(&Codec::Hevc, (3840, 2160), false, &HdrFormat::Hdr10, false);
+    let v2 = generate_video_label(&Codec::Hevc, (3840, 2160), false, &HdrFormat::Hdr10, false);
+    assert!(std::ptr::eq(v1.as_ref(), v2.as_ref()));
+    assert_eq!(
+        v1,
+        video_label_text(&Codec::Hevc, (3840, 2160), false, &HdrFormat::Hdr10, false)
+    );
+    assert_eq!(
+        generate_audio_label(&Codec::Pgs, &AudioChannels::Stereo, false),
+        ""
+    );
 }

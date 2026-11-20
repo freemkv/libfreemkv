@@ -712,9 +712,9 @@ impl DemuxSink {
 
             let (kind, codec, pid, lang) = match stream {
                 DiscStream::Video(v) => (TrackKind::Video, v.codec, v.pid, String::new()),
-                DiscStream::Audio(a) => (TrackKind::Audio, a.codec, a.pid, a.language.clone()),
+                DiscStream::Audio(a) => (TrackKind::Audio, a.codec, a.pid, a.language.to_string()),
                 DiscStream::Subtitle(s) => {
-                    (TrackKind::Subtitle, s.codec, s.pid, s.language.clone())
+                    (TrackKind::Subtitle, s.codec, s.pid, s.language.to_string())
                 }
             };
             // Before the kind filter: the video track drives multi-clip PTS-continuity

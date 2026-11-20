@@ -91,7 +91,7 @@ fn fixture(o: &Opts) -> Fx {
         color_space: ColorSpace::Bt470bg,
         display_aspect: None,
         secondary: false,
-        label: String::new(),
+        label: Default::default(),
         measured_cicp: None,
     })];
     let audio = |pid: u16, codec: Codec, lang: &str, label: &str| {
@@ -103,7 +103,7 @@ fn fixture(o: &Opts) -> Fx {
             sample_rate: SampleRate::S48,
             secondary: false,
             purpose: LabelPurpose::Normal,
-            label: label.into(),
+            label: label.to_string().into(),
         })
     };
     streams.push(audio(0x00C0, Codec::Mp2, "eng", ""));
@@ -127,7 +127,7 @@ fn fixture(o: &Opts) -> Fx {
             language: if k == 0 { "eng".into() } else { "nld".into() },
             forced: k == 0,
             qualifier: LabelQualifier::None,
-            codec_data: Some(palette.clone()),
+            codec_data: Some(palette.clone().into()),
         }));
     }
     let title = DiscTitle {
@@ -1345,8 +1345,8 @@ fn an_mpg_file_reads_back_through_the_ps_pipeline() {
         .iter()
         .map(|s| match s {
             DiscStream::Video(v) => (v.pid, v.codec, String::new()),
-            DiscStream::Audio(a) => (a.pid, a.codec, a.language.clone()),
-            DiscStream::Subtitle(t) => (t.pid, t.codec, t.language.clone()),
+            DiscStream::Audio(a) => (a.pid, a.codec, a.language.to_string()),
+            DiscStream::Subtitle(t) => (t.pid, t.codec, t.language.to_string()),
         })
         .collect();
     assert_eq!(

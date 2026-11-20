@@ -179,7 +179,7 @@ fn build_zip(entries: &[(&str, Vec<u8>)]) -> Vec<u8> {
 }
 
 fn open_jar(bytes: Vec<u8>) -> jar::Jar {
-    jar::Jar::new(std::io::Cursor::new(bytes)).expect("valid zip")
+    jar::Jar::new(std::io::Cursor::new(bytes.into())).expect("valid zip")
 }
 
 /// Build a `.class` fixture whose `<clinit>` does N `ldc` of distinct

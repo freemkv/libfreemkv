@@ -5,7 +5,7 @@ use super::{
     AcquireOptions, ArrivalPiece, ForensicState, Inner, KeyResolution, KeyRing, KeyScope,
     ProofCache, overlaps,
 };
-use crate::aacs::content::{decrypt_unit, is_clean};
+use crate::aacs::content::{ALIGNED_UNIT_LEN, decrypt_unit, is_clean, ts_unit_key_opens};
 use crate::aacs::trace::{KeyNode, KeyOutcome, KeyStep, ResolutionTrace};
 use crate::ctx::Ctx;
 use crate::decrypt::{AacsKeyMap, Phase};
@@ -114,7 +114,9 @@ struct Run<'a> {
     format: ContentFormat,
     sources: Vec<Box<dyn KeySource>>,
     dead: Vec<bool>,
-    inputs: DiscInputs,
+    inputs: Arc<DiscInputs>,
+    // The title keys of `inputs`, parsed once per acquire.
+    enc_keys: Arc<[[u8; 16]]>,
     pool: Vec<[u8; 16]>,
     origin: Vec<&'static str>,
     requests: u32,
@@ -145,6 +147,11 @@ impl Run<'_> {
     }
 
     fn opens(&self, unit: &[u8], slot: usize) -> bool {
+        // BD-TS: decrypt only each packet's head block, the same verdict as a full decrypt;
+        // a wrong key fails without a copy or a whole-unit CBC pass.
+        if self.format == ContentFormat::BdTs && unit.len() == ALIGNED_UNIT_LEN {
+            return ts_unit_key_opens(unit, &self.pool[slot]);
+        }
         let mut u = unit.to_vec();
         decrypt_unit(&mut u, &self.pool[slot]);
         is_clean(&u, self.format)
@@ -158,9 +165,10 @@ impl Run<'_> {
             return Ok(Asked::Skipped);
         }
         self.requests += 1;
-        let mut inputs = self.inputs.clone();
-        inputs.samples = samples.to_vec();
-        let ctx = DiscInputsCtx::new(&inputs).with_stop(Some(self.halt), self.progress);
+        // Refcounts only: the ctx borrows the inputs, the parsed keys and `samples`.
+        let (inputs, enc_keys) = (Arc::clone(&self.inputs), Arc::clone(&self.enc_keys));
+        let ctx = DiscInputsCtx::borrowed(&inputs, samples, &enc_keys)
+            .with_stop(Some(self.halt), self.progress);
         let start = self.clock.now();
         let mut wait = RETRY_FIRST;
         let mut attempted = false;
@@ -403,6 +411,7 @@ pub(crate) fn acquire(
         samples: Vec::new(),
         volume_label: aacs.volume_label.clone(),
     };
+    let enc_keys: Arc<[[u8; 16]]> = crate::keysource::parse_enc_title_keys(&inputs).into();
     let built = sources();
     let n_src = built.len();
     let vid_consumer = built.iter().any(|s| s.uses_vid());
@@ -413,7 +422,8 @@ pub(crate) fn acquire(
         format: ev.container,
         sources: built,
         dead: vec![false; n_src],
-        inputs,
+        inputs: Arc::new(inputs),
+        enc_keys,
         pool: Vec::new(),
         origin: Vec::new(),
         requests: 0,
@@ -638,7 +648,7 @@ fn resolve_one_unit(
         None => None,
         Some(l) => Some(resolve_forensic(sampler, l, seed, run, ev.container)?),
     };
-    build(&mut inner, &ps, layout, forensic, run, clip);
+    build(&mut inner, ps, layout, forensic, run, clip);
     Ok(Some(inner))
 }
 
@@ -682,7 +692,7 @@ fn resolve_per_unit(
         tracing::info!(target: "freemkv::keys", pieces = ps.len(), "content and forensic segments in the clear: no key source asked");
         let mut inner = aacs_inner(run);
         inner.no_stream_files = ev.no_stream_files;
-        build(&mut inner, &ps, None, None, run, Vec::new());
+        build(&mut inner, ps, None, None, run, Vec::new());
         return Ok(Some(inner));
     }
     let opened = |run: &Run, p: &Probed| -> Option<usize> {
@@ -840,7 +850,7 @@ fn resolve_per_unit(
         None => None,
         Some(l) => Some(resolve_forensic(sampler, l, seed, run, ev.container)?),
     };
-    build(&mut inner, &ps, layout, forensic, run, clip);
+    build(&mut inner, ps, layout, forensic, run, clip);
     Ok(Some(inner))
 }
 
@@ -879,7 +889,7 @@ fn decide(
             .collect();
         let mut inner = aacs_inner(run);
         inner.no_stream_files = ev.no_stream_files;
-        build(&mut inner, &ps, None, None, run, Vec::new());
+        build(&mut inner, ps, None, None, run, Vec::new());
         return Ok(inner);
     }
     if ev.container.aacs_per_pack() {
@@ -1217,7 +1227,7 @@ fn resolve_bd(
         None => None,
         Some(l) => Some(resolve_forensic(sampler, l, seed, run, format)?),
     };
-    build(&mut inner, &ps, layout, forensic, run, clip);
+    build(&mut inner, ps, layout, forensic, run, clip);
     Ok(inner)
 }
 
@@ -1356,7 +1366,7 @@ fn resolve_forensic(
 // Step 14: maps from Keyed pieces (and the forensic ranges); arrival pieces for the rest.
 fn build(
     inner: &mut Inner,
-    ps: &[Probed],
+    ps: Vec<Probed>,
     layout: Option<&super::fmts::Layout>,
     forensic: Option<Forensic>,
     run: &Run,
@@ -1416,7 +1426,8 @@ fn build(
                 }
                 inner.arrival.push(ArrivalPiece {
                     id: p.id(),
-                    spans: p.piece.spans.clone(),
+                    // Moved, not cloned: `ps` is consumed and `inner.spans` copied above.
+                    spans: p.piece.spans,
                     candidate: match p.verdict {
                         Verdict::Lazy(c) => c,
                         _ => None,

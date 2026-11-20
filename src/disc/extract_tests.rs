@@ -337,8 +337,8 @@ fn aacs_disc() -> Disc {
         mkb_version: None,
         disc_hash: String::new(),
         volume_id: [0u8; 16],
-        uk_ro: Vec::new(),
-        mkb: Vec::new(),
+        uk_ro: Vec::<u8>::new().into(),
+        mkb: Vec::<u8>::new().into(),
     });
     d
 }

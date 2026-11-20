@@ -28,8 +28,8 @@ fn aacs(version: u8, disc_hash: &str, volume_id: [u8; 16]) -> AacsState {
         mkb_version: None,
         disc_hash: disc_hash.into(),
         volume_id,
-        uk_ro: Vec::new(),
-        mkb: Vec::new(),
+        uk_ro: Vec::<u8>::new().into(),
+        mkb: Vec::<u8>::new().into(),
     }
 }
 

@@ -147,7 +147,7 @@ impl<R: Read + Seek> Mp4Reader<R> {
                     }),
                     display_aspect: None,
                     secondary: false,
-                    label: String::new(),
+                    label: Default::default(),
                     measured_cicp: cicp,
                 }),
                 Some(h) if &h == b"soun" => DiscStream::Audio(AudioStream {
@@ -156,14 +156,14 @@ impl<R: Read + Seek> Mp4Reader<R> {
                     // `channels` is an untrusted u16; saturate rather than wrap with
                     // `as u8` (a crafted 256 would alias to 0/Mono).
                     channels: AudioChannels::from_count(channels.min(u8::MAX as u16) as u8),
-                    language: language.clone().unwrap_or_else(|| "und".into()),
+                    language: language.as_deref().unwrap_or("und").into(),
                     sample_rate: SampleRate::from_hz(
                         dts_max_rate
                             .unwrap_or_else(|| audio_rate(entry_sample_rate, timescale, dts_hd)),
                     ),
                     secondary: false,
                     purpose: LabelPurpose::Normal,
-                    label: String::new(),
+                    label: Default::default(),
                 }),
                 _ => {
                     tracing::debug!(

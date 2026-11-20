@@ -130,7 +130,7 @@ fn mpeg2_dvd_title(extent_sectors: u32) -> DiscTitle {
         color_space: ColorSpace::Smpte170m,
         display_aspect: Some((4, 3)),
         secondary: false,
-        label: String::new(),
+        label: Default::default(),
         measured_cicp: None,
     }));
     title.content_format = ContentFormat::MpegPs;

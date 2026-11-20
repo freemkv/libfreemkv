@@ -52,6 +52,9 @@ const MAX_PREFETCH_RUN_SECTORS: u32 = 8192;
 // Files larger than this are not cached by `metadata_sector_ranges` (MKB_RO.inf is ~134 MB).
 const MAX_CACHED_FILE_BYTES: u64 = 50_000_000;
 
+// A `metadata_sector_ranges_for` byte limit that prefetches the whole file.
+pub(crate) const WHOLE_FILE: u64 = u64::MAX;
+
 // Smallest Main VDS extent ECMA-167 3/10.2.1 permits an AVDP to record (16
 // sectors). A smaller extent is unusable, so it's ignored in favour of
 // VDS_FALLBACK_START.
@@ -197,6 +200,28 @@ pub struct DirEntry {
     pub entries: Vec<DirEntry>,
 }
 
+/// A directory's files by ASCII-case-folded name, built once so repeated lookups are not
+/// linear scans. The first entry of a name wins, as the path lookup finds it.
+pub(crate) struct FileIndex<'a>(std::collections::HashMap<String, &'a DirEntry>);
+
+impl<'a> FileIndex<'a> {
+    /// The files (not subdirectories) of `dir`; empty when there is no such directory.
+    pub(crate) fn of(dir: Option<&'a DirEntry>) -> Self {
+        let mut map = std::collections::HashMap::new();
+        for e in dir.into_iter().flat_map(|d| &d.entries) {
+            if !e.is_dir {
+                map.entry(e.name.to_ascii_uppercase()).or_insert(e);
+            }
+        }
+        FileIndex(map)
+    }
+
+    /// The file named `name`, compared ASCII-case-insensitively.
+    pub(crate) fn get(&self, name: &str) -> Option<&'a DirEntry> {
+        self.0.get(&name.to_ascii_uppercase()).copied()
+    }
+}
+
 impl UdfFs {
     /// Test hook: relocate the physical partition (ICBs stay put via the metadata map).
     #[cfg(test)]
@@ -268,6 +293,16 @@ impl UdfFs {
         self.read_file_limited(reader, path, Some(max_bytes))
     }
 
+    /// [`Self::read_file`] of an entry the caller already holds (e.g. from a directory
+    /// listing), with no path lookup.
+    pub(crate) fn read_entry(
+        &self,
+        reader: &mut dyn SectorSource,
+        entry: &DirEntry,
+    ) -> Result<Vec<u8>> {
+        self.read_entry_limited(reader, entry, None)
+    }
+
     // Shared impl of read_file/read_file_prefix. When max_bytes is Some, reads
     // at most that many bytes and skips the MAX_FILE_BYTES cap (already bounded).
     fn read_file_limited(
@@ -277,7 +312,15 @@ impl UdfFs {
         max_bytes: Option<usize>,
     ) -> Result<Vec<u8>> {
         let entry = self.entry_at(path)?;
+        self.read_entry_limited(reader, entry, max_bytes)
+    }
 
+    fn read_entry_limited(
+        &self,
+        reader: &mut dyn SectorSource,
+        entry: &DirEntry,
+        max_bytes: Option<usize>,
+    ) -> Result<Vec<u8>> {
         // `max_bytes == None` => read the whole file; `Some(n)` => read at most
         // n bytes (rounded up to a sector) and skip the anti-DoS caps below.
         let limit = max_bytes.unwrap_or(usize::MAX);
@@ -321,9 +364,9 @@ impl UdfFs {
         // capped so a bogus entry.size can't force a GiB-scale reservation.
         let cap_hint = (entry.size as usize)
             .min(limit)
-            .min(MAX_FILE_BYTES as usize);
+            .min(MAX_FILE_BYTES as usize)
+            .next_multiple_of(SECTOR_BYTES);
         let mut data = Vec::with_capacity(cap_hint);
-        let mut sector = [0u8; SECTOR_BYTES];
         'extents: for ext in extents {
             let (data_lba, data_len) = (ext.lba, ext.len);
             if max_bytes.is_none() {
@@ -370,8 +413,10 @@ impl UdfFs {
                     status: None,
                     sense: None,
                 })?;
-                read_sector(reader, abs, &mut sector)?;
-                data.extend_from_slice(&sector);
+                // Read straight into the file buffer: no per-sector staging copy.
+                let at = data.len();
+                data.resize(at + SECTOR_BYTES, 0);
+                read_sector(reader, abs, &mut data[at..])?;
             }
         }
 
@@ -400,16 +445,17 @@ impl UdfFs {
     /// `STREAM` directories (case-insensitive) are not descended, and files over 50 MB are
     /// skipped.
     pub fn metadata_sector_ranges(&self, reader: &mut dyn SectorSource) -> Result<Vec<(u32, u32)>> {
-        self.metadata_sector_ranges_for(reader, &|_| true)
+        self.metadata_sector_ranges_for(reader, &|_| Some(WHOLE_FILE))
     }
 
     /// [`Self::metadata_sector_ranges`] over the files `wanted` accepts, by absolute path
-    /// (e.g. `/BDMV/PLAYLIST/00000.mpls`): a file it refuses gets no range and its File Entry
-    /// is not read. The live scan's prefetch plan.
+    /// (e.g. `/BDMV/PLAYLIST/00000.mpls`): `wanted` returns how many bytes of the file to
+    /// prefetch ([`WHOLE_FILE`] for all of it), or `None` to leave it out, File Entry
+    /// unread. The live scan's prefetch plan.
     pub(crate) fn metadata_sector_ranges_for(
         &self,
         reader: &mut dyn SectorSource,
-        wanted: &dyn Fn(&str) -> bool,
+        wanted: &dyn Fn(&str) -> Option<u64>,
     ) -> Result<Vec<(u32, u32)>> {
         let mut ranges = Vec::new();
 
@@ -524,7 +570,7 @@ impl UdfFs {
         reader: &mut dyn SectorSource,
         entry: &DirEntry,
         path: &mut String,
-        wanted: &dyn Fn(&str) -> bool,
+        wanted: &dyn Fn(&str) -> Option<u64>,
         ranges: &mut Vec<(u32, u32)>,
         seen: &mut HashSet<u32>,
     ) -> Result<()> {
@@ -544,7 +590,7 @@ impl UdfFs {
         reader: &mut dyn SectorSource,
         child: &DirEntry,
         path: &mut String,
-        wanted: &dyn Fn(&str) -> bool,
+        wanted: &dyn Fn(&str) -> Option<u64>,
         ranges: &mut Vec<(u32, u32)>,
         seen: &mut HashSet<u32>,
     ) -> Result<()> {
@@ -556,13 +602,13 @@ impl UdfFs {
             return self.collect_file_ranges(reader, child, path, wanted, ranges, seen);
         }
         // A file the scan never reads is not prefetched (nor its File Entry read).
-        if !wanted(path) {
+        let Some(limit) = wanted(path) else {
             return Ok(());
-        }
+        };
         // Include the ICB sector itself (in metadata partition)
         ranges.push((self.meta_to_abs(child.meta_lba)?, 1));
         // Include file data — skip only truly huge files (MKB_RO.inf = 134MB)
-        if child.size > MAX_CACHED_FILE_BYTES {
+        if child.size.min(limit) > MAX_CACHED_FILE_BYTES {
             return Ok(());
         }
         // Push every extent (a fragmented AACS cert / MPLS / CLPI spans several);
@@ -574,7 +620,14 @@ impl UdfFs {
             Err(Error::Halted) => return Err(Error::Halted),
             Err(_) => {}
             Ok(extents) => {
+                // File bytes still wanted: each extent, cached or not, uses up its length.
+                let mut left = limit;
                 for ext in extents {
+                    if left == 0 {
+                        break;
+                    }
+                    let take = (ext.len as u64).min(left);
+                    left -= take;
                     // An unrecorded extent holds nothing to cache.
                     if !ext.recorded {
                         continue;
@@ -582,7 +635,7 @@ impl UdfFs {
                     let Some(abs_start) = self.partition_start.checked_add(ext.lba) else {
                         continue;
                     };
-                    let sector_count = (ext.len as u64).div_ceil(SECTOR_BYTES_U64) as u32;
+                    let sector_count = take.div_ceil(SECTOR_BYTES_U64) as u32;
                     ranges.push((abs_start, sector_count));
                 }
                 compact_ranges(ranges, self.meta.start())?;
@@ -885,8 +938,19 @@ impl UdfFs {
         reader: &mut dyn SectorSource,
         path: &str,
     ) -> Result<Vec<(u32, u32)>> {
-        let meta_lba = self.entry_at(path)?.meta_lba;
-        let abs = self.extents_abs_at(reader, meta_lba)?;
+        let entry = self.entry_at(path)?;
+        self.entry_extents(reader, entry, path)
+    }
+
+    /// [`Self::file_extents`] of an entry the caller already holds; `path` only names it
+    /// in an error.
+    pub(crate) fn entry_extents(
+        &self,
+        reader: &mut dyn SectorSource,
+        entry: &DirEntry,
+        path: &str,
+    ) -> Result<Vec<(u32, u32)>> {
+        let abs = self.extents_abs_at(reader, entry.meta_lba)?;
         // Refuse only a hole that OCCUPIES byte space (zero-length displaces
         // nothing, so `!recorded` alone wrongly drops fine titles). The hazard is
         // LENGTH: reading it splices undefined sectors in; dropping shifts later extents.
@@ -901,9 +965,13 @@ impl UdfFs {
     /// Resolve `path` to its directory entry. Shared by both extent
     /// resolvers so they cannot drift apart on lookup semantics.
     fn entry_at(&self, path: &str) -> Result<&DirEntry> {
-        let parts: Vec<&str> = path.trim_matches('/').split('/').collect();
+        let trimmed = path.trim_matches('/');
+        let (dirs, filename) = match trimmed.rsplit_once('/') {
+            Some((dirs, name)) => (Some(dirs), name),
+            None => (None, trimmed),
+        };
         let mut current = &self.root;
-        for part in &parts[..parts.len() - 1] {
+        for part in dirs.into_iter().flat_map(|d| d.split('/')) {
             current = current
                 .entries
                 .iter()
@@ -912,14 +980,6 @@ impl UdfFs {
                     path: part.to_string(),
                 })?;
         }
-        let filename = match parts.last() {
-            Some(f) => f,
-            None => {
-                return Err(Error::UdfNotFound {
-                    path: path.to_string(),
-                });
-            }
-        };
         current
             .entries
             .iter()
@@ -1924,8 +1984,22 @@ pub(crate) struct BufferedSectorReader<'a, S: SectorSource + ?Sized = dyn Sector
     cache: Vec<u8>,
     cache_sectors: u32,
     batch: u16,
-    /// Pre-fetched sector data from bulk reads (sector ranges for AACS, MPLS, CLPI, etc.)
-    prefetched: std::collections::HashMap<u32, Vec<u8>>,
+    /// Pre-fetched sector runs from bulk reads (AACS, MPLS, CLPI, etc.): one contiguous
+    /// buffer per run, sorted by start LBA and disjoint, so a lookup is a binary search
+    /// and the cache costs no per-sector allocation.
+    prefetched: Vec<PrefetchRun>,
+}
+
+/// One prefetched run: `data` holds whole sectors starting at `start`.
+struct PrefetchRun {
+    start: u32,
+    data: Vec<u8>,
+}
+
+impl PrefetchRun {
+    fn sectors(&self) -> u32 {
+        (self.data.len() / SECTOR_BYTES) as u32
+    }
 }
 
 impl<'a, S: SectorSource + ?Sized> BufferedSectorReader<'a, S> {
@@ -1936,7 +2010,7 @@ impl<'a, S: SectorSource + ?Sized> BufferedSectorReader<'a, S> {
             cache: Vec::new(),
             cache_sectors: 0,
             batch,
-            prefetched: std::collections::HashMap::new(),
+            prefetched: Vec::new(),
         }
     }
 
@@ -1991,53 +2065,102 @@ impl<S: SectorSource + ?Sized> BufferedSectorReader<'_, S> {
         Ok(())
     }
 
-    /// Pre-read multiple sector ranges into the permanent per-sector HashMap cache
-    /// (bulk-loads AACS/MPLS/CLPI/META before scanning), capped at MAX_PREFETCH_SECTORS
-    /// to bound RAM against a crafted UDF. A Stop ends it with `Halted` between (or within)
-    /// ranges; any other failed batch skips the rest of that range.
+    /// Pre-read multiple sector ranges into the permanent prefetch cache (bulk-loads
+    /// AACS/MPLS/CLPI/META before scanning), capped at MAX_PREFETCH_SECTORS to bound RAM
+    /// against a crafted UDF. Each range is read straight into one contiguous run. A Stop
+    /// ends it with `Halted` between (or within) ranges; any other failed batch skips the
+    /// rest of that range.
     pub(crate) fn prefetch_ranges(&mut self, ranges: &[(u32, u32)]) -> crate::error::Result<()> {
         // 2048 bytes/sector → 128 Ki sectors ≈ 256 MiB of permanent cache.
         const MAX_PREFETCH_SECTORS: u64 = 128 * 1024;
-        let mut tmp = vec![0u8; self.batch as usize * SECTOR_BYTES];
         let total: u64 = ranges.iter().map(|&(_, c)| c as u64).sum();
-        let mut cached: u64 = 0;
+        let mut cached: u64 = self.prefetched.iter().map(|r| r.sectors() as u64).sum();
         let mut done: u64 = 0;
         let mut hb = crate::progress::Heartbeat::new("udf_prefetch");
-        for &(start, count) in ranges {
+        let mut result = Ok(());
+        'ranges: for &(start, count) in ranges {
             // Clamp to u32 LBA space: unconstrained Uint32 ADs left `start + count`
             // unbounded, so a range near the top overflowed `start + offset` below
             // (debug panic; release wrap seeded the permanent cache at low LBAs).
             let count = count.min(u32::MAX - start);
+            let room = MAX_PREFETCH_SECTORS
+                .saturating_sub(cached)
+                .min(count as u64);
+            let mut data = Vec::with_capacity(room as usize * SECTOR_BYTES);
             let mut offset = 0u32;
             while offset < count {
+                if cached >= MAX_PREFETCH_SECTORS {
+                    // Cache cap hit: later LBAs are still served by the sliding window.
+                    self.push_run(start, data);
+                    break 'ranges;
+                }
                 hb.tick(done, total);
-                let batch = (count - offset).min(self.batch as u32) as u16;
-                let bytes = batch as usize * SECTOR_BYTES;
-                match self
-                    .inner
-                    .read_sectors(start + offset, batch, &mut tmp[..bytes], true)
+                let batch = (count - offset)
+                    .min(self.batch as u32)
+                    .min((MAX_PREFETCH_SECTORS - cached) as u32) as u16;
+                let at = data.len();
+                data.resize(at + batch as usize * SECTOR_BYTES, 0);
+                if let Err(e) =
+                    self.inner
+                        .read_sectors(start + offset, batch, &mut data[at..], true)
                 {
-                    Ok(_) => {}
-                    Err(crate::error::Error::Halted) => return Err(crate::error::Error::Halted),
-                    Err(_) => break,
-                }
-                for i in 0..batch as u32 {
-                    if cached >= MAX_PREFETCH_SECTORS {
-                        // Cache cap hit: stop seeding the permanent HashMap.
-                        // Remaining LBAs are still served by the sliding-window
-                        // read path below, just without the bulk pre-load.
-                        return Ok(());
+                    data.truncate(at);
+                    if matches!(e, crate::error::Error::Halted) {
+                        self.push_run(start, data);
+                        result = Err(crate::error::Error::Halted);
+                        break 'ranges;
                     }
-                    let s = i as usize * SECTOR_BYTES;
-                    self.prefetched
-                        .insert(start + offset + i, tmp[s..s + SECTOR_BYTES].to_vec());
-                    cached += 1;
+                    break;
                 }
+                cached += batch as u64;
                 offset += batch as u32;
                 done += batch as u64;
             }
+            self.push_run(start, data);
         }
-        Ok(())
+        self.prefetched.sort_unstable_by_key(|r| r.start);
+        self.merge_overlapping_runs();
+        result
+    }
+
+    fn push_run(&mut self, start: u32, mut data: Vec<u8>) {
+        if !data.is_empty() {
+            data.shrink_to_fit();
+            self.prefetched.push(PrefetchRun { start, data });
+        }
+    }
+
+    // Keeps the sorted runs disjoint: an overlapping run adds only its tail past the run
+    // before it. `metadata_sector_ranges_for` already merges, so this is rare.
+    fn merge_overlapping_runs(&mut self) {
+        let runs = std::mem::take(&mut self.prefetched);
+        for run in runs {
+            if let Some(last) = self.prefetched.last_mut() {
+                let last_end = last.start as u64 + last.sectors() as u64;
+                if (run.start as u64) < last_end {
+                    let skip = (last_end - run.start as u64) as usize * SECTOR_BYTES;
+                    if let Some(tail) = run.data.get(skip..) {
+                        last.data.extend_from_slice(tail);
+                    }
+                    continue;
+                }
+            }
+            self.prefetched.push(run);
+        }
+    }
+
+    /// The prefetched bytes of sector `lba`, borrowed from its run.
+    fn prefetched_sector(&self, lba: u32) -> Option<&[u8]> {
+        let idx = self.prefetched.partition_point(|r| r.start <= lba);
+        let run = self.prefetched.get(idx.checked_sub(1)?)?;
+        let off = (lba - run.start) as usize * SECTOR_BYTES;
+        run.data.get(off..off + SECTOR_BYTES)
+    }
+
+    /// Whether sector `lba` is served from the permanent prefetch cache.
+    #[cfg(test)]
+    pub(crate) fn is_prefetched(&self, lba: u32) -> bool {
+        self.prefetched_sector(lba).is_some()
     }
 }
 
@@ -2055,8 +2178,8 @@ impl<S: SectorSource + ?Sized> SectorSource for BufferedSectorReader<'_, S> {
             if buf.len() < SECTOR_BYTES {
                 return Err(crate::error::Error::UdfBufferTooSmall);
             }
-            // Check permanent prefetch cache first (HashMap)
-            if let Some(data) = self.prefetched.get(&lba) {
+            // Check the permanent prefetch cache first.
+            if let Some(data) = self.prefetched_sector(lba) {
                 buf[..SECTOR_BYTES].copy_from_slice(data);
                 return Ok(SECTOR_BYTES);
             }

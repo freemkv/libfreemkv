@@ -77,3 +77,55 @@ fn read_unit_needs_the_whole_unit() {
     assert!(read_unit(&mut Short(full - 1), 0).unwrap().is_none());
     assert!(read_unit(&mut Short(0), 0).unwrap().is_none());
 }
+
+fn next_rand(state: &mut u64) -> u64 {
+    *state ^= *state << 13;
+    *state ^= *state >> 7;
+    *state ^= *state << 17;
+    *state
+}
+
+fn rand_ranges(state: &mut u64, n: usize, span: u32) -> Vec<(u32, u32)> {
+    (0..n)
+        .map(|_| {
+            let s = (next_rand(state) % span as u64) as u32;
+            (s, s + (next_rand(state) % 40) as u32)
+        })
+        .collect()
+}
+
+// The pieces walk's indexed helpers give exactly what the linear forms they replace give:
+// subtracting from, and merging into, a `sorted_ranges` set, and the titles a range touches.
+#[test]
+fn pieces_index_helpers_match_the_linear_forms() {
+    let mut state = 0x2545_F491_4F6C_DD1Du64;
+    for _ in 0..300 {
+        let claimed = sorted_ranges(rand_ranges(&mut state, 12, 400));
+        let new = rand_ranges(&mut state, 5, 400);
+        let mut naive = claimed.clone();
+        naive.extend(&new);
+        assert_eq!(merge_into_sorted(&claimed, new), sorted_ranges(naive));
+        let s = (next_rand(&mut state) % 400) as u32;
+        let n = (next_rand(&mut state) % 120) as u32;
+        assert_eq!(
+            subtract_sorted(s, n, &claimed),
+            crate::whole_disc::subtract_ranges(&[(s, n)], &claimed)
+        );
+        let titles: Vec<(usize, u32, u32)> = rand_ranges(&mut state, 150, 4000)
+            .into_iter()
+            .filter(|&(s, e)| e > s)
+            .enumerate()
+            .map(|(i, (s, e))| (i % 7, s, e))
+            .collect();
+        let index = TitleRangeIndex::new(&titles);
+        let query = rand_ranges(&mut state, 3, 4000);
+        let mut want: Vec<usize> = titles
+            .iter()
+            .filter(|&&(_, s, e)| super::super::overlaps(&query, s, e))
+            .map(|&(t, _, _)| t)
+            .collect();
+        want.sort_unstable();
+        want.dedup();
+        assert_eq!(index.touching(&query), want);
+    }
+}

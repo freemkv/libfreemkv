@@ -145,7 +145,7 @@ fn fvi_title() -> DiscTitle {
         color_space: ColorSpace::Smpte170m,
         display_aspect: Some((16, 9)),
         secondary: false,
-        label: String::new(),
+        label: Default::default(),
         measured_cicp: None,
     })];
     t.content_format = ContentFormat::MpegPs;
@@ -395,7 +395,7 @@ fn aac_audio_title(pid: u16) -> DiscTitle {
         sample_rate: SampleRate::S48,
         secondary: false,
         purpose: LabelPurpose::Normal,
-        label: String::new(),
+        label: Default::default(),
     }));
     t
 }
@@ -611,7 +611,7 @@ fn build_iso_pipeline_pruned_title_drops_unselected_pid_frames() {
         sample_rate: SampleRate::S48,
         secondary: false,
         purpose: LabelPurpose::Normal,
-        label: String::new(),
+        label: Default::default(),
     }));
     title.extents = vec![Extent {
         start_lba: 0,

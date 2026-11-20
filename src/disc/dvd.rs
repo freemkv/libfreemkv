@@ -192,7 +192,7 @@ impl Disc {
                     crate::ifo::DvdAspect::R4x3 => (4, 3),
                 }),
                 secondary: false,
-                label: String::new(),
+                label: Default::default(),
                 // TODO(spec): measured colour/TFF await a CodecParser->title channel.
                 measured_cicp: None,
             });
@@ -286,10 +286,10 @@ impl Disc {
                 // coded video frame (720x480 NTSC / 720x576 PAL) so players place/scale the
                 // subpicture correctly; format_palette omits it on unresolved (0,0).
                 let (vid_w, vid_h) = ts.video.resolution.pixels().unwrap_or((0, 0));
-                let codec_data = dvd_title
+                let codec_data: Option<std::sync::Arc<[u8]>> = dvd_title
                     .palette
                     .as_ref()
-                    .map(|pal| crate::mux::codec::dvdsub::format_palette(pal, vid_w, vid_h));
+                    .map(|pal| crate::mux::codec::dvdsub::format_palette(pal, vid_w, vid_h).into());
 
                 // Logical stream i routes to the physical id this PGC's SPST_CTL names (not
                 // 0x20+i: anamorphic discs interleave wide/letterbox/pan-scan variants).
@@ -319,7 +319,7 @@ impl Disc {
                     subtitle_streams.push(Stream::Subtitle(SubtitleStream {
                         pid,
                         codec: Codec::DvdSub,
-                        language: s.language.clone(),
+                        language: s.language.as_str().into(),
                         forced,
                         qualifier,
                         codec_data: codec_data.clone(),
@@ -477,6 +477,7 @@ fn subpicture_label(code_extension: u8) -> (bool, LabelQualifier) {
 // debug. The disc is told apart by its VIDEO_TS.IFO.
 fn warn_multi_pgc_titles(vmg: &[u8], info: &ifo::DvdInfo) {
     use std::hash::{Hash, Hasher};
+    const MAX_WARNED_DISCS: usize = 256;
     static WARNED: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
     let split: Vec<String> = info
         .title_sets
@@ -500,6 +501,10 @@ fn warn_multi_pgc_titles(vmg: &[u8], info: &ifo::DvdInfo) {
         let mut warned = WARNED.lock().unwrap_or_else(|e| e.into_inner());
         let first = !warned.contains(&key);
         if first {
+            // Bounded for a long-running daemon: the oldest disc is forgotten first.
+            if warned.len() >= MAX_WARNED_DISCS {
+                warned.remove(0);
+            }
             warned.push(key);
         }
         first
@@ -551,11 +556,11 @@ fn title_audio_streams(ts: &ifo::DvdTitleSet, t: &ifo::DvdTitle, title: u16) -> 
             pid,
             codec: a.codec,
             channels: AudioChannels::from_count(a.channels),
-            language: a.language.clone(),
+            language: a.language.as_str().into(),
             sample_rate: SampleRate::from_hz(a.sample_rate),
             secondary: false,
             purpose: audio_purpose(a.code_extension),
-            label: String::new(),
+            label: Default::default(),
         }));
         // Coding mode 3, "MPEG-2 with extension bitstream" (EP0867877A2): its extension stream
         // `0xD0|n` becomes a dependent track right after the base (pairing inferred, see
@@ -568,11 +573,11 @@ fn title_audio_streams(ts: &ifo::DvdTitleSet, t: &ifo::DvdTitle, title: u16) -> 
                 pid: ext_pid,
                 codec: Codec::Mp2,
                 channels: AudioChannels::Unknown,
-                language: a.language.clone(),
+                language: a.language.as_str().into(),
                 sample_rate: SampleRate::from_hz(a.sample_rate),
                 secondary: false,
                 purpose: audio_purpose(a.code_extension),
-                label: crate::disc::MP2_EXTENSION_LABEL.to_string(),
+                label: std::borrow::Cow::Borrowed(crate::disc::MP2_EXTENSION_LABEL),
             }));
         }
     }

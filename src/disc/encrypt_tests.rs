@@ -390,7 +390,7 @@ fn vid_only_disc_hash_is_sha1_of_unit_key_ro() {
     assert_eq!(st.disc_hash, expected);
     assert!(st.disc_hash.starts_with("0x"));
     // uk_ro must be stashed verbatim for the external resolver.
-    assert_eq!(st.uk_ro, uk);
+    assert_eq!(&st.uk_ro[..], &uk[..]);
 }
 
 /// The MKB is trimmed to its real record length, NOT left as the full

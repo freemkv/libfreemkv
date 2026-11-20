@@ -400,3 +400,26 @@ fn cpi_section_present_still_parses() {
 // ─────────────────────────────────────────────────────────────────────
 // parse_cpi — low-level fixtures
 // ─────────────────────────────────────────────────────────────────────
+
+// The scan reads only the header: `packet_count` over the first HEADER_BYTES gives the
+// same count and the same errors as a full `parse`.
+#[test]
+fn packet_count_from_the_header_matches_a_full_parse() {
+    let pi = build_program_info(&[(0x1200, vec![0x90u8, b'f', b'r', b'a'])]);
+    let cpi = [0u8, 0, 0, 2, 0, 0];
+    for data in [
+        build_clpi(5, None),
+        build_clpi(0xDEAD_BEEF, Some(&cpi)),
+        build_clpi_with_proginfo(777, &pi, Some(&cpi)),
+    ] {
+        let head = &data[..HEADER_BYTES.min(data.len())];
+        assert_eq!(
+            packet_count(head).expect("head"),
+            parse(&data).expect("parse").source_packet_count
+        );
+    }
+    let short = build_clpi(9, None);
+    assert_eq!(packet_count(&short[..40]).expect("cut head"), 0);
+    assert!(packet_count(&short[..15]).is_err());
+    assert!(packet_count(b"XXXX0200XXXXXXXXXXXX").is_err());
+}

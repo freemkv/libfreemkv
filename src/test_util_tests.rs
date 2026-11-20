@@ -47,8 +47,8 @@ fn aacs_state_defaults_and_every_setter() {
         .mkb_version(Some(77))
         .disc_hash("0xABC")
         .volume_id([9; 16])
-        .uk_ro(vec![1, 2])
-        .mkb(vec![3])
+        .uk_ro(vec![1u8, 2])
+        .mkb(vec![3u8])
         .build();
     assert_eq!(
         (s.version, s.bus_encryption, s.mkb_version),
@@ -56,7 +56,7 @@ fn aacs_state_defaults_and_every_setter() {
     );
     assert_eq!(s.disc_hash, "0xABC");
     assert_eq!(s.volume_id, [9; 16]);
-    assert_eq!((s.uk_ro, s.mkb), (vec![1, 2], vec![3]));
+    assert_eq!((&s.uk_ro[..], &s.mkb[..]), (&[1u8, 2][..], &[3u8][..]));
 }
 
 fn fixture() -> EncryptedBdImage {

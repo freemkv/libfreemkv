@@ -9,7 +9,7 @@ fn mp2_track(pid: u16, label: &str) -> AudioStream {
         sample_rate: SampleRate::S48,
         secondary: false,
         purpose: LabelPurpose::Normal,
-        label: label.into(),
+        label: label.to_string().into(),
     }
 }
 
@@ -921,8 +921,8 @@ fn aacs_state_and_key_debug_are_redacted() {
         mkb_version: Some(77),
         disc_hash: "0xAA".into(),
         volume_id: [0xD5; 16],
-        uk_ro: vec![1, 2, 3],
-        mkb: vec![4, 5, 6],
+        uk_ro: vec![1u8, 2, 3].into(),
+        mkb: vec![4u8, 5, 6].into(),
     };
     let d = format!("{st:?}");
     assert!(!d.contains("213"), "AacsState leaked key bytes: {d}");
@@ -1040,7 +1040,7 @@ fn title_with_video(codec: Codec, resolution: Resolution) -> DiscTitle {
             color_space: ColorSpace::Bt709,
             display_aspect: None,
             secondary: false,
-            label: String::new(),
+            label: Default::default(),
             measured_cicp: None,
         })],
         chapters: Vec::new(),
@@ -1093,7 +1093,7 @@ fn title_with(playlist: &str, duration_secs: f64, size_bytes: u64, n_clips: usiz
         .map(|i| Clip {
             marks_on_pes_clock: true,
             feed_span: None,
-            clip_id: format!("{i:05}"),
+            clip_id: format!("{i:05}").into(),
             in_time: 0,
             out_time: 1,
             duration_secs: 1.0,
@@ -1552,7 +1552,7 @@ fn canonical_title_order_picks_largest_feature() {
                 .map(|i| Clip {
                     marks_on_pes_clock: true,
                     feed_span: None,
-                    clip_id: format!("{i:05}"),
+                    clip_id: format!("{i:05}").into(),
                     in_time: 0,
                     out_time: 0,
                     duration_secs: 0.0,
@@ -1601,7 +1601,7 @@ fn canonical_title_order_prefers_stream_richer_sibling_issue_45() {
         color_space: ColorSpace::Bt709,
         display_aspect: None,
         secondary: true,
-        label: String::new(),
+        label: Default::default(),
         measured_cicp: None,
     }));
     let mut vv = [base(40), richer_v];
@@ -1635,6 +1635,69 @@ fn canonical_title_order_prefers_stream_richer_sibling_issue_45() {
         ii[0].playlist_id, 800,
         "identical seamless siblings still pick the lowest id"
     );
+}
+
+// The scan sorts by precomputed keys; they must order titles exactly as the public
+// comparators do, ties and oversize demotion included.
+#[test]
+fn cached_title_keys_order_like_the_comparators() {
+    let cap = 50_000_000_000u64;
+    let mut state = 0x853C_49E6_748F_EA9Bu64;
+    let mut next = |m: u64| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state % m
+    };
+    for _ in 0..50 {
+        let mut titles: Vec<DiscTitle> = (0..12u16)
+            .map(|id| {
+                let mut t = title_with_video(Codec::Hevc, Resolution::R2160p);
+                t.playlist_id = 800 + (next(6) as u16) * 10 + id;
+                t.size_bytes = [1, 2, 60_000][next(3) as usize] * 1_000_000;
+                t.duration_secs = [600.0, 7200.0, f64::NAN][next(3) as usize];
+                for _ in 0..next(3) {
+                    t.streams.push(Stream::Subtitle(SubtitleStream {
+                        pid: 0x1200,
+                        codec: Codec::Pgs,
+                        language: "eng".into(),
+                        forced: false,
+                        qualifier: LabelQualifier::None,
+                        codec_data: None,
+                    }));
+                }
+                if next(2) == 0 {
+                    t.streams.clear();
+                }
+                t
+            })
+            .collect();
+        let ranks: Vec<TitleRank> = (0..titles.len())
+            .map(|_| TitleRank {
+                nav: next(5) == 0,
+                authoring: next(4) == 0,
+                composite: next(3) == 0,
+            })
+            .collect();
+        let ids = |v: &[DiscTitle]| v.iter().map(|t| t.playlist_id).collect::<Vec<_>>();
+        let mut by_cmp = titles.clone();
+        by_cmp.sort_by(|a, b| Disc::canonical_title_order(a, b, cap));
+        let mut by_key = titles.clone();
+        by_key.sort_by_cached_key(|t| Disc::canonical_key(t, cap));
+        assert_eq!(ids(&by_key), ids(&by_cmp));
+        let mut dec_cmp: Vec<(TitleRank, DiscTitle)> =
+            ranks.iter().copied().zip(titles.clone()).collect();
+        dec_cmp.sort_by(|(ra, a), (rb, b)| Disc::main_feature_order(a, b, cap, ra, rb));
+        let mut dec_key: Vec<(TitleRank, DiscTitle)> = ranks
+            .iter()
+            .copied()
+            .zip(std::mem::take(&mut titles))
+            .collect();
+        dec_key.sort_by_cached_key(|(r, t)| Disc::main_feature_key(t, r, cap));
+        let pid =
+            |v: &[(TitleRank, DiscTitle)]| v.iter().map(|p| p.1.playlist_id).collect::<Vec<_>>();
+        assert_eq!(pid(&dec_key), pid(&dec_cmp));
+    }
 }
 
 // L088: canonical_title_order's final tiebreak (playlist_id) is a real sort
@@ -3168,8 +3231,8 @@ fn aacs_empty() -> AacsState {
         mkb_version: None,
         disc_hash: String::new(),
         volume_id: [0u8; 16],
-        uk_ro: Vec::new(),
-        mkb: Vec::new(),
+        uk_ro: Vec::<u8>::new().into(),
+        mkb: Vec::<u8>::new().into(),
     }
 }
 
@@ -3515,7 +3578,7 @@ fn correct_truehd_channels_skips_probe_when_no_truehd_stream() {
         sample_rate: SampleRate::S48,
         secondary: false,
         purpose: LabelPurpose::Normal,
-        label: String::new(),
+        label: Default::default(),
     })];
     title.extents = vec![Extent {
         start_lba: 0,
@@ -4222,7 +4285,7 @@ fn disc_title_stream_filters_select_their_own_kind_in_order() {
             color_space: ColorSpace::Bt2020,
             display_aspect: None,
             secondary: false,
-            label: String::new(),
+            label: Default::default(),
             measured_cicp: None,
         }),
         Stream::Audio(AudioStream {
@@ -4233,7 +4296,7 @@ fn disc_title_stream_filters_select_their_own_kind_in_order() {
             sample_rate: SampleRate::S48,
             secondary: false,
             purpose: LabelPurpose::Normal,
-            label: String::new(),
+            label: Default::default(),
         }),
         Stream::Audio(AudioStream {
             pid: 0x1101,
@@ -4243,7 +4306,7 @@ fn disc_title_stream_filters_select_their_own_kind_in_order() {
             sample_rate: SampleRate::S48,
             secondary: true,
             purpose: LabelPurpose::Commentary,
-            label: String::new(),
+            label: Default::default(),
         }),
         // Blu-ray 3D dependent view: a second video stream.
         Stream::Video(VideoStream {
@@ -4255,7 +4318,7 @@ fn disc_title_stream_filters_select_their_own_kind_in_order() {
             color_space: ColorSpace::Bt709,
             display_aspect: None,
             secondary: true,
-            label: String::new(),
+            label: Default::default(),
             measured_cicp: None,
         }),
     ];
@@ -4407,7 +4470,7 @@ fn title_with_audio(audio: &[(Codec, AudioChannels)]) -> DiscTitle {
                     sample_rate: SampleRate::S48,
                     secondary: false,
                     purpose: LabelPurpose::Normal,
-                    label: String::new(),
+                    label: Default::default(),
                 })
             })
             .collect(),
@@ -5764,13 +5827,17 @@ fn main_title_prefers_the_largest_title_with_video() {
 fn inputs_label_is_the_trimmed_volume_id_else_the_meta_title() {
     let mut disc = make_test_disc(1_000, "  TITLE_2024  ");
     let mut st = aacs_empty();
-    st.uk_ro = vec![1, 2, 3];
-    st.mkb = vec![4, 5];
+    st.uk_ro = vec![1u8, 2, 3].into();
+    st.mkb = vec![4u8, 5].into();
     disc.aacs = Some(st);
     let i = disc.inputs().expect("inputs");
     assert_eq!(i.volume_label.as_deref(), Some("TITLE_2024"));
-    assert_eq!(i.unit_key_ro, vec![1, 2, 3]);
-    assert_eq!(i.mkb, vec![4, 5]);
+    assert_eq!(&i.unit_key_ro[..], &[1u8, 2, 3]);
+    assert!(std::sync::Arc::ptr_eq(
+        &i.mkb,
+        &disc.aacs.as_ref().unwrap().mkb
+    ));
+    assert_eq!(&i.mkb[..], &[4u8, 5]);
     disc.volume_id = "   ".into();
     disc.meta_title = Some("Meta".into());
     assert_eq!(
@@ -5971,6 +6038,26 @@ fn scan_prefetches_only_the_files_a_bd_scan_parses() {
     ] {
         assert!(scan_parses(false, p), "{p}: a non-BD tree keeps every file");
     }
+}
+
+// The prefetch loads only a CLPI's header on a BD tree, every other parsed file whole,
+// and nothing the scan does not parse.
+#[test]
+fn scan_prefetch_loads_only_the_clpi_header() {
+    let head = Some(crate::clpi::HEADER_BYTES as u64);
+    let whole = Some(crate::udf::WHOLE_FILE);
+    assert_eq!(scan_prefetch_bytes(true, "/BDMV/CLIPINF/00055.clpi"), head);
+    assert_eq!(scan_prefetch_bytes(true, "/bdmv/clipinf/00055.CLPI"), head);
+    assert_eq!(
+        scan_prefetch_bytes(true, "/BDMV/PLAYLIST/00800.mpls"),
+        whole
+    );
+    assert_eq!(scan_prefetch_bytes(true, "/AACS/MKB_RO.inf"), whole);
+    assert_eq!(scan_prefetch_bytes(true, "/BDMV/BACKUP/index.bdmv"), None);
+    assert_eq!(
+        scan_prefetch_bytes(false, "/BDMV/CLIPINF/00055.clpi"),
+        whole
+    );
 }
 
 #[test]
@@ -6184,4 +6271,37 @@ fn a_complete_feature_has_a_chapter_table_spanning_half_its_runtime() {
         0.0,
         &[0.0, 0.0]
     )));
+}
+
+// A stream language is held inline and reads, prints and compares as the String it replaced;
+// the lossy decode of 3 invalid bytes (9 bytes) fits, and an oversized value is cut on a char.
+#[test]
+fn lang_reads_prints_and_compares_like_a_string() {
+    let eng = Lang::from("eng");
+    assert_eq!(eng, "eng");
+    assert_eq!(eng.as_str(), "eng");
+    assert_eq!(format!("{eng:?}"), format!("{:?}", "eng"));
+    assert_eq!(eng.to_string(), "eng");
+    assert!(Lang::default().is_empty());
+    assert_eq!(Lang::default(), "");
+    let lossy = String::from_utf8_lossy(&[0xFF, 0xFE, 0xFD]).to_string();
+    assert_eq!(Lang::from(lossy.as_str()), lossy);
+    let long = "é".repeat(10);
+    let cut = Lang::from(long.as_str());
+    assert_eq!(cut.as_str(), "é".repeat(7));
+    assert!(Lang::from("deu") < Lang::from("eng"));
+    assert_eq!(Lang::from("fra"), Lang::from(String::from("fra")));
+}
+
+// A clip id reads, prints and compares as the String it replaced, and clones share it.
+#[test]
+fn clip_id_reads_prints_and_compares_like_a_string() {
+    let id = ClipId::from("00001");
+    assert_eq!(id, "00001");
+    assert_eq!(id, String::from("00001"));
+    assert_eq!(format!("{id:?}"), format!("{:?}", "00001"));
+    assert_eq!(format!("{id}"), "00001");
+    let copy = id.clone();
+    assert!(std::ptr::eq(id.as_str(), copy.as_str()));
+    assert!(ClipId::default().is_empty());
 }

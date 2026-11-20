@@ -1759,6 +1759,59 @@ fn prefetch_ranges_serves_every_sector_of_every_range_from_the_permanent_cache()
 }
 
 #[test]
+fn prefetch_ranges_keeps_runs_contiguous_disjoint_and_sorted() {
+    // Unsorted, overlapping and nested ranges: every sector is served at its own
+    // LBA, the runs end up sorted and disjoint, and gaps between runs miss.
+    let mut inner = CountReader::new();
+    let mut br = BufferedSectorReader::new(&mut inner, 4);
+    br.prefetch_ranges(&[(500, 3), (100, 10), (105, 10), (101, 2), (520, 1)])
+        .unwrap();
+    let starts: Vec<u32> = br.prefetched.iter().map(|r| r.start).collect();
+    assert_eq!(starts, [100, 500, 520]);
+    assert_eq!(br.prefetched[0].sectors(), 15);
+    for lba in (100..115).chain(500..503).chain(520..521) {
+        assert_eq!(
+            br.prefetched_sector(lba),
+            Some(&CountReader::expected(lba)[..])
+        );
+    }
+    for lba in [99u32, 115, 499, 503, 519, 521] {
+        assert!(
+            !br.is_prefetched(lba),
+            "sector {lba} is outside every range"
+        );
+    }
+}
+
+#[test]
+fn prefetch_ranges_keeps_the_sectors_before_a_failed_batch() {
+    // A failed batch ends its range: the sectors already read stay cached, the
+    // rest of that range is left to the sliding window, and later ranges load.
+    struct FailsAt(u32);
+    impl SectorSource for FailsAt {
+        fn read_sectors(&mut self, lba: u32, count: u16, buf: &mut [u8], _: bool) -> Result<usize> {
+            if (lba..lba + count as u32).contains(&self.0) {
+                return Err(Error::UdfBufferTooSmall);
+            }
+            for i in 0..count as u32 {
+                let off = i as usize * 2048;
+                buf[off..off + 2048].copy_from_slice(&CountReader::expected(lba + i));
+            }
+            Ok(count as usize * 2048)
+        }
+    }
+    let mut inner = FailsAt(13);
+    let mut br = BufferedSectorReader::new(&mut inner, 2);
+    br.prefetch_ranges(&[(10, 8), (40, 2)]).unwrap();
+    for lba in [10u32, 11, 40, 41] {
+        assert!(br.is_prefetched(lba), "sector {lba} should be cached");
+    }
+    for lba in 12..18u32 {
+        assert!(!br.is_prefetched(lba), "sector {lba} was past the failure");
+    }
+}
+
+#[test]
 fn metadata_sector_ranges_covers_the_structure_and_each_small_files_extents() {
     // The prefetch plan decides what's bulk-read before scanning: UDF
     // structure, every non-STREAM ICB, RECORDED extents under the size cap,
@@ -1885,7 +1938,7 @@ fn metadata_sector_ranges_leave_out_the_files_wanted_refuses() {
     let ranges = fs
         .metadata_sector_ranges_for(&mut reader, &|p| {
             seen.borrow_mut().push(p.to_string());
-            !p.contains("/BACKUP/")
+            (!p.contains("/BACKUP/")).then_some(WHOLE_FILE)
         })
         .expect("the plan is built");
     assert_eq!(
@@ -1897,6 +1950,46 @@ fn metadata_sector_ranges_leave_out_the_files_wanted_refuses() {
         !reader.1.contains(&(PART + 20)),
         "the refused file's File Entry was read: {:?}",
         reader.1
+    );
+}
+
+// A byte limit from `wanted` prefetches only the file's head: whole sectors covering
+// that many bytes, across extents, and nothing past it.
+#[test]
+fn metadata_sector_ranges_honour_a_head_byte_limit() {
+    const PART: u32 = 1000;
+    let fs = UdfFs {
+        root: DirEntry {
+            name: String::new(),
+            is_dir: true,
+            meta_lba: 0,
+            size: 0,
+            entries: vec![file_entry("00001.clpi", 10, 10240)],
+        },
+        volume_id: String::new(),
+        partition_start: PART,
+        meta: MetaMap::contiguous(PART),
+        metadata_sectors: 4,
+        meta_file_lba: None,
+        meta_mirror: None,
+    };
+    let mut reader = MapReader::new();
+    reader.put(
+        PART + 10,
+        build_efe(10240, &[(0, 4096, 500), (0, 6144, 700)]),
+    );
+    let plan = |reader: &mut MapReader, limit: u64| {
+        fs.metadata_sector_ranges_for(reader, &|_| Some(limit))
+            .expect("the plan is built")
+    };
+    assert_eq!(plan(&mut reader, 60), vec![(0, 1004), (1010, 1), (1500, 1)]);
+    assert_eq!(
+        plan(&mut reader, 5000),
+        vec![(0, 1004), (1010, 1), (1500, 2), (1700, 1)]
+    );
+    assert_eq!(
+        plan(&mut reader, WHOLE_FILE),
+        vec![(0, 1004), (1010, 1), (1500, 2), (1700, 3)]
     );
 }
 
@@ -1944,17 +2037,21 @@ fn prefetch_ranges_near_u32_max_does_not_overflow() {
     br.prefetch_ranges(&[(0xFFFF_FFF0, 512)]).unwrap();
     // Every key the permanent cache holds must be a real LBA, i.e. inside
     // the declared range — never a wrapped low sector.
-    for &lba in br.prefetched.keys() {
+    for run in &br.prefetched {
         assert!(
-            lba >= 0xFFFF_FFF0,
-            "prefetch_ranges wrapped a near-u32::MAX LBA to {lba}"
+            run.start >= 0xFFFF_FFF0,
+            "prefetch_ranges wrapped a near-u32::MAX LBA to {}",
+            run.start
         );
+    }
+    for lba in 0..600u32 {
+        assert!(!br.is_prefetched(lba), "low sector {lba} was seeded");
     }
     // Clamping must drop only unaddressable sectors — dropping addressable
     // ones too silently defeats the bulk read this function exists for.
     for lba in 0xFFFF_FFF0u32..=0xFFFF_FFFE {
         assert!(
-            br.prefetched.contains_key(&lba),
+            br.is_prefetched(lba),
             "addressable sector {lba} was dropped from the prefetch"
         );
     }
@@ -4548,4 +4645,36 @@ fn metadata_partition_map_checks_type_length_and_identifier() {
         !metadata_partition_map(&id, 100),
         "not the metadata identifier"
     );
+}
+
+// The directory index finds a file as the path lookup does: ASCII-case-insensitively,
+// the first entry of a name, never a subdirectory.
+#[test]
+fn file_index_matches_the_path_lookup() {
+    let mut first = file_entry("00001.m2ts", 10, 2048);
+    first.size = 1;
+    let mut dup = file_entry("00001.M2TS", 11, 2048);
+    dup.size = 2;
+    let dir = DirEntry {
+        name: "STREAM".to_string(),
+        is_dir: true,
+        meta_lba: 1,
+        size: 0,
+        entries: vec![
+            DirEntry {
+                name: "SSIF".to_string(),
+                is_dir: true,
+                meta_lba: 2,
+                size: 0,
+                entries: Vec::new(),
+            },
+            first,
+            dup,
+        ],
+    };
+    let idx = FileIndex::of(Some(&dir));
+    assert_eq!(idx.get("00001.M2ts").map(|e| e.size), Some(1));
+    assert!(idx.get("ssif").is_none(), "a subdirectory is not a file");
+    assert!(idx.get("00002.m2ts").is_none());
+    assert!(FileIndex::of(None).get("00001.m2ts").is_none());
 }

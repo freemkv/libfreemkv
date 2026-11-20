@@ -104,7 +104,7 @@ fn three_cell_feed(
         color_space: ColorSpace::Bt709,
         display_aspect: None,
         secondary: false,
-        label: String::new(),
+        label: Default::default(),
         measured_cicp: None,
     }));
     let parsers: Vec<(u16, Box<dyn CodecParser>)> = vec![(
@@ -501,7 +501,7 @@ fn b1_audio_does_not_drop_on_discontinuity() {
         sample_rate: SampleRate::S48,
         secondary: false,
         purpose: LabelPurpose::Normal,
-        label: String::new(),
+        label: Default::default(),
     }));
     let parsers: Vec<(u16, Box<dyn CodecParser>)> = vec![(0x1100, Box::new(KeyframeParser))];
     let pid_to_track = vec![(0x1100u16, 0usize)];
@@ -632,7 +632,7 @@ fn declared_extension_track_carries_each_pes_whole() {
         sample_rate: crate::disc::SampleRate::S48,
         secondary: false,
         purpose: crate::disc::LabelPurpose::Normal,
-        label: crate::disc::MP2_EXTENSION_LABEL.into(),
+        label: std::borrow::Cow::Borrowed(crate::disc::MP2_EXTENSION_LABEL),
     };
     title.streams.push(crate::disc::Stream::Audio(ext));
     // The canonical builder both read paths use picks the parser.
@@ -782,7 +782,7 @@ fn a_pts_less_second_field_merges_into_its_first() {
         color_space: ColorSpace::Bt709,
         display_aspect: None,
         secondary: false,
-        label: String::new(),
+        label: Default::default(),
         measured_cicp: None,
     }));
     let parsers: Vec<(u16, Box<dyn CodecParser>)> = vec![(
@@ -863,7 +863,7 @@ fn run_ps_fragments(codec: Codec) -> Vec<crate::pes::PesFrame> {
         color_space: ColorSpace::Bt709,
         display_aspect: None,
         secondary: false,
-        label: String::new(),
+        label: Default::default(),
         measured_cicp: None,
     }));
     let parsers: Vec<(u16, Box<dyn CodecParser>)> = vec![(
@@ -987,7 +987,7 @@ fn video_title(secondary: bool) -> DiscTitle {
         color_space: ColorSpace::Bt2020,
         display_aspect: None,
         secondary,
-        label: String::new(),
+        label: Default::default(),
         measured_cicp: None,
     }));
     t
@@ -1099,7 +1099,7 @@ fn headers_ready_true_for_audio_only_title() {
         sample_rate: SampleRate::S48,
         secondary: false,
         purpose: LabelPurpose::Normal,
-        label: String::new(),
+        label: Default::default(),
     }));
     let (stream, _tx) = make_stream(title, vec![], vec![]);
     assert!(stream.headers_ready(), "no video → always ready");
@@ -1116,7 +1116,7 @@ fn aac_audio(pid: u16) -> crate::disc::Stream {
         sample_rate: SampleRate::S44_1,
         secondary: false,
         purpose: LabelPurpose::Normal,
-        label: String::new(),
+        label: Default::default(),
     })
 }
 
@@ -1294,7 +1294,7 @@ fn dvd_highway_preserves_video_keyframe_and_duration() {
         color_space: ColorSpace::Bt709,
         display_aspect: Some((4, 3)),
         secondary: false,
-        label: String::new(),
+        label: Default::default(),
         measured_cicp: None,
     }));
     let parsers: Vec<(u16, Box<dyn CodecParser>)> =

@@ -434,7 +434,7 @@ fn a_high_track_number_on_a_dropped_track_type_does_not_fail_the_file() {
 fn audio_language(extra: &[u8]) -> String {
     let s = open(mkv(&[entry(1, 2, ebml::CODEC_AC3, extra)], &[]));
     match &s.info().streams[0] {
-        Stream::Audio(a) => a.language.clone(),
+        Stream::Audio(a) => a.language.to_string(),
         other => panic!("expected audio, got {other:?}"),
     }
 }

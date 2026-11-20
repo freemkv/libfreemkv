@@ -161,7 +161,7 @@ fn read_rejects_sample_offset_past_eof() {
         color_space: crate::disc::ColorSpace::Unknown,
         display_aspect: None,
         secondary: false,
-        label: String::new(),
+        label: Default::default(),
         measured_cicp: None,
     })];
     t.codec_privates = vec![Some(vec![0xAA, 0xBB, 0xCC, 0xDD, 0xEE])];
@@ -284,7 +284,7 @@ fn write_then_read_round_trip() {
             color_space: crate::disc::ColorSpace::Unknown,
             display_aspect: None,
             secondary: false,
-            label: String::new(),
+            label: Default::default(),
             measured_cicp: None,
         }),
         DiscStreamE::Audio(AudioStream {
@@ -295,7 +295,7 @@ fn write_then_read_round_trip() {
             sample_rate: SampleRate::S48,
             secondary: false,
             purpose: LabelPurpose::Normal,
-            label: String::new(),
+            label: Default::default(),
         }),
     ];
     let hvcc = vec![0xAA, 0xBB, 0xCC, 0xDD, 0xEE];
@@ -473,7 +473,7 @@ fn b_frame_presentation_order_survives_the_mp4_round_trip() {
         color_space: crate::disc::ColorSpace::Unknown,
         display_aspect: None,
         secondary: false,
-        label: String::new(),
+        label: Default::default(),
         measured_cicp: None,
     })];
     t.codec_privates = vec![Some(vec![0xAA, 0xBB, 0xCC, 0xDD, 0xEE])];
@@ -561,7 +561,7 @@ fn declared_track_duration_equals_frame_count_times_frame_duration() {
         color_space: crate::disc::ColorSpace::Unknown,
         display_aspect: None,
         secondary: false,
-        label: String::new(),
+        label: Default::default(),
         measured_cicp: None,
     })];
     t.codec_privates = vec![Some(vec![0xAA, 0xBB, 0xCC, 0xDD, 0xEE])];
@@ -646,7 +646,7 @@ fn moov_tree_carries_the_mandatory_track_header_and_media_boxes() {
             color_space: crate::disc::ColorSpace::Unknown,
             display_aspect: None,
             secondary: false,
-            label: String::new(),
+            label: Default::default(),
             measured_cicp: None,
         }),
         DiscStreamE::Audio(AudioStream {
@@ -657,7 +657,7 @@ fn moov_tree_carries_the_mandatory_track_header_and_media_boxes() {
             sample_rate: SampleRate::S48,
             secondary: false,
             purpose: LabelPurpose::Normal,
-            label: String::new(),
+            label: Default::default(),
         }),
     ];
     t.codec_privates = vec![Some(vec![0xAA, 0xBB, 0xCC, 0xDD, 0xEE]), None];
@@ -1373,7 +1373,7 @@ fn a_96k_dts_hd_track_round_trips_its_rate() {
             color_space: crate::disc::ColorSpace::Unknown,
             display_aspect: None,
             secondary: false,
-            label: String::new(),
+            label: Default::default(),
             measured_cicp: None,
         }),
         DiscStream::Audio(AudioStream {
@@ -1384,7 +1384,7 @@ fn a_96k_dts_hd_track_round_trips_its_rate() {
             sample_rate: SampleRate::S96,
             secondary: false,
             purpose: LabelPurpose::Normal,
-            label: String::new(),
+            label: Default::default(),
         }),
     ];
     t.codec_privates = vec![Some(vec![0xAA, 0xBB, 0xCC]), None];

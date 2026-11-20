@@ -227,7 +227,7 @@ fn create_does_not_panic_when_only_video_is_mvc_dependent() {
         color_space: ColorSpace::Bt709,
         display_aspect: None,
         secondary: true,
-        label: crate::disc::MVC_DEPENDENT_LABEL.to_string(),
+        label: std::borrow::Cow::Borrowed(crate::disc::MVC_DEPENDENT_LABEL),
         measured_cicp: None,
     };
     let title = DiscTitle {
@@ -266,9 +266,9 @@ fn mvc_title() -> crate::disc::DiscTitle {
             display_aspect: None,
             secondary: mvc_dependent,
             label: if mvc_dependent {
-                crate::disc::MVC_DEPENDENT_LABEL.to_string()
+                std::borrow::Cow::Borrowed(crate::disc::MVC_DEPENDENT_LABEL)
             } else {
-                String::new()
+                std::borrow::Cow::Borrowed("")
             },
             measured_cicp: None,
         })
@@ -285,7 +285,7 @@ fn mvc_title() -> crate::disc::DiscTitle {
                 sample_rate: crate::disc::SampleRate::S48,
                 secondary: false,
                 purpose: crate::disc::LabelPurpose::Normal,
-                label: String::new(),
+                label: Default::default(),
             }),
         ],
         ..DiscTitle::empty()
@@ -434,7 +434,7 @@ fn lpcm_bit_depth_follows_the_parser_codec_private() {
                 sample_rate: crate::disc::SampleRate::S48,
                 secondary: false,
                 purpose: crate::disc::LabelPurpose::Normal,
-                label: String::new(),
+                label: Default::default(),
             }));
         title.codec_privates.push(cp);
     }
@@ -459,7 +459,7 @@ fn set_codec_private_skips_a_left_out_stream_and_remaps_the_rest() {
             sample_rate: crate::disc::SampleRate::S48,
             secondary: false,
             purpose: crate::disc::LabelPurpose::Normal,
-            label: label.into(),
+            label: label.to_string().into(),
         })
     };
     title
@@ -514,7 +514,7 @@ fn apply_coding_to_track_sets_measured_field_order_never_guesses() {
             color_space: ColorSpace::Bt470bg,
             display_aspect: None,
             secondary: false,
-            label: String::new(),
+            label: Default::default(),
             measured_cicp: None,
         })
     };
@@ -598,7 +598,7 @@ fn apply_coding_to_track_sets_measured_field_order_never_guesses() {
         color_space: ColorSpace::Bt709,
         display_aspect: None,
         secondary: false,
-        label: String::new(),
+        label: Default::default(),
         measured_cicp: None,
     });
     assert!(!prog.interlaced);
@@ -625,7 +625,7 @@ fn apply_coding_to_track_plumbs_measured_hdr10() {
             color_space: ColorSpace::Bt2020,
             display_aspect: None,
             secondary: false,
-            label: String::new(),
+            label: Default::default(),
             measured_cicp: None,
         })
     };
@@ -2216,7 +2216,7 @@ fn h264_title() -> crate::disc::DiscTitle {
             color_space: ColorSpace::Bt709,
             display_aspect: None,
             secondary: false,
-            label: String::new(),
+            label: Default::default(),
             measured_cicp: None,
         })],
         ..DiscTitle::empty()
@@ -2243,7 +2243,7 @@ fn the_pending_frame_cap_builds_the_muxer_and_keeps_later_frames() {
             sample_rate: crate::disc::SampleRate::S48,
             secondary: false,
             purpose: crate::disc::LabelPurpose::Normal,
-            label: String::new(),
+            label: Default::default(),
         }));
     title.codec_privates.push(None);
     let mut s = MkvStream::create(Box::new(out.clone()), &title, None).unwrap();
@@ -2343,7 +2343,7 @@ fn mp2_extension_track_is_left_out_and_later_tracks_still_mux() {
             sample_rate: crate::disc::SampleRate::S48,
             secondary: false,
             purpose: crate::disc::LabelPurpose::Normal,
-            label: label.into(),
+            label: label.to_string().into(),
         })
     };
     title
@@ -2842,7 +2842,7 @@ fn only_the_first_video_and_first_audio_track_are_default() {
             color_space: ColorSpace::Bt709,
             display_aspect: None,
             secondary: false,
-            label: label.into(),
+            label: label.to_string().into(),
             measured_cicp: None,
         })
     };
@@ -2855,7 +2855,7 @@ fn only_the_first_video_and_first_audio_track_are_default() {
             sample_rate: crate::disc::SampleRate::S48,
             secondary: false,
             purpose: crate::disc::LabelPurpose::Normal,
-            label: label.into(),
+            label: label.to_string().into(),
         })
     };
     let title = DiscTitle {
@@ -2894,7 +2894,7 @@ fn the_activation_trigger_is_the_first_video_track_not_the_first_track() {
                 sample_rate: crate::disc::SampleRate::S48,
                 secondary: false,
                 purpose: crate::disc::LabelPurpose::Normal,
-                label: String::new(),
+                label: Default::default(),
             }),
             Stream::Video(VideoStream {
                 pid: 0x1011,
@@ -2905,7 +2905,7 @@ fn the_activation_trigger_is_the_first_video_track_not_the_first_track() {
                 color_space: ColorSpace::Bt470bg,
                 display_aspect: None,
                 secondary: false,
-                label: String::new(),
+                label: Default::default(),
                 measured_cicp: None,
             }),
         ],
@@ -2971,7 +2971,7 @@ fn a_progressive_picture_on_a_declared_interlaced_disc_ships_as_progressive() {
             color_space: ColorSpace::Bt470bg,
             display_aspect: None,
             secondary: false,
-            label: String::new(),
+            label: Default::default(),
             measured_cicp: None,
         })],
         ..DiscTitle::empty()
@@ -3037,7 +3037,7 @@ fn a_progressive_first_picture_on_a_mostly_interlaced_title_ships_interlaced() {
             color_space: ColorSpace::Bt470bg,
             display_aspect: None,
             secondary: false,
-            label: String::new(),
+            label: Default::default(),
             measured_cicp: None,
         })],
         ..DiscTitle::empty()
@@ -3115,7 +3115,7 @@ fn an_interlaced_first_picture_on_a_mostly_progressive_title_ships_progressive()
             color_space: ColorSpace::Bt470bg,
             display_aspect: None,
             secondary: false,
-            label: String::new(),
+            label: Default::default(),
             measured_cicp: None,
         })],
         ..DiscTitle::empty()
@@ -3193,7 +3193,7 @@ fn an_even_split_of_scan_types_ships_progressive_not_interlaced() {
             color_space: ColorSpace::Bt470bg,
             display_aspect: None,
             secondary: false,
-            label: String::new(),
+            label: Default::default(),
             measured_cicp: None,
         })],
         ..DiscTitle::empty()
@@ -3254,7 +3254,7 @@ fn the_measured_field_order_reaches_the_written_file() {
                 sample_rate: crate::disc::SampleRate::S48,
                 secondary: false,
                 purpose: crate::disc::LabelPurpose::Normal,
-                label: String::new(),
+                label: Default::default(),
             }),
             Stream::Video(VideoStream {
                 pid: 0x1011,
@@ -3265,7 +3265,7 @@ fn the_measured_field_order_reaches_the_written_file() {
                 color_space: ColorSpace::Bt470bg,
                 display_aspect: None,
                 secondary: false,
-                label: String::new(),
+                label: Default::default(),
                 measured_cicp: None,
             }),
         ],
@@ -3909,7 +3909,7 @@ fn an_mpeg_ps_origin_ignores_clip_marks_and_squashes_nothing() {
     t.content_format = crate::disc::ContentFormat::MpegPs;
     t.clips = vec![crate::disc::Clip {
         marks_on_pes_clock: false,
-        clip_id: String::new(),
+        clip_id: Default::default(),
         in_time: 36_000,
         out_time: 450_000,
         duration_secs: 9.2,
@@ -3936,7 +3936,7 @@ fn a_bd_frame_before_the_clip_in_is_dropped_without_a_seam_plan() {
     t.content_format = crate::disc::ContentFormat::BdTs;
     t.clips = vec![crate::disc::Clip {
         marks_on_pes_clock: true,
-        clip_id: String::new(),
+        clip_id: Default::default(),
         in_time: 36_000,
         out_time: 0,
         duration_secs: 0.0,
@@ -4072,7 +4072,7 @@ fn a_flac_track_survives_an_mkv_to_mkv_remux() {
             sample_rate: SampleRate::S48,
             secondary: false,
             purpose: crate::labels::LabelPurpose::Normal,
-            label: String::new(),
+            label: Default::default(),
         })],
         ..DiscTitle::empty()
     };

@@ -34,23 +34,32 @@ pub(crate) struct ClpiStream {
     pub language: String,
 }
 
-/// Parse a CLPI file from raw bytes. A file too short to hold the packet count still
-/// parses (count 0); only a bad magic or a head under 16 bytes errors.
-pub fn parse(data: &[u8]) -> Result<ClipInfo> {
+/// Bytes of a CLPI the scan needs: the header through `source_packet_count` (56..60).
+/// The scan reads only this prefix, never the CPI/EP map behind it.
+pub(crate) const HEADER_BYTES: usize = 60;
+
+/// `source_packet_count` from a CLPI head (at least [`HEADER_BYTES`] of the file, or all
+/// of it). Same answer and errors as [`parse`]'s field, without the ProgramInfo walk.
+pub(crate) fn packet_count(data: &[u8]) -> Result<u32> {
     // 16 bytes reach the section offsets; below that, nothing usable.
     if data.len() < 16 || &data[0..4] != b"HDMV" {
         return Err(Error::ClpiParse);
     }
-
-    // Header offsets
-    let prog_info_start = u32::from_be_bytes([data[12], data[13], data[14], data[15]]) as usize;
-
     // ClipInfo section at offset 40
     // source_packet_count at offset 40 + 4(len) + 2(reserved) + 1(stream_type) + 1(app_type) + 4(reserved) + 4(ts_rate)
     // A file cut before [56..60] keeps its streams and reports 0 (unknown) packets.
-    let source_packet_count = data
-        .get(56..60)
-        .map_or(0, |b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]));
+    Ok(data
+        .get(56..HEADER_BYTES)
+        .map_or(0, |b| u32::from_be_bytes([b[0], b[1], b[2], b[3]])))
+}
+
+/// Parse a CLPI file from raw bytes. A file too short to hold the packet count still
+/// parses (count 0); only a bad magic or a head under 16 bytes errors.
+pub fn parse(data: &[u8]) -> Result<ClipInfo> {
+    let source_packet_count = packet_count(data)?;
+
+    // Header offsets
+    let prog_info_start = u32::from_be_bytes([data[12], data[13], data[14], data[15]]) as usize;
 
     // Parse ProgramInfo (per-stream language + codec), best-effort: malformed
     // program_info doesn't fail the parse, just yields an empty streams list.

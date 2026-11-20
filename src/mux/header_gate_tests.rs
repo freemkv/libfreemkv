@@ -16,7 +16,7 @@ fn aac_title_with(secondary: bool) -> DiscTitle {
         sample_rate: crate::disc::SampleRate::S48,
         secondary,
         purpose: crate::disc::LabelPurpose::Normal,
-        label: String::new(),
+        label: Default::default(),
     }));
     t
 }
@@ -183,7 +183,7 @@ fn video_gate_is_never_expired() {
         color_space: crate::disc::ColorSpace::Bt2020,
         display_aspect: None,
         secondary: false,
-        label: String::new(),
+        label: Default::default(),
         measured_cicp: None,
     }));
     assert!(!g.ready(&t, |_| None));
@@ -202,7 +202,7 @@ fn secondary_video_never_gates() {
             color_space: crate::disc::ColorSpace::Bt2020,
             display_aspect: None,
             secondary,
-            label: String::new(),
+            label: Default::default(),
             measured_cicp: None,
         }));
     }

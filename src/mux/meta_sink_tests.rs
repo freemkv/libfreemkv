@@ -81,7 +81,7 @@ fn json_marks_the_mvc_dependent_view() {
             color_space: ColorSpace::Bt709,
             display_aspect: None,
             secondary: false,
-            label: label.into(),
+            label: label.to_string().into(),
             measured_cicp: None,
         })
     };
@@ -122,7 +122,7 @@ fn title_json_carries_streams_and_chapters() {
         sample_rate: SampleRate::S48,
         secondary: false,
         purpose: LabelPurpose::Normal,
-        label: String::new(),
+        label: Default::default(),
     })];
     let v = title_json(&t);
     assert_eq!(v["playlist"], "MAIN");
@@ -159,7 +159,7 @@ fn unknown_audio_layout_reports_unknown_channels() {
         sample_rate: SampleRate::Unknown,
         secondary: false,
         purpose: LabelPurpose::Normal,
-        label: String::new(),
+        label: Default::default(),
     })];
     let v = title_json(&t);
     let a = &v["audio"][0];
@@ -185,7 +185,7 @@ fn video_json_carries_resolution_and_hdr() {
         color_space: ColorSpace::Bt2020,
         display_aspect: None,
         secondary: false,
-        label: String::new(),
+        label: Default::default(),
         measured_cicp: None,
     })];
     let vid = &title_json(&t)["video"][0];
@@ -220,7 +220,7 @@ fn json_restores_dropped_stream_fields_from_title() {
             color_space: ColorSpace::Bt470bg,
             display_aspect: Some((16, 9)),
             secondary: false,
-            label: String::new(),
+            label: Default::default(),
             measured_cicp: Some(MeasuredCicp {
                 matrix: 5,
                 transfer: 6,
@@ -236,7 +236,7 @@ fn json_restores_dropped_stream_fields_from_title() {
             sample_rate: SampleRate::S48,
             secondary: true,
             purpose: LabelPurpose::Commentary,
-            label: String::new(),
+            label: Default::default(),
         }),
         DiscStream::Subtitle(SubtitleStream {
             pid: 0x1200,
@@ -286,7 +286,7 @@ fn enriching_a_document_without_stream_arrays_does_not_panic() {
         sample_rate: crate::disc::SampleRate::Unknown,
         secondary: false,
         purpose: crate::disc::LabelPurpose::Normal,
-        label: String::new(),
+        label: Default::default(),
     })];
     let mut doc = serde_json::json!({});
     enrich_streams(&mut doc, &t);
@@ -323,7 +323,7 @@ fn json_per_kind_cursors_and_title_fields() {
             color_space: ColorSpace::Bt2020,
             display_aspect: None,
             secondary: false,
-            label: String::new(),
+            label: Default::default(),
             measured_cicp: None,
         })
     };
@@ -336,7 +336,7 @@ fn json_per_kind_cursors_and_title_fields() {
             sample_rate: SampleRate::S48,
             secondary: false,
             purpose: LabelPurpose::Normal,
-            label: String::new(),
+            label: Default::default(),
         })
     };
     let sub = |pid| {

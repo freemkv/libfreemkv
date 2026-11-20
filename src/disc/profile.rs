@@ -166,7 +166,7 @@ impl AudioTrack {
             default,
             commentary: a.purpose == LabelPurpose::Commentary,
             descriptive: a.purpose == LabelPurpose::Descriptive,
-            name: a.label.clone(),
+            name: a.label.to_string(),
         }
     }
 }

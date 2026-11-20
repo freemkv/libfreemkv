@@ -169,7 +169,7 @@ fn title_with_video(
             color_space: ColorSpace::Bt709,
             display_aspect: None,
             secondary: false,
-            label: String::new(),
+            label: Default::default(),
             measured_cicp: None,
         })],
         chapters: Vec::new(),

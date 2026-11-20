@@ -52,7 +52,12 @@ fn parse_with_budget(
         }
 
         // Phase A — master enums (Language / Purpose / VideoFormat / Region / Studio).
-        let enums = identify_master_enums(archive, &mut budget);
+        // Its sweep is kept: Phases C and D reuse the parsed classes, never re-inflating.
+        let mut kept = None;
+        let enums =
+            identify_master_enums_in(&mut Classes::Keep(&mut *archive, &mut kept), &mut budget);
+        let sweep = kept?;
+        let mut classes = Classes::Kept(&sweep);
         if enums.is_empty() {
             tracing::info!(
                 jar = ?entry_name,
@@ -77,7 +82,7 @@ fn parse_with_budget(
         // split across two classes on Deluxe). Each gets its own `<clinit>`
         // walk; constructions union into a single stream list.
         let binding_classes =
-            find_binding_classes(archive, &master_table.class_name_set(), &mut budget);
+            find_binding_classes_in(&mut classes, &master_table.class_name_set(), &mut budget);
         if binding_classes.is_empty() {
             tracing::info!(
                 jar = ?entry_name,
@@ -103,7 +108,7 @@ fn parse_with_budget(
             if room == 0 {
                 break;
             }
-            let mut decoded = decode_binding(archive, name, &master_table, &mut budget);
+            let mut decoded = decode_binding_in(&mut classes, name, &master_table, &mut budget);
             drift = drift.saturating_add(decoded.drift);
             decoded.constructions.truncate(room);
             streams.extend(decoded.constructions);
@@ -352,15 +357,58 @@ impl CandidatePool {
 /// Phase A. Walk every `.class` in `archive`, identify the master
 /// enums by `<clinit>` ldc-sequence fingerprint. Returns a vector of
 /// `(label, MasterEnum)` — at most one match per fingerprint label.
+#[cfg(test)]
 fn identify_master_enums(
     archive: &mut jar::Jar,
+    budget: &mut u64,
+) -> Vec<(&'static str, MasterEnum)> {
+    identify_master_enums_in(&mut Classes::Jar(archive), budget)
+}
+
+/// The `.class` entries a Deluxe phase walks: a jar swept fresh, a jar swept while the
+/// sweep is kept (Phase A), or the kept sweep (Phases C and D), so each class of the
+/// jar is inflated and parsed once per parse. Budget charges are the same either way.
+enum Classes<'a> {
+    #[cfg(test)]
+    Jar(&'a mut jar::Jar),
+    Keep(&'a mut jar::Jar, &'a mut Option<jar::ClassSweep>),
+    Kept(&'a jar::ClassSweep),
+}
+
+impl Classes<'_> {
+    fn for_each(&mut self, budget: &mut u64, f: impl FnMut(&str, &ClassFile)) {
+        match self {
+            #[cfg(test)]
+            Classes::Jar(a) => jar::for_each_class_budgeted(&mut **a, budget, f),
+            Classes::Keep(a, kept) => **kept = Some(jar::ClassSweep::record(&mut **a, budget, f)),
+            Classes::Kept(s) => s.for_each(budget, f),
+        }
+    }
+
+    fn try_class<R>(
+        &mut self,
+        name: &str,
+        budget: &mut u64,
+        f: impl FnMut(&ClassFile) -> Option<R>,
+    ) -> Option<R> {
+        match self {
+            #[cfg(test)]
+            Classes::Jar(a) => jar::try_class_budgeted(&mut **a, name, budget, f),
+            Classes::Keep(a, _) => jar::try_class_budgeted(&mut **a, name, budget, f),
+            Classes::Kept(s) => s.try_class(name, budget, f),
+        }
+    }
+}
+
+fn identify_master_enums_in(
+    classes: &mut Classes<'_>,
     budget: &mut u64,
 ) -> Vec<(&'static str, MasterEnum)> {
     // First pass: collect every class's <clinit> ldc strings, keyed by the JVM
     // INTERNAL name (`this_class`), not the zip entry name — binding classes
     // reference enum constants as `getstatic <internal>.f`.
     let mut pool = CandidatePool::default();
-    jar::for_each_class_budgeted(archive, budget, |zip_name, class| {
+    classes.for_each(budget, |zip_name, class| {
         let Some(ldcs) = clinit_ldc_strings(class) else {
             return;
         };
@@ -549,14 +597,23 @@ fn ldcs_match_prefix(ldcs: &[String], prefix: &[&str]) -> bool {
 
 // Finds binding-class candidates by getstatic-count to the master enums.
 // Some discs split the table across audio/subtitle classes, hence top-K.
+#[cfg(test)]
 fn find_binding_classes(
     archive: &mut jar::Jar,
     master_enum_classes: &HashSet<&str>,
     budget: &mut u64,
 ) -> Vec<(String, usize)> {
+    find_binding_classes_in(&mut Classes::Jar(archive), master_enum_classes, budget)
+}
+
+fn find_binding_classes_in(
+    classes: &mut Classes<'_>,
+    master_enum_classes: &HashSet<&str>,
+    budget: &mut u64,
+) -> Vec<(String, usize)> {
     const MIN_GETSTATIC: usize = 4;
     let mut candidates: Vec<(String, usize)> = Vec::new();
-    jar::for_each_class_budgeted(archive, budget, |class_name, class| {
+    classes.for_each(budget, |class_name, class| {
         // A master enum's own <clinit> reads every constant into $VALUES; it is not a binding.
         if class
             .this_class_name()
@@ -681,18 +738,34 @@ pub(crate) struct Decoded {
 
 /// Phase D entry point: fetch the named binding class from `archive` and run the
 /// bytecode walker against its `<clinit>`.
+#[cfg(test)]
 fn decode_binding(
     archive: &mut jar::Jar,
     binding_class_name: &str,
     master: &MasterEnumTable,
     budget: &mut u64,
 ) -> Decoded {
+    decode_binding_in(
+        &mut Classes::Jar(archive),
+        binding_class_name,
+        master,
+        budget,
+    )
+}
+
+fn decode_binding_in(
+    classes: &mut Classes<'_>,
+    binding_class_name: &str,
+    master: &MasterEnumTable,
+    budget: &mut u64,
+) -> Decoded {
     // Fetched by entry name: the classes ahead of it in the jar are not inflated or
     // parsed, so they do not spend the shared budget.
-    jar::try_class_budgeted(archive, binding_class_name, budget, |class| {
-        Some(decode_binding_class(class, master))
-    })
-    .unwrap_or_default()
+    classes
+        .try_class(binding_class_name, budget, |class| {
+            Some(decode_binding_class(class, master))
+        })
+        .unwrap_or_default()
 }
 
 /// Walk every method named `<clinit>` (typically only one) on this

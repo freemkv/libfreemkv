@@ -447,7 +447,7 @@ fn validate_audio_parser(encoder: &str, format: &str, codec: crate::disc::Codec)
         sample_rate: SampleRate::S48,
         secondary: false,
         purpose: LabelPurpose::Normal,
-        label: String::new(),
+        label: Default::default(),
     });
     track.codec_private = codec_private.flatten();
     let output = dir.path().join("output.mkv");

@@ -277,11 +277,11 @@ fn audio(
         pid,
         codec,
         channels,
-        language,
+        language: language.into(),
         sample_rate: rate,
         secondary: false,
         purpose: LabelPurpose::Normal,
-        label,
+        label: label.into(),
     })
 }
 
@@ -400,7 +400,7 @@ pub(crate) fn scan(head: &[u8]) -> Option<Scan> {
                     color_space: colour,
                     display_aspect: dar,
                     secondary: false,
-                    label: String::new(),
+                    label: Default::default(),
                     measured_cicp: None,
                 }));
             }
@@ -479,13 +479,13 @@ pub(crate) fn scan(head: &[u8]) -> Option<Scan> {
                     0x20..=0x3F => Stream::Subtitle(SubtitleStream {
                         pid: u16::from(sub),
                         codec: Codec::DvdSub,
-                        language: lang,
+                        language: lang.into(),
                         forced: info.is_some_and(|i| i.forced),
                         qualifier: LabelQualifier::None,
                         codec_data: map
                             .as_ref()
                             .and_then(|m| m.palette.as_ref())
-                            .map(|p| idx_text(p, video_res)),
+                            .map(|p| idx_text(p, video_res).into()),
                     }),
                     _ => {
                         tracing::warn!(target: "mux", sub_id = sub, "mpg: private_stream_1 sub-stream of an unhandled kind; left out");

@@ -81,8 +81,8 @@ pub fn aacs_state() -> AacsStateBuilder {
             mkb_version: None,
             disc_hash: String::new(),
             volume_id: [0u8; 16],
-            uk_ro: Vec::new(),
-            mkb: Vec::new(),
+            uk_ro: Vec::<u8>::new().into(),
+            mkb: Vec::<u8>::new().into(),
         },
     }
 }
@@ -108,12 +108,12 @@ impl AacsStateBuilder {
         self.state.volume_id = vid;
         self
     }
-    pub fn uk_ro(mut self, bytes: Vec<u8>) -> Self {
-        self.state.uk_ro = bytes;
+    pub fn uk_ro(mut self, bytes: impl Into<Arc<[u8]>>) -> Self {
+        self.state.uk_ro = bytes.into();
         self
     }
-    pub fn mkb(mut self, bytes: Vec<u8>) -> Self {
-        self.state.mkb = bytes;
+    pub fn mkb(mut self, bytes: impl Into<Arc<[u8]>>) -> Self {
+        self.state.mkb = bytes.into();
         self
     }
     pub fn build(self) -> AacsState {
@@ -455,6 +455,37 @@ pub fn damage_unit_seed(unit: &mut [u8]) {
     }
     unit[0] |= 0xC0;
     unit[4] = 0x00;
+}
+
+/// Bench seam for the live scan's metadata prefetch (`benches/scan.rs`): reads the UDF
+/// filesystem of `src`, bulk-loads the metadata partition and every file a live BD scan
+/// parses, as `Disc::scan` does, then reads back through the buffered reader what the scan
+/// reads: each `/BDMV/PLAYLIST` file whole and each `/BDMV/CLIPINF` file's header.
+/// Returns `(prefetched ranges, bytes read back)`.
+pub fn prefetch_scan_files(src: &mut dyn SectorSource, batch: u16) -> Result<(usize, usize)> {
+    let fs = crate::udf::read_filesystem(src)?;
+    let mut buffered = crate::udf::BufferedSectorReader::new(src, batch);
+    buffered.prefetch(fs.metadata_start(), fs.metadata_sectors())?;
+    let bd = fs.find_dir("/BDMV").is_some();
+    let ranges =
+        fs.metadata_sector_ranges_for(&mut buffered, &|p| crate::disc::scan_prefetch_bytes(bd, p))?;
+    buffered.prefetch_ranges(&ranges)?;
+    let mut bytes = 0;
+    for (dir, limit) in [
+        ("/BDMV/PLAYLIST", None),
+        ("/BDMV/CLIPINF", Some(crate::clpi::HEADER_BYTES)),
+    ] {
+        let Some(d) = fs.find_dir(dir) else { continue };
+        for e in d.entries.iter().filter(|e| !e.is_dir) {
+            let path = format!("{dir}/{}", e.name);
+            bytes += match limit {
+                Some(n) => fs.read_file_prefix(&mut buffered, &path, n)?,
+                None => fs.read_file(&mut buffered, &path)?,
+            }
+            .len();
+        }
+    }
+    Ok((ranges.len(), bytes))
 }
 
 #[path = "test_util_golden.rs"]

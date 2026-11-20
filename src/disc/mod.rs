@@ -219,11 +219,260 @@ pub struct DiscTitle {
     pub codec_privates: Vec<Option<Vec<u8>>>,
 }
 
+/// A clip's id (e.g. "00001"), interned by the scan: every title and content segment
+/// naming the clip shares one allocation. Reads as a `str` and compares with string
+/// types as the `String` it replaces did.
+#[derive(Clone, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ClipId(std::sync::Arc<str>);
+
+impl ClipId {
+    /// The id as a string slice.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for ClipId {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl AsRef<str> for ClipId {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::borrow::Borrow<str> for ClipId {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for ClipId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&*self.0, f)
+    }
+}
+
+impl std::fmt::Display for ClipId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.pad(&self.0)
+    }
+}
+
+impl From<&str> for ClipId {
+    fn from(s: &str) -> Self {
+        ClipId(s.into())
+    }
+}
+
+impl From<String> for ClipId {
+    fn from(s: String) -> Self {
+        ClipId(s.into())
+    }
+}
+
+impl From<&String> for ClipId {
+    fn from(s: &String) -> Self {
+        ClipId(s.as_str().into())
+    }
+}
+
+impl From<std::sync::Arc<str>> for ClipId {
+    fn from(s: std::sync::Arc<str>) -> Self {
+        ClipId(s)
+    }
+}
+
+impl From<ClipId> for String {
+    fn from(id: ClipId) -> Self {
+        id.0.to_string()
+    }
+}
+
+impl PartialEq<str> for ClipId {
+    fn eq(&self, other: &str) -> bool {
+        &*self.0 == other
+    }
+}
+
+impl PartialEq<&str> for ClipId {
+    fn eq(&self, other: &&str) -> bool {
+        &*self.0 == *other
+    }
+}
+
+impl PartialEq<String> for ClipId {
+    fn eq(&self, other: &String) -> bool {
+        &*self.0 == other.as_str()
+    }
+}
+
+impl PartialEq<ClipId> for str {
+    fn eq(&self, other: &ClipId) -> bool {
+        self == &*other.0
+    }
+}
+
+impl PartialEq<ClipId> for &str {
+    fn eq(&self, other: &ClipId) -> bool {
+        *self == &*other.0
+    }
+}
+
+impl PartialEq<ClipId> for String {
+    fn eq(&self, other: &ClipId) -> bool {
+        self.as_str() == &*other.0
+    }
+}
+
+impl serde::Serialize for ClipId {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        s.serialize_str(&self.0)
+    }
+}
+
+const LANG_CAPACITY: usize = 15;
+
+/// A stream's language code (ISO 639-2, e.g. "eng"), held inline with no heap allocation.
+/// Up to [`Lang::CAPACITY`] bytes: a 3-byte code, or its lossy decode, always fits; a longer
+/// value is cut at a char boundary. Reads as a `str` and compares with string types.
+#[derive(Clone, Default, PartialEq, Eq, Hash)]
+pub struct Lang {
+    len: u8,
+    bytes: [u8; LANG_CAPACITY],
+}
+
+impl Lang {
+    /// Bytes a `Lang` holds.
+    pub const CAPACITY: usize = LANG_CAPACITY;
+
+    /// The code as a string slice.
+    pub fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.bytes[..self.len as usize]).unwrap_or_default()
+    }
+}
+
+impl From<&str> for Lang {
+    fn from(s: &str) -> Self {
+        let mut len = s.len().min(Self::CAPACITY);
+        while !s.is_char_boundary(len) {
+            len -= 1;
+        }
+        let mut bytes = [0u8; Self::CAPACITY];
+        bytes[..len].copy_from_slice(&s.as_bytes()[..len]);
+        Lang {
+            len: len as u8,
+            bytes,
+        }
+    }
+}
+
+impl From<String> for Lang {
+    fn from(s: String) -> Self {
+        Lang::from(s.as_str())
+    }
+}
+
+impl From<&String> for Lang {
+    fn from(s: &String) -> Self {
+        Lang::from(s.as_str())
+    }
+}
+
+impl From<Lang> for String {
+    fn from(l: Lang) -> Self {
+        l.as_str().to_string()
+    }
+}
+
+impl std::ops::Deref for Lang {
+    type Target = str;
+    fn deref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl AsRef<str> for Lang {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl PartialOrd for Lang {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Lang {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.as_str().cmp(other.as_str())
+    }
+}
+
+impl std::fmt::Debug for Lang {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(self.as_str(), f)
+    }
+}
+
+impl std::fmt::Display for Lang {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.pad(self.as_str())
+    }
+}
+
+impl PartialEq<str> for Lang {
+    fn eq(&self, other: &str) -> bool {
+        self.as_str() == other
+    }
+}
+
+impl PartialEq<&str> for Lang {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
+}
+
+impl PartialEq<String> for Lang {
+    fn eq(&self, other: &String) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+
+impl PartialEq<Lang> for str {
+    fn eq(&self, other: &Lang) -> bool {
+        self == other.as_str()
+    }
+}
+
+impl PartialEq<Lang> for &str {
+    fn eq(&self, other: &Lang) -> bool {
+        *self == other.as_str()
+    }
+}
+
+impl PartialEq<Lang> for String {
+    fn eq(&self, other: &Lang) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+
+impl serde::Serialize for Lang {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        s.serialize_str(self.as_str())
+    }
+}
+
 /// A clip reference within a title.
 #[derive(Debug, Clone)]
 pub struct Clip {
-    /// Clip filename without extension (e.g. "00001")
-    pub clip_id: String,
+    /// Clip filename without extension (e.g. "00001"), shared by every title naming it.
+    pub clip_id: ClipId,
     /// In-time in 45kHz ticks
     pub in_time: u32,
     /// Out-time in 45kHz ticks
@@ -242,6 +491,52 @@ pub struct Clip {
     /// The in/out marks run on the clock the clip's PES timestamps run on, so a mux can cut
     /// at them. Only the Blu-ray scanner sets it (PlayItem marks share the 45 kHz PTS clock).
     pub marks_on_pes_clock: bool,
+}
+
+/// `Disc::canonical_title_order`'s keys, in its priority order (derived `Ord` compares
+/// fields top to bottom).
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+struct CanonicalKey {
+    oversize: bool,
+    size: std::cmp::Reverse<u64>,
+    duration: std::cmp::Reverse<TotalF64>,
+    richness: std::cmp::Reverse<(u8, u8, usize)>,
+    video: std::cmp::Reverse<usize>,
+    subtitles: std::cmp::Reverse<usize>,
+    playlist_id: u16,
+}
+
+/// `Disc::main_feature_order`'s keys: nav, authoring (both preferred), composite
+/// (demoted), plausible video (preferred), then the canonical order.
+type MainFeatureKey = (
+    std::cmp::Reverse<bool>,
+    std::cmp::Reverse<bool>,
+    bool,
+    std::cmp::Reverse<bool>,
+    CanonicalKey,
+);
+
+/// An `f64` ordered by `total_cmp`, as the title comparators order durations.
+struct TotalF64(f64);
+
+impl PartialEq for TotalF64 {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.total_cmp(&other.0).is_eq()
+    }
+}
+
+impl Eq for TotalF64 {}
+
+impl PartialOrd for TotalF64 {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for TotalF64 {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.total_cmp(&other.0)
+    }
 }
 
 /// Per-title classification for [`Disc::main_feature_order`]. All three fields
@@ -295,7 +590,7 @@ pub struct VideoStream {
     /// Whether this is a secondary stream (PiP, Dolby Vision EL)
     pub secondary: bool,
     /// Extra label (e.g. "Dolby Vision EL")
-    pub label: String,
+    pub label: std::borrow::Cow<'static, str>,
     /// CICP colour signalling (matrix, transfer, primaries, full_range) MEASURED
     /// from the bitstream — HEVC/H.264 VUI `colour_description` or MPEG-2
     /// `sequence_display_extension`. `Some(...)` takes precedence over the
@@ -313,6 +608,11 @@ pub struct VideoStream {
 pub const MVC_DEPENDENT_LABEL: &str = "MVC dependent view (3D right eye)";
 
 impl VideoStream {
+    /// The label text (empty when none).
+    pub fn label_str(&self) -> &str {
+        &self.label
+    }
+
     /// Whether this video stream is the MVC dependent (right-eye) view — the
     /// 3D substream that the muxer merges into the base track as a per-frame
     /// `BlockAdditional` rather than emitting as an independent track.
@@ -345,7 +645,7 @@ pub struct AudioStream {
     /// Channel layout
     pub channels: AudioChannels,
     /// ISO 639-2 language code (e.g. "eng", "fra")
-    pub language: String,
+    pub language: Lang,
     /// Sample rate
     pub sample_rate: SampleRate,
     /// Whether this is a secondary stream (commentary)
@@ -355,7 +655,7 @@ pub struct AudioStream {
     pub purpose: LabelPurpose,
     /// Codec / variant text (e.g. "Dolby TrueHD 5.1", "(US)").
     /// NEVER contains English purpose words — see `purpose` for that.
-    pub label: String,
+    pub label: std::borrow::Cow<'static, str>,
 }
 
 /// Label marking an [`AudioStream`] as a DVD MPEG-2 multichannel extension bit stream (PES
@@ -364,6 +664,11 @@ pub struct AudioStream {
 pub const MP2_EXTENSION_LABEL: &str = "MPEG-2 multichannel extension";
 
 impl AudioStream {
+    /// The label text (empty when none).
+    pub fn label_str(&self) -> &str {
+        &self.label
+    }
+
     /// Whether this is a DVD MPEG-2 multichannel extension track ([`MP2_EXTENSION_LABEL`] on
     /// PID `0xD0..=0xD7`), which a sink either writes next to its base or lists as excluded.
     /// Its base is PID `0xC0 | (pid & 7)`.
@@ -380,14 +685,14 @@ pub struct SubtitleStream {
     /// Codec (PGS)
     pub codec: Codec,
     /// ISO 639-2 language code (e.g. "eng", "fra")
-    pub language: String,
+    pub language: Lang,
     /// Whether this is a forced subtitle
     pub forced: bool,
     /// Subtitle qualifier (SDH / descriptive service / forced / none).
     /// Callers translate this to display text in their own locale.
     pub qualifier: LabelQualifier,
     /// Pre-formatted codec private data (e.g. VobSub .idx palette header)
-    pub codec_data: Option<Vec<u8>>,
+    pub codec_data: Option<std::sync::Arc<[u8]>>,
 }
 
 /// Video/audio codec.
@@ -1719,11 +2024,25 @@ pub struct AacsState {
     pub volume_id: [u8; 16],
     /// Raw `Unit_Key_RO.inf` bytes (encrypted unit keys + CPS map). Stashed at
     /// scan so an external resolver (key-resolver) can derive the unit keys
-    /// from a VUK without re-reading the disc. Empty when not captured.
-    pub uk_ro: Vec<u8>,
+    /// from a VUK without re-reading the disc. Empty when not captured. Shared:
+    /// [`Disc::inputs`] and key acquisition take a refcount, never a copy.
+    pub uk_ro: std::sync::Arc<[u8]>,
     /// Raw MKB bytes (`MKB_RO.inf`). Stashed at scan so an external resolver can
     /// walk it (device/processing key → media key). Empty when not captured.
-    pub mkb: Vec<u8>,
+    /// Shared like `uk_ro` (1-4 MB on UHD).
+    pub mkb: std::sync::Arc<[u8]>,
+}
+
+impl AacsState {
+    /// The raw `Unit_Key_RO.inf` bytes (empty when not captured).
+    pub fn uk_ro_bytes(&self) -> &[u8] {
+        &self.uk_ro
+    }
+
+    /// The raw MKB bytes (empty when not captured).
+    pub fn mkb_bytes(&self) -> &[u8] {
+        &self.mkb
+    }
 }
 
 // Redacting `Debug`: `AacsState` is public via `Disc.aacs` and carries VUK /
@@ -1824,6 +2143,23 @@ impl DiscId {
     pub fn name(&self) -> &str {
         self.meta_title.as_deref().unwrap_or(&self.volume_id)
     }
+}
+
+/// How many bytes of the file at `path` the live scan's metadata prefetch loads: `None`
+/// for a file [`scan_parses`] leaves out, the header for a BD `/BDMV/CLIPINF` file (the
+/// scan reads only its packet count, never the EP map), else the whole file.
+pub(crate) fn scan_prefetch_bytes(bd: bool, path: &str) -> Option<u64> {
+    if !scan_parses(bd, path) {
+        return None;
+    }
+    let clpi = bd
+        && path.len() > "/BDMV/CLIPINF/".len()
+        && path.as_bytes()[.."/BDMV/CLIPINF/".len()].eq_ignore_ascii_case(b"/BDMV/CLIPINF/");
+    Some(if clpi {
+        crate::clpi::HEADER_BYTES as u64
+    } else {
+        crate::udf::WHOLE_FILE
+    })
 }
 
 /// Whether a live scan parses the file at `path` (absolute, any case), so the metadata
@@ -2047,7 +2383,7 @@ impl Disc {
         // Pre-read the small files the scan parses (AACS, MPLS, CLPI, META, *.bdmv): one
         // command each otherwise.
         let bd = udf_fs.find_dir("/BDMV").is_some();
-        match udf_fs.metadata_sector_ranges_for(&mut buffered, &|p| scan_parses(bd, p)) {
+        match udf_fs.metadata_sector_ranges_for(&mut buffered, &|p| scan_prefetch_bytes(bd, p)) {
             Ok(ranges) => buffered.prefetch_ranges(&ranges)?,
             Err(Error::Halted) => return Err(Error::Halted),
             Err(_) => {} // prefetch is optional
@@ -2579,6 +2915,8 @@ impl Disc {
             Some((cap, bus)) => encrypt::resolve_aacs(cap, &bus),
             None => (None, None),
         };
+        // Playlists the title scan parses are kept for the labels pass below (one parse).
+        let _playlist_stash = crate::labels::stash_scope();
 
         // 3. Titles + container — dispatched by on-disc tree (HD-DVD/DVD peers,
         // FMTS shares the BD tree; FORMAT is a separate axis derived below). DVD
@@ -2615,7 +2953,7 @@ impl Disc {
         // "longest duration first" misranks branching UHDs (see `canonical_title_order`);
         // sort so `-t 1` / autorip / `.first()` converge on the real movie.
         let capacity_bytes = capacity as u64 * 2048;
-        titles.sort_by(|a, b| Self::canonical_title_order(a, b, capacity_bytes));
+        titles.sort_by_cached_key(|t| Self::canonical_key(t, capacity_bytes));
 
         // 4. Metadata + labels
         let meta_title = Self::read_meta_title(reader, &udf_fs);
@@ -2694,6 +3032,14 @@ impl Disc {
             elapsed_ms = scan_with_t0.elapsed().as_millis() as u64,
             "end"
         );
+        // The model lives as long as the session: drop the growth slack of push-built Vecs.
+        titles.shrink_to_fit();
+        for t in &mut titles {
+            t.extents.shrink_to_fit();
+            t.clips.shrink_to_fit();
+            t.streams.shrink_to_fit();
+            t.chapters.shrink_to_fit();
+        }
         let disc = Disc {
             volume_id: udf_fs.volume_id.clone(),
             meta_title,
@@ -2807,6 +3153,34 @@ impl Disc {
             // (Alita 00800-00808, same body + different logo) pick the LOWEST
             // playlist_id. Inert where an earlier key separates the pair.
             .then_with(|| a.playlist_id.cmp(&b.playlist_id))
+    }
+
+    // `canonical_title_order` as a sort key, so a sort computes each title's audio
+    // richness and stream counts once instead of in every comparison.
+    fn canonical_key(t: &DiscTitle, capacity_bytes: u64) -> CanonicalKey {
+        use std::cmp::Reverse;
+        CanonicalKey {
+            oversize: capacity_bytes > 0 && t.size_bytes > capacity_bytes,
+            size: Reverse(t.size_bytes),
+            duration: Reverse(TotalF64(t.duration_secs)),
+            richness: Reverse(Self::audio_richness(t)),
+            video: Reverse(t.video_streams().count()),
+            subtitles: Reverse(t.subtitle_streams().count()),
+            playlist_id: t.playlist_id,
+        }
+    }
+
+    // `main_feature_order` as a sort key: the rank flags, video plausibility, then the
+    // canonical key, each computed once per title.
+    fn main_feature_key(t: &DiscTitle, r: &TitleRank, capacity_bytes: u64) -> MainFeatureKey {
+        use std::cmp::Reverse;
+        (
+            Reverse(r.nav),
+            Reverse(r.authoring),
+            r.composite,
+            Reverse(t.has_probable_video()),
+            Self::canonical_key(t, capacity_bytes),
+        )
     }
 
     /// The keys [`Self::main_feature_order`] layers ON TOP of
@@ -2951,8 +3325,7 @@ impl Disc {
         let ranks = Self::rank_titles(titles, hint, nav_feature);
         let mut decorated: Vec<(TitleRank, DiscTitle)> =
             ranks.into_iter().zip(std::mem::take(titles)).collect();
-        decorated
-            .sort_by(|(ra, a), (rb, b)| Self::main_feature_order(a, b, capacity_bytes, ra, rb));
+        decorated.sort_by_cached_key(|(r, t)| Self::main_feature_key(t, r, capacity_bytes));
         *titles = decorated.into_iter().map(|(_, t)| t).collect();
     }
 

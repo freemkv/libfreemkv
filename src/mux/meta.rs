@@ -182,7 +182,7 @@ impl M2tsMeta {
                     frame_rate: v.frame_rate.to_string(),
                     hdr: v.hdr.id().into(),
                     color_space: v.color_space.id().into(),
-                    label: v.label.clone(),
+                    label: v.label.to_string(),
                     secondary: v.secondary,
                     codec_private: codec_private_b64(i),
                     display_aspect: v.display_aspect.map(|(w, h)| [w, h]),
@@ -194,9 +194,9 @@ impl M2tsMeta {
                     pid: a.pid,
                     codec: a.codec.id().into(),
                     channels: a.channels.to_string(),
-                    language: a.language.clone(),
+                    language: a.language.to_string(),
                     sample_rate: a.sample_rate.to_string(),
-                    label: a.label.clone(),
+                    label: a.label.to_string(),
                     secondary: a.secondary,
                     codec_private: codec_private_b64(i),
                     purpose: purpose_id(a.purpose).into(),
@@ -204,7 +204,7 @@ impl M2tsMeta {
                 Stream::Subtitle(s) => MetaStream::Subtitle {
                     pid: s.pid,
                     codec: s.codec.id().into(),
-                    language: s.language.clone(),
+                    language: s.language.to_string(),
                     forced: s.forced,
                     codec_private: codec_private_b64(i),
                     qualifier: qualifier_id(s.qualifier).into(),
@@ -312,7 +312,7 @@ impl M2tsMeta {
                         color_space: cs,
                         display_aspect: display_aspect.map(|[w, h]| (w, h)),
                         secondary: *secondary,
-                        label: label.clone(),
+                        label: label.clone().into(),
                         measured_cicp: cicp.map(|[matrix, transfer, primaries, range]| {
                             crate::disc::MeasuredCicp {
                                 matrix,
@@ -339,13 +339,13 @@ impl M2tsMeta {
                     channels: channels
                         .parse()
                         .unwrap_or(crate::disc::AudioChannels::Unknown),
-                    language: language.clone(),
+                    language: language.into(),
                     sample_rate: sample_rate
                         .parse()
                         .unwrap_or(crate::disc::SampleRate::Unknown),
                     secondary: *secondary,
                     purpose: purpose_from_id(purpose),
-                    label: label.clone(),
+                    label: label.clone().into(),
                 }),
                 MetaStream::Subtitle {
                     pid,
@@ -357,10 +357,10 @@ impl M2tsMeta {
                 } => Stream::Subtitle(SubtitleStream {
                     pid: *pid,
                     codec: codec.parse().unwrap_or(crate::disc::Codec::Unknown(0)),
-                    language: language.clone(),
+                    language: language.into(),
                     forced: *forced,
                     qualifier: qualifier_from_id(qualifier),
-                    codec_data: decode_codec_private(codec_private),
+                    codec_data: decode_codec_private(codec_private).map(Into::into),
                 }),
             })
             .collect();

@@ -15,7 +15,7 @@ fn hevc_video() -> DiscStream {
         color_space: ColorSpace::Bt2020,
         display_aspect: None,
         secondary: false,
-        label: String::new(),
+        label: Default::default(),
         measured_cicp: None,
     })
 }
@@ -29,7 +29,7 @@ fn audio(codec: Codec, lang: &str) -> DiscStream {
         sample_rate: SampleRate::S48,
         secondary: false,
         purpose: LabelPurpose::Normal,
-        label: String::new(),
+        label: Default::default(),
     })
 }
 

@@ -14,7 +14,7 @@ fn video_title(codec: Codec, res: Resolution, fr: FrameRate, cs: ColorSpace) -> 
         color_space: cs,
         display_aspect: None,
         secondary: false,
-        label: String::new(),
+        label: Default::default(),
         measured_cicp: None,
     })];
     t.content_format = ContentFormat::BdTs;
@@ -123,7 +123,7 @@ fn fvi_colour_follows_hdr_and_measured_cicp() {
         color_space: cs,
         display_aspect: None,
         secondary: false,
-        label: String::new(),
+        label: Default::default(),
         measured_cicp: cicp,
     };
 

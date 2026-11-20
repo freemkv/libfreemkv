@@ -1953,6 +1953,10 @@ impl SectorSource for HaltingReader<'_> {
 /// 00801.mpls at 40000) over one fully wired clip. Both playlists are
 /// keepable, so a scan that returns fewer than two titles has LOST one.
 fn two_playlist_bd_fs(disc: &mut MemDisc) -> udf::UdfFs {
+    two_playlist_bd_fs_with_clpi(disc, build_clpi(4000))
+}
+
+fn two_playlist_bd_fs_with_clpi(disc: &mut MemDisc, clpi: Vec<u8>) -> udf::UdfFs {
     let long_mpls = || {
         build_mpls(
             &[PiSpec {
@@ -1976,7 +1980,7 @@ fn two_playlist_bd_fs(disc: &mut MemDisc) -> udf::UdfFs {
         name: "CLIPINF".to_string(),
         icb_lba: 24,
         dir_data_lba: 25,
-        files: vec![file_with("00001.clpi", 102, 8000, build_clpi(4000), false)],
+        files: vec![file_with("00001.clpi", 102, 8000, clpi, false)],
         subdirs: vec![],
     };
     let playlist = DirSpec {
@@ -2438,6 +2442,63 @@ fn scan_bluray_titles_reads_shared_clpi_once_across_playlists() {
     assert_eq!(w.hits, 1, "shared .clpi re-read per playlist");
 }
 
+// N playlists naming one clip resolve its stream extents once per scan: the clip's
+// File Entry is read once, and every title gets the same extents.
+#[test]
+fn scan_bluray_titles_resolves_shared_clip_extents_once() {
+    let mut disc = MemDisc::new();
+    let udf = two_playlist_bd_fs(&mut disc);
+    let mut w = LbaWatch {
+        inner: disc,
+        lba: PART_START + 100,
+        hits: 0,
+    };
+    let titles = Disc::scan_bluray_titles(&mut w, &udf, None).expect("scan");
+    assert_eq!(titles.len(), 2);
+    assert_eq!(w.hits, 1, "shared clip's extents re-resolved per playlist");
+    assert_eq!(titles[0].extents, titles[1].extents);
+    assert_eq!(titles[0].size_bytes, titles[1].size_bytes);
+    assert!(!titles[0].extents.is_empty());
+    // The clip id is interned: both titles (and their content segments) share one string.
+    let (a, b) = (&titles[0].clips[0].clip_id, &titles[1].clips[0].clip_id);
+    assert_eq!(a, "00001");
+    assert!(
+        std::ptr::eq(a.as_str(), b.as_str()),
+        "clip id copied per title"
+    );
+    for seg in &titles[1].selection_evidence.segments {
+        assert!(
+            std::ptr::eq(a.as_str(), seg.unit.as_str()),
+            "segment unit copied"
+        );
+    }
+}
+
+// The scan reads only a .clpi's header sector: the CPI/EP map behind it is never read,
+// and the packet count (so the title size) is the one a full parse gives.
+#[test]
+fn scan_bluray_titles_reads_only_the_clpi_header() {
+    let mut clpi = build_clpi(4000);
+    clpi.resize(3 * 2048, 0xA5);
+    let mut disc = MemDisc::new();
+    let udf = two_playlist_bd_fs_with_clpi(&mut disc, clpi);
+    let mut w = LbaWatch {
+        inner: disc,
+        lba: PART_START + 8001,
+        hits: 0,
+    };
+    let titles = Disc::scan_bluray_titles(&mut w, &udf, None).expect("scan");
+    assert_eq!(titles.len(), 2);
+    assert_eq!(w.hits, 0, "the scan read past the .clpi header");
+    for t in &titles {
+        assert_eq!(
+            t.size_bytes,
+            4000 * 192,
+            "size from the header's packet count"
+        );
+    }
+}
+
 // The in-loop poll must fire before any playlist is read (the post-loop poll alone would
 // also yield Halted, so count reads).
 #[test]
@@ -2522,7 +2583,7 @@ fn push_extents_drops_empty_and_lba_zero_extents_without_advancing() {
     let mut extents = Vec::new();
     let mut pos = 0u64;
     push_extents(
-        vec![(100, 2), (200, 0), (0, 5), (300, 3)],
+        &[(100, 2), (200, 0), (0, 5), (300, 3)],
         &mut extents,
         &mut pos,
     );
@@ -2538,7 +2599,7 @@ fn push_extents_drops_empty_and_lba_zero_extents_without_advancing() {
 fn push_extents_drops_zero_sector_extent_alone() {
     let mut extents = Vec::new();
     let mut pos = 0u64;
-    push_extents(vec![(200, 0), (300, 1)], &mut extents, &mut pos);
+    push_extents(&[(200, 0), (300, 1)], &mut extents, &mut pos);
     assert_eq!(extents.len(), 1);
     assert_eq!(pos, 2048);
 }
@@ -2547,7 +2608,7 @@ fn push_extents_drops_zero_sector_extent_alone() {
 fn push_extents_drops_lba_zero_extent_alone() {
     let mut extents = Vec::new();
     let mut pos = 0u64;
-    push_extents(vec![(0, 4), (300, 1)], &mut extents, &mut pos);
+    push_extents(&[(0, 4), (300, 1)], &mut extents, &mut pos);
     assert_eq!(extents.len(), 1);
     assert_eq!(pos, 2048);
 }
@@ -2806,7 +2867,7 @@ fn bd_roster(titles: &[DiscTitle]) -> Option<Vec<(u16, Option<usize>)>> {
                 roster,
                 title_count,
                 ordinal,
-            } if roster == "bd-playall-partition-v1:800" && *title_count == titles.len() => {
+            } if &**roster == "bd-playall-partition-v1:800" && *title_count == titles.len() => {
                 Some((t.playlist_id, *ordinal))
             }
             _ => None,
@@ -2831,6 +2892,20 @@ fn scan_bluray_titles_annotates_the_playall_roster() {
     assert_eq!(
         bd_roster(&titles),
         Some(vec![(1, Some(0)), (2, Some(1)), (3, Some(2)), (800, None)])
+    );
+    // One roster string shared by every title, not a copy per title.
+    let rosters: Vec<&std::sync::Arc<str>> = titles
+        .iter()
+        .filter_map(|t| match &t.selection_evidence.episodes {
+            EpisodeEvidence::Authored { roster, .. } => Some(roster),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(rosters.len(), titles.len());
+    assert!(
+        rosters
+            .iter()
+            .all(|r| std::sync::Arc::ptr_eq(r, rosters[0]))
     );
 }
 

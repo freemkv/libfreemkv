@@ -870,7 +870,7 @@ fn opus_track_timing_and_padding_survive_network_to_mkv() {
         sample_rate: SampleRate::S48,
         secondary: false,
         purpose: crate::disc::LabelPurpose::Normal,
-        label: String::new(),
+        label: Default::default(),
     });
     title.codec_privates = vec![Some(b"OpusHead\x01\x02".to_vec())];
     let timing = pes::TrackTiming {

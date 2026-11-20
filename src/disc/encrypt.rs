@@ -274,8 +274,8 @@ pub(super) fn resolve_aacs(
                 mkb_version,
                 disc_hash: aacs::inf::disc_hash_hex(&dh),
                 volume_id: bus.handshake().map(|h| h.volume_id).unwrap_or([0u8; 16]),
-                uk_ro,
-                mkb: cap.mkb,
+                uk_ro: uk_ro.into(),
+                mkb: cap.mkb.into(),
             };
             (Some(state), aacs_verdict(cap.bus_encryption, bus))
         }

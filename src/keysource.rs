@@ -10,6 +10,8 @@
 use crate::aacs::types::HostCert;
 use crate::aacs::types::{UnitKey, Vid};
 use crate::error::Error;
+use std::borrow::Cow;
+use std::sync::Arc;
 
 /// Minimum encrypted-content unit samples a single online key request must carry.
 ///
@@ -83,10 +85,11 @@ pub struct DiscInputs {
     /// `Unit_Key_RO.inf` parse stride (48-byte V10 vs 64-byte V20/V21) when a
     /// source returns a VUK to derive unit keys from. Defaults to 2.
     pub version: u8,
-    /// Raw MKB bytes. Empty when not captured.
-    pub mkb: Vec<u8>,
-    /// Raw `Unit_Key_RO.inf` bytes. Empty when not captured.
-    pub unit_key_ro: Vec<u8>,
+    /// Raw MKB bytes. Empty when not captured. Shared with the scanned
+    /// [`crate::disc::AacsState`]: cloning `DiscInputs` never copies it.
+    pub mkb: Arc<[u8]>,
+    /// Raw `Unit_Key_RO.inf` bytes. Empty when not captured. Shared like `mkb`.
+    pub unit_key_ro: Arc<[u8]>,
     /// Encrypted on-disc content sample units (each a 6144-byte aligned unit),
     /// for sources that validate a key server-side against real ciphertext
     /// (e.g. an online key service). Empty for sources that don't need them
@@ -175,9 +178,27 @@ pub trait ResolveCtx {
 /// 64-byte V20/V21 stride), matching the library resolver's dispatch.
 pub struct DiscInputsCtx<'a> {
     inner: &'a DiscInputs,
-    enc_keys: Vec<[u8; 16]>,
+    // The samples handed to sources: `inner.samples`, or a per-request set borrowed
+    // from the resolver so a request never clones the inputs.
+    samples: &'a [Vec<u8>],
+    enc_keys: Cow<'a, [[u8; 16]]>,
     halt: Option<&'a crate::halt::Halt>,
     progress: Option<&'a crate::halt::Liveness>,
+}
+
+/// The encrypted title keys of `inputs`, in on-disc order (see [`DiscInputsCtx::new`]).
+pub(crate) fn parse_enc_title_keys(inputs: &DiscInputs) -> Vec<[u8; 16]> {
+    use crate::aacs::inf::parse_title_keys;
+    use crate::aacs::mkb::AacsVersion;
+    if inputs.unit_key_ro.is_empty() {
+        return Vec::new();
+    }
+    parse_title_keys(&inputs.unit_key_ro, AacsVersion::from_major(inputs.version))
+        .map(|f| f.encrypted_keys.into_iter().map(|(_, k)| k).collect())
+        .unwrap_or_else(|| {
+            tracing::warn!("unit key file unparseable; no encrypted title keys");
+            Vec::new()
+        })
 }
 
 impl<'a> DiscInputsCtx<'a> {
@@ -189,21 +210,27 @@ impl<'a> DiscInputsCtx<'a> {
     ///
     /// A malformed `unit_key_ro` parses to an empty key set rather than an error.
     pub fn new(inputs: &'a DiscInputs) -> Self {
-        use crate::aacs::inf::parse_title_keys;
-        use crate::aacs::mkb::AacsVersion;
-        let enc_keys = if inputs.unit_key_ro.is_empty() {
-            Vec::new()
-        } else {
-            parse_title_keys(&inputs.unit_key_ro, AacsVersion::from_major(inputs.version))
-                .map(|f| f.encrypted_keys.into_iter().map(|(_, k)| k).collect())
-                .unwrap_or_else(|| {
-                    tracing::warn!("unit key file unparseable; no encrypted title keys");
-                    Vec::new()
-                })
-        };
         Self {
             inner: inputs,
-            enc_keys,
+            samples: &inputs.samples,
+            enc_keys: Cow::Owned(parse_enc_title_keys(inputs)),
+            halt: None,
+            progress: None,
+        }
+    }
+
+    /// A context over `inputs` with `samples` in place of `inputs.samples` and the
+    /// title keys already parsed by [`parse_enc_title_keys`]: nothing is copied or
+    /// re-parsed per request.
+    pub(crate) fn borrowed(
+        inputs: &'a DiscInputs,
+        samples: &'a [Vec<u8>],
+        enc_keys: &'a [[u8; 16]],
+    ) -> Self {
+        Self {
+            inner: inputs,
+            samples,
+            enc_keys: Cow::Borrowed(enc_keys),
             halt: None,
             progress: None,
         }
@@ -245,7 +272,7 @@ impl ResolveCtx for DiscInputsCtx<'_> {
         Ok(&self.enc_keys)
     }
     fn samples(&self, n: usize) -> Result<Vec<Vec<u8>>, Error> {
-        Ok(self.inner.samples.iter().take(n).cloned().collect())
+        Ok(self.samples.iter().take(n).cloned().collect())
     }
     fn unit_key_ro(&self) -> &[u8] {
         &self.inner.unit_key_ro

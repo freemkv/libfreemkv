@@ -16,7 +16,7 @@ fn main_feature_reason_names_the_comparators_real_keys() {
             .map(|i| Clip {
                 marks_on_pes_clock: true,
                 feed_span: None,
-                clip_id: format!("{i:05}"),
+                clip_id: format!("{i:05}").into(),
                 in_time: 0,
                 out_time: 0,
                 duration_secs: 0.0,

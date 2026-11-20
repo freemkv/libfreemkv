@@ -56,7 +56,7 @@ fn video_stream(codec: Codec) -> DiscStream {
         color_space: ColorSpace::Bt709,
         display_aspect: None,
         secondary: false,
-        label: String::new(),
+        label: Default::default(),
         measured_cicp: None,
     })
 }
@@ -66,11 +66,11 @@ fn audio_stream(codec: Codec, lang: &str) -> DiscStream {
         pid: 0x1100,
         codec,
         channels: AudioChannels::Stereo,
-        language: lang.to_string(),
+        language: lang.into(),
         sample_rate: SampleRate::S48,
         secondary: false,
         purpose: LabelPurpose::Normal,
-        label: String::new(),
+        label: Default::default(),
     })
 }
 
@@ -78,7 +78,7 @@ fn subtitle_stream(codec: Codec, lang: &str) -> DiscStream {
     DiscStream::Subtitle(crate::disc::SubtitleStream {
         pid: 0x1200,
         codec,
-        language: lang.to_string(),
+        language: lang.into(),
         forced: false,
         qualifier: crate::disc::LabelQualifier::None,
         codec_data: None,
@@ -1274,7 +1274,7 @@ fn a_filtered_export_whose_persisted_track_was_emptied_fails() {
         .map(|i| crate::disc::Clip {
             marks_on_pes_clock: true,
             feed_span: None,
-            clip_id: format!("0000{i}"),
+            clip_id: format!("0000{i}").into(),
             in_time: (100 + 100 * i) * 45_000,
             out_time: (200 + 100 * i) * 45_000,
             duration_secs: 100.0,
