@@ -10,6 +10,7 @@
 
 pub mod bus_removal;
 pub mod decrypting;
+pub(crate) mod deferred;
 pub mod prefetched;
 pub mod read_stage;
 pub(crate) mod stage;

@@ -399,6 +399,8 @@ impl<S: SectorSource> SectorSource for DecryptingSectorSource<S> {
         let n = self
             .inner
             .read_sectors_fua(lba, count, buf, recovery, fua)?;
+        // A decrypt deferred beneath this reader runs first: every judgement below needs plaintext.
+        super::deferred::settle(&mut buf[..n])?;
         self.judge_detected(&mut buf[..n])?;
         if let Some(css) = self.css_titles.as_mut() {
             css.decrypt(lba, &mut buf[..n], &mut self.keys)?;
@@ -444,6 +446,19 @@ impl<S: SectorSource> SectorSource for DecryptingSectorSource<S> {
             return Ok(n);
         }
         if let Some(map) = self.key_map.clone() {
+            // Inside an armed prefetch buffer, the unit decrypt runs in the decrypt stage.
+            let aacs = matches!(self.keys, DecryptKeys::Aacs { .. });
+            let deferred = aacs
+                && super::deferred::try_defer(&buf[..n], || super::deferred::Job {
+                    lba,
+                    keys: self.keys.clone(),
+                    map: map.clone(),
+                    content: content.clone(),
+                    tally: self.tally(),
+                });
+            if deferred {
+                return Ok(n);
+            }
             let blanked = crate::decrypt::decrypt_sectors_mapped_in_content(
                 &mut buf[..n],
                 &self.keys,
@@ -604,15 +619,14 @@ impl<S: SectorSource> DecryptingSectorSource<S> {
     }
 
     fn count_blanked(&self, lba: u32, n: usize) {
-        self.blanked
-            .0
-            .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
-        if let (Some(ctx), 1..) = (&self.ctx, n) {
-            ctx.stats.add_blanked(n as u64);
-            ctx.emit(crate::event::Event::UnitBlanked {
-                lba: u64::from(lba),
-                units: n as u64,
-            });
+        super::deferred::count_blanked(&self.blanked.0, self.ctx.as_ref(), lba, n);
+    }
+
+    // Where a deferred unit decrypt counts what it blanks: this reader's tally and run.
+    fn tally(&self) -> super::deferred::Tally {
+        super::deferred::Tally {
+            blanked: self.blanked.0.clone(),
+            ctx: self.ctx.clone(),
         }
     }
 }

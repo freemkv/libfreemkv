@@ -458,6 +458,15 @@ impl<S: SectorSource> SectorSource for UnitAligned<S> {
             }
             Ok(count as usize * crate::consts::SECTOR_BYTES)
         })()?;
+        let end = lba as u64 + count as u64;
+        if self
+            .name_patches
+            .iter()
+            .any(|p| p.lba >= lba && (p.lba as u64) < end)
+        {
+            // A patch lands on decrypted bytes, so a deferred decrypt of this read runs first.
+            crate::sector::deferred::settle(&mut buf[..got])?;
+        }
         for patch in &self.name_patches {
             if patch.lba >= lba && (patch.lba as u64) < lba as u64 + count as u64 {
                 let offset =

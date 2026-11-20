@@ -1342,3 +1342,302 @@ fn transport_failure_across_channel_still_classifies() {
         );
     });
 }
+
+// ── Read/decrypt overlap ───────────────────────────────────────────────────────────
+
+const OVERLAP_KEY: [u8; 16] = [0x6B; 16];
+
+// One clear BD-TS unit flagged encrypted, as `(plaintext with CPI cleared, ciphertext)`.
+fn overlap_unit() -> (Vec<u8>, Vec<u8>) {
+    let unit_len = crate::aacs::content::ALIGNED_UNIT_LEN;
+    let mut plain: Vec<u8> = (0..unit_len).map(|i| (i % 249) as u8 | 1).collect();
+    for p in plain.chunks_mut(crate::consts::BD_SOURCE_PACKET_BYTES) {
+        p[0] |= 0xC0;
+        p[4] = 0x47;
+    }
+    let mut cipher = plain.clone();
+    assert!(crate::aacs::content::encrypt_unit(
+        &mut cipher,
+        &OVERLAP_KEY
+    ));
+    (crate::aacs::content::cpi_cleared(plain), cipher)
+}
+
+// Every file (anchored at an `anchors` LBA) repeats one encrypted unit on its own grid.
+struct UnitImage {
+    unit: Vec<u8>,
+    anchors: Vec<u32>,
+    fail_at: Option<u32>,
+    panic_at: Option<u32>,
+}
+
+impl UnitImage {
+    fn new(unit: Vec<u8>, anchors: Vec<u32>) -> Self {
+        Self {
+            unit,
+            anchors,
+            fail_at: None,
+            panic_at: None,
+        }
+    }
+    fn sector<'a>(unit: &'a [u8], anchors: &[u32], lba: u32) -> &'a [u8] {
+        let anchor = anchors
+            .iter()
+            .rev()
+            .find(|&&a| a <= lba)
+            .copied()
+            .unwrap_or(0);
+        let k = ((lba - anchor) % 3) as usize * 2048;
+        &unit[k..k + 2048]
+    }
+}
+
+impl SectorSource for UnitImage {
+    fn capacity_sectors(&self) -> u32 {
+        u32::MAX
+    }
+    fn read_sectors(&mut self, lba: u32, count: u16, buf: &mut [u8], _: bool) -> Result<usize> {
+        let end = lba as u64 + count as u64;
+        if self
+            .panic_at
+            .is_some_and(|p| (lba as u64..end).contains(&(p as u64)))
+        {
+            panic!("reader panic (expected by the test)");
+        }
+        if let Some(f) = self
+            .fail_at
+            .filter(|&f| (lba as u64..end).contains(&(f as u64)))
+        {
+            return Err(crate::error::Error::DiscRead {
+                sector: f as u64,
+                status: None,
+                sense: None,
+            });
+        }
+        for (i, s) in buf[..count as usize * 2048].chunks_mut(2048).enumerate() {
+            s.copy_from_slice(Self::sector(&self.unit, &self.anchors, lba + i as u32));
+        }
+        Ok(count as usize * 2048)
+    }
+}
+
+// The key set's reader over `img`: each `(start, end)` file in `files` is keyed content,
+// and `[start, content_end)` of the first is content too (an unkeyed tail fails loud).
+fn overlap_reader(
+    img: UnitImage,
+    files: &[(u32, u32)],
+    content_end: Option<u32>,
+) -> crate::whole_disc::UnitAligned<crate::sector::DecryptingSectorSource<UnitImage>> {
+    let keys = crate::decrypt::DecryptKeys::Aacs {
+        unit_keys: vec![(0, OVERLAP_KEY)],
+        format: crate::disc::ContentFormat::BdTs,
+    };
+    let map =
+        crate::decrypt::AacsKeyMap::from_ranges(files.iter().map(|&(s, e)| (s, e, 0)).collect());
+    let mut content: Vec<(u32, u32)> = files.iter().map(|&(s, e)| (s, e - s)).collect();
+    if let Some(end) = content_end {
+        content[0].1 = end - content[0].0;
+    }
+    let spans = files.iter().map(|&(s, e)| (s, e - s, s as u64)).collect();
+    let keying = crate::sector::Keying::ring(keys, Arc::new(map), None);
+    let dec = crate::sector::DecryptingSectorSource::new(img, keying)
+        .with_content_ranges(Arc::from(content));
+    crate::whole_disc::UnitAligned::new(dec, spans)
+}
+
+fn stage_runs() -> usize {
+    crate::sector::deferred::STAGE_RUNS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+// The decrypt stage's output is byte for byte the serial reader's, across two files on
+// different unit grids and batch sizes that split them every way.
+#[test]
+fn overlapped_decrypt_is_byte_identical_to_the_serial_read() {
+    let _serial = serial();
+    let (plain, cipher) = overlap_unit();
+    let files = [(0u32, 60u32), (61, 151)];
+    let extents: Vec<Extent> = files
+        .iter()
+        .map(|&(s, e)| Extent {
+            start_lba: s,
+            sector_count: e - s,
+        })
+        .collect();
+    let mut want = Vec::new();
+    for &(s, e) in &files {
+        for lba in s..e {
+            want.extend_from_slice(UnitImage::sector(&plain, &[0, 61], lba));
+        }
+    }
+    let mut serial_reader =
+        overlap_reader(UnitImage::new(cipher.clone(), vec![0, 61]), &files, None);
+    let mut serial_out = Vec::new();
+    for &(s, e) in &files {
+        let mut buf = vec![0u8; (e - s) as usize * 2048];
+        serial_reader
+            .read_sectors(s, (e - s) as u16, &mut buf, false)
+            .unwrap();
+        serial_out.extend_from_slice(&buf);
+    }
+    assert!(serial_out == want, "the serial reader decrypts");
+    for batch in [3u16, 15, 31, 64, 90] {
+        let before = stage_runs();
+        let reader = overlap_reader(UnitImage::new(cipher.clone(), vec![0, 61]), &files, None);
+        let mut pf =
+            PrefetchedSectorSource::new(reader, extents.clone(), batch, &Ctx::default()).unwrap();
+        let (got, last) = drain_direct(&mut pf, batch.max(3), 1000);
+        assert!(matches!(last, Ok(0)), "batch {batch}: {last:?}");
+        assert!(got == want, "batch {batch}: overlapped output differs");
+        assert!(
+            stage_runs() > before,
+            "batch {batch}: the decrypt stage ran"
+        );
+    }
+}
+
+// A unit decrypt that fails in the stage arrives after every earlier batch, in order, and
+// ends the stream: no later batch, then the latched dead source.
+#[test]
+fn a_stage_decrypt_failure_arrives_in_order_and_ends_the_stream() {
+    let _serial = serial();
+    with_watchdog(Duration::from_secs(10), || {
+        let (plain, cipher) = overlap_unit();
+        let reader = overlap_reader(UnitImage::new(cipher, vec![0]), &[(0, 30)], Some(60));
+        let extents = vec![Extent {
+            start_lba: 0,
+            sector_count: 60,
+        }];
+        let mut pf = PrefetchedSectorSource::new(reader, extents, 15, &Ctx::default()).unwrap();
+        let mut buf = vec![0u8; 15 * 2048];
+        for b in 0..2u32 {
+            assert_eq!(pf.read_sectors(0, 15, &mut buf, false).unwrap(), buf.len());
+            let want: Vec<u8> = (b * 15..b * 15 + 15)
+                .flat_map(|l| UnitImage::sector(&plain, &[0], l).to_vec())
+                .collect();
+            assert!(buf == want, "batch {b} decrypted");
+        }
+        let e = pf.read_sectors(0, 15, &mut buf, false).unwrap_err();
+        assert_eq!(e.code(), crate::error::Error::DecryptFailed.code());
+        let after = pf.read_sectors(0, 15, &mut buf, false).unwrap_err();
+        assert!(
+            matches!(after, crate::error::Error::SourceTerminated),
+            "{after:?}"
+        );
+    });
+}
+
+// A read error behind deferred batches is reported after them, never before.
+#[test]
+fn a_read_error_follows_the_batches_still_decrypting() {
+    let _serial = serial();
+    with_watchdog(Duration::from_secs(10), || {
+        let (plain, cipher) = overlap_unit();
+        let mut img = UnitImage::new(cipher, vec![0]);
+        img.fail_at = Some(33);
+        let reader = overlap_reader(img, &[(0, 60)], None);
+        let extents = vec![Extent {
+            start_lba: 0,
+            sector_count: 60,
+        }];
+        let mut pf = PrefetchedSectorSource::new(reader, extents, 15, &Ctx::default()).unwrap();
+        let (got, last) = drain_direct(&mut pf, 15, 10);
+        let want: Vec<u8> = (0..30)
+            .flat_map(|l| UnitImage::sector(&plain, &[0], l).to_vec())
+            .collect();
+        assert!(got == want, "both batches before the error, decrypted");
+        let e = last.unwrap_err();
+        assert!(
+            matches!(e, crate::error::Error::DiscRead { sector: 33, .. }),
+            "{e:?}"
+        );
+    });
+}
+
+// A reader panic behind a deferred batch: the batch is delivered, then the panic error.
+#[test]
+fn a_reader_panic_with_the_stage_running_is_an_error_after_earlier_batches() {
+    let _serial = serial();
+    with_watchdog(Duration::from_secs(10), || {
+        let (_, cipher) = overlap_unit();
+        let mut img = UnitImage::new(cipher, vec![0]);
+        img.panic_at = Some(31);
+        let reader = overlap_reader(img, &[(0, 60)], None);
+        let extents = vec![Extent {
+            start_lba: 0,
+            sector_count: 60,
+        }];
+        let mut pf = PrefetchedSectorSource::new(reader, extents, 15, &Ctx::default()).unwrap();
+        let (got, last) = drain_direct(&mut pf, 15, 10);
+        assert_eq!(got.len(), 30 * 2048);
+        assert!(
+            matches!(last, Err(crate::error::Error::DemuxThreadPanicked)),
+            "{last:?}"
+        );
+    });
+}
+
+// A cancel while the stage and the producer are both blocked ends them within a slice.
+#[test]
+fn cancel_during_overlap_ends_producer_and_stage() {
+    let _serial = serial();
+    let before = crate::halt::live_drive_holders();
+    let (_, cipher) = overlap_unit();
+    let reader = overlap_reader(UnitImage::new(cipher, vec![0]), &[(0, 3_000_000)], None);
+    let halt = Halt::new();
+    let pf = PrefetchedSectorSource::new(reader, big_extent(), 30, &Ctx::new(halt.clone()))
+        .expect("spawn");
+    // Undrained: the channel fills, the stage blocks sending, the producer handing over.
+    std::thread::sleep(Duration::from_millis(100));
+    halt.cancel();
+    let ended = holders_settle_to(before, Duration::from_secs(1));
+    within(10, move || drop(pf));
+    assert!(ended, "a cancel must end the producer and its stage");
+}
+
+// A consumer that walks away mid-stream releases the producer and its stage.
+#[test]
+fn consumer_drop_during_overlap_joins_cleanly() {
+    let _serial = serial();
+    within(10, || {
+        let (_, cipher) = overlap_unit();
+        let reader = overlap_reader(UnitImage::new(cipher, vec![0]), &[(0, 3_000_000)], None);
+        let pf =
+            PrefetchedSectorSource::new(reader, big_extent(), 30, &Ctx::default()).expect("spawn");
+        let (rx, recycle, shell) = pf.into_channels();
+        for _ in 0..4 {
+            let buf = rx.recv().expect("batch").expect("ok");
+            let _ = recycle.send(buf);
+        }
+        drop((rx, recycle));
+        drop(shell);
+    });
+}
+
+// A live drive's recovering reads judge each decrypt in the read: no stage, ever.
+#[test]
+fn live_reads_never_defer_their_decrypt() {
+    let _serial = serial();
+    with_watchdog(Duration::from_secs(10), || {
+        let (plain, cipher) = overlap_unit();
+        let reader = overlap_reader(UnitImage::new(cipher, vec![0]), &[(0, 60)], None);
+        let extents = vec![Extent {
+            start_lba: 0,
+            sector_count: 60,
+        }];
+        let before = stage_runs();
+        let policy = crate::sector::read_stage::ReadPolicy::Live {
+            batch: 15,
+            skip_errors: false,
+        };
+        let (mut pf, _) =
+            PrefetchedSectorSource::with_policy(reader, extents, policy, 3, &Ctx::default())
+                .unwrap();
+        let (got, last) = drain_direct(&mut pf, 15, 10);
+        assert!(matches!(last, Ok(0)), "{last:?}");
+        let want: Vec<u8> = (0..60)
+            .flat_map(|l| UnitImage::sector(&plain, &[0], l).to_vec())
+            .collect();
+        assert!(got == want);
+        assert_eq!(stage_runs(), before, "no deferred decrypt");
+    });
+}

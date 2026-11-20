@@ -6,11 +6,16 @@
 //! The producer thread ([`PrefetchedSectorSource::new`]) walks the extent list in order,
 //! sending batches into a bounded channel; sender drop reads as end-of-stream. `read_sectors`
 //! ignores its `lba`/`count` args.
+//!
+//! Under fixed image batches the keyed unit decrypt moves to a decrypt stage thread
+//! (`sector::deferred`), so batch N+1 is read while batch N decrypts.
 
 use crate::ctx::Ctx;
 use crate::error::Result;
 use crate::halt::{DriveHolder, Halt, Recv, SendOutcome};
 use crate::sector::SectorSource;
+use crate::sector::deferred;
+use crate::sector::read_stage::ReadPolicy;
 use crossbeam_channel::{Receiver, Sender, bounded};
 use std::time::Duration;
 
@@ -88,6 +93,66 @@ fn send_or_stop(halt: &Halt, tx: &Sender<Batch>, item: Batch) -> bool {
         halt.send_timeout(tx, item, Duration::MAX),
         Ok(SendOutcome::Sent)
     )
+}
+
+/// What the producer hands the decrypt stage, in read order.
+enum Staged {
+    /// A read batch and the unit decrypts it still needs.
+    Batch(Vec<u8>, Vec<deferred::Pending>),
+    /// The read failed; the stage forwards it after every earlier batch.
+    Failed(crate::error::Error),
+}
+
+impl Staged {
+    fn has_jobs(&self) -> bool {
+        matches!(self, Staged::Batch(_, jobs) if !jobs.is_empty())
+    }
+
+    // Run the batch's deferred decrypts now: its first failure fails the batch.
+    fn settle(self) -> Staged {
+        match self {
+            Staged::Batch(mut buf, jobs) => match deferred::run(&mut buf, jobs) {
+                Ok(()) => Staged::Batch(buf, Vec::new()),
+                Err(e) => Staged::Failed(e),
+            },
+            failed => failed,
+        }
+    }
+}
+
+/// Start the decrypt stage: it settles each batch and forwards it, or the read's error,
+/// to `tx`, stopping after the first error. `None` if the thread cannot start.
+fn spawn_stage<'scope>(
+    scope: &'scope std::thread::Scope<'scope, '_>,
+    halt: &Halt,
+    tx: &Sender<Batch>,
+) -> Option<Sender<Staged>> {
+    // Zero capacity: the producer reads one batch ahead of the decrypt, no further.
+    let (stage_tx, stage_rx) = bounded::<Staged>(0);
+    let (halt, tx) = (halt.clone(), tx.clone());
+    let run = move || {
+        let body = std::panic::AssertUnwindSafe(|| {
+            while let Ok(Recv::Item(item)) = halt.recv_timeout(&stage_rx, Duration::MAX) {
+                let out = match item.settle() {
+                    Staged::Batch(buf, _) => Ok(buf),
+                    Staged::Failed(e) => Err(e.into()),
+                };
+                let failed = out.is_err();
+                if !send_or_stop(&halt, &tx, out) || failed {
+                    return;
+                }
+            }
+        });
+        if std::panic::catch_unwind(body).is_err() {
+            let e = crate::error::Error::DemuxThreadPanicked.into();
+            send_or_stop(&halt, &tx, Err(e));
+        }
+    };
+    std::thread::Builder::new()
+        .name("freemkv-decrypt-stage".into())
+        .spawn_scoped(scope, run)
+        .ok()
+        .map(|_| stage_tx)
 }
 
 impl PrefetchedSectorSource {
@@ -180,7 +245,8 @@ impl PrefetchedSectorSource {
         let batch_sectors = policy.batch();
         let unmapped = reader.unmapped_stream_files().to_vec();
         let (tx, rx) = bounded::<Batch>(PREFETCH_CHANNEL_DEPTH);
-        let (recycle_tx, recycle_rx) = bounded::<Vec<u8>>(PREFETCH_CHANNEL_DEPTH + 1);
+        // Room for every pool buffer, the overlap's extra one included, so a recycle never blocks.
+        let (recycle_tx, recycle_rx) = bounded::<Vec<u8>>(PREFETCH_CHANNEL_DEPTH + 2);
         let batch_bytes = batch_sectors as usize * crate::consts::SECTOR_BYTES;
         let wait = ctx.halt.clone();
 
@@ -196,6 +262,10 @@ impl PrefetchedSectorSource {
             "a test that spawns a prefetcher (a Drive holder) must hold DRIVE_HOLDER_TEST_LOCK"
         );
         let file_view = view.is_some();
+        // Fixed image batches overlap: the next read runs while a decrypt stage finishes the
+        // last. A live drive's recovering reads judge each decrypt at once, so they never do.
+        let overlap = !file_view && matches!(policy, ReadPolicy::Image { .. });
+        let max_bytes = batch_sectors.max(unit_align) as usize * crate::consts::SECTOR_BYTES;
         let body = move || {
             // A byte view: what is still to go out after the prefix.
             let (prefix, mut left) = match view {
@@ -209,40 +279,75 @@ impl PrefetchedSectorSource {
                 if !prefix.is_empty() && !send_or_stop(&wait, &tx, Ok(prefix)) {
                     return;
                 }
-                loop {
-                    if wait.is_cancelled() {
-                        return;
-                    }
-                    // Halt-aware: a cancel does not disconnect the channel, so a
-                    // plain recv() would never re-reach the check. Disconnected =
-                    // the consumer dropped both channels.
-                    let Ok(Recv::Item(mut buf)) = wait.recv_timeout(&recycle_rx, Duration::MAX)
-                    else {
-                        return;
-                    };
-                    match walk.next(&mut reader, &mut buf) {
-                        Ok(true) => {
-                            // A byte view ends at the file's real length.
-                            let last = left.is_some_and(|l| buf.len() as u64 >= l);
-                            if let Some(l) = left.as_mut() {
-                                buf.truncate((*l).min(buf.len() as u64) as usize);
-                                *l -= buf.len() as u64;
-                            }
-                            if !buf.is_empty() && !send_or_stop(&wait, &tx, Ok(buf)) {
-                                return; // consumer dropped, or stopped
-                            }
-                            if last {
-                                return;
+                std::thread::scope(|scope| {
+                    // Started by the first batch with deferred decrypts; then every item
+                    // goes through it, so the consumer still sees them in read order.
+                    let mut stage: Option<Sender<Staged>> = None;
+                    // The overlap's extra pool buffer, used before the next recycled one.
+                    let mut spare: Option<Vec<u8>> = None;
+                    loop {
+                        if wait.is_cancelled() {
+                            return;
+                        }
+                        // Halt-aware: a cancel does not disconnect the channel, so a
+                        // plain recv() would never re-reach the check. Disconnected =
+                        // the consumer dropped both channels.
+                        let mut buf = match spare.take() {
+                            Some(b) => b,
+                            None => match wait.recv_timeout(&recycle_rx, Duration::MAX) {
+                                Ok(Recv::Item(b)) => b,
+                                _ => return,
+                            },
+                        };
+                        let armed = overlap.then(|| deferred::arm(&mut buf, max_bytes));
+                        let read = walk.next(&mut reader, &mut buf);
+                        let jobs = match armed {
+                            Some(a) => a.finish(&buf),
+                            None => Ok(Vec::new()),
+                        };
+                        let mut item = match (read, jobs) {
+                            (Ok(true), Ok(jobs)) => Staged::Batch(buf, jobs),
+                            // Drop tx — the consumer sees RecvError → EOF.
+                            (Ok(false), _) => return,
+                            (Err(e), _) | (Ok(true), Err(e)) => Staged::Failed(e),
+                        };
+                        if stage.is_none() && item.has_jobs() {
+                            stage = spawn_stage(scope, &wait, &tx);
+                            if stage.is_some() {
+                                spare = Some(vec![0u8; batch_bytes]);
                             }
                         }
-                        // Drop tx — the consumer sees RecvError → EOF.
-                        Ok(false) => return,
-                        Err(e) => {
-                            send_or_stop(&wait, &tx, Err(e.into()));
+                        if let Some(st) = &stage {
+                            let failed = matches!(item, Staged::Failed(_));
+                            let sent = wait.send_timeout(st, item, Duration::MAX);
+                            if failed || !matches!(sent, Ok(SendOutcome::Sent)) {
+                                return; // after an error, or the stage stopped
+                            }
+                            continue;
+                        }
+                        // No stage (none needed, or it could not start): finish here.
+                        item = item.settle();
+                        let mut buf = match item {
+                            Staged::Batch(buf, _) => buf,
+                            Staged::Failed(e) => {
+                                send_or_stop(&wait, &tx, Err(e.into()));
+                                return;
+                            }
+                        };
+                        // A byte view ends at the file's real length.
+                        let last = left.is_some_and(|l| buf.len() as u64 >= l);
+                        if let Some(l) = left.as_mut() {
+                            buf.truncate((*l).min(buf.len() as u64) as usize);
+                            *l -= buf.len() as u64;
+                        }
+                        if !buf.is_empty() && !send_or_stop(&wait, &tx, Ok(buf)) {
+                            return; // consumer dropped, or stopped
+                        }
+                        if last {
                             return;
                         }
                     }
-                }
+                });
             });
             if std::panic::catch_unwind(body).is_err() {
                 // Panicked mid-stream — surface a typed error so the demux
