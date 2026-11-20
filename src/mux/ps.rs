@@ -674,7 +674,8 @@ impl PsDemuxer {
                     };
                     if let Some(mut pkt) = parsed {
                         if self.has_base {
-                            pkt.source = Some(crate::pes::SourcePos::at_byte(buf_base + sc as u64));
+                            pkt.source =
+                                Some(crate::pes::SourcePos::at_byte(self.buffer_base + sc as u64));
                         }
                         packets.push(pkt);
                     }
