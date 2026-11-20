@@ -33,6 +33,9 @@ pub type Batch = std::result::Result<Vec<u8>, std::io::Error>;
 /// with the real reader, the extent list to walk, and the batch
 /// size; the wrapper spawns the producer immediately and starts
 /// filling the channel.
+///
+/// Its [`SectorSource::read_sectors`] is a compatibility path that copies each batch into the
+/// caller's buffer; [`into_channels`](Self::into_channels) hands batches over without a copy.
 pub struct PrefetchedSectorSource {
     rx: Receiver<Batch>,
     /// Recycle channel — consumer returns drained buffers here; the
