@@ -130,3 +130,41 @@ fn draining_past_the_end_is_clamped() {
     b.drain(99);
     assert!(b.is_empty());
 }
+
+// The read cursor and its bulk compaction are invisible: against a plain Vec that
+// memmoves on every drain, the bytes and the facts of every byte agree after each step,
+// across pushes, small drains that build past the compaction threshold, and full drains.
+#[test]
+fn the_read_cursor_matches_a_draining_vec_byte_for_byte() {
+    let mut b = PesBuf::with_capacity(16);
+    let mut model: Vec<u8> = Vec::new();
+    let mut model_src: Vec<u64> = Vec::new();
+    let mut next = 0u64;
+    for round in 0..400u64 {
+        let len = 500 + (round * 7919 % 9000) as usize;
+        let data: Vec<u8> = (0..len).map(|i| (i as u64 * 31 + round) as u8).collect();
+        let byte = 1_000_000 + next;
+        b.push(&pes(&data, Some(90_000 + round as i64), Some(byte)));
+        model.extend_from_slice(&data);
+        model_src.extend(std::iter::repeat_n(byte, len));
+        next += len as u64;
+        let n = match round % 50 {
+            49 => model.len(),
+            r if r % 2 == 0 => len / 3,
+            _ => 1 + (round as usize * 104_729) % (len / 2 + 1),
+        }
+        .min(model.len());
+        b.drain(n);
+        model.drain(..n);
+        model_src.drain(..n);
+        assert_eq!(b.as_slice(), &model[..], "round {round}");
+        assert_eq!(b.len(), model.len());
+        for off in [0, model.len() / 2, model.len().saturating_sub(1)] {
+            if off < model.len() {
+                assert_eq!(b.facts_at(off).source.map(|s| s.byte), Some(model_src[off]));
+            }
+        }
+    }
+    b.drain(b.len());
+    assert!(b.is_empty() && b.as_slice().is_empty());
+}
