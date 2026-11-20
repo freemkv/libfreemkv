@@ -114,7 +114,9 @@ struct Run<'a> {
     format: ContentFormat,
     sources: Vec<Box<dyn KeySource>>,
     dead: Vec<bool>,
-    inputs: DiscInputs,
+    inputs: Arc<DiscInputs>,
+    // The title keys of `inputs`, parsed once per acquire.
+    enc_keys: Arc<[[u8; 16]]>,
     pool: Vec<[u8; 16]>,
     origin: Vec<&'static str>,
     requests: u32,
@@ -158,9 +160,10 @@ impl Run<'_> {
             return Ok(Asked::Skipped);
         }
         self.requests += 1;
-        let mut inputs = self.inputs.clone();
-        inputs.samples = samples.to_vec();
-        let ctx = DiscInputsCtx::new(&inputs).with_stop(Some(self.halt), self.progress);
+        // Refcounts only: the ctx borrows the inputs, the parsed keys and `samples`.
+        let (inputs, enc_keys) = (Arc::clone(&self.inputs), Arc::clone(&self.enc_keys));
+        let ctx = DiscInputsCtx::borrowed(&inputs, samples, &enc_keys)
+            .with_stop(Some(self.halt), self.progress);
         let start = self.clock.now();
         let mut wait = RETRY_FIRST;
         let mut attempted = false;
@@ -403,6 +406,7 @@ pub(crate) fn acquire(
         samples: Vec::new(),
         volume_label: aacs.volume_label.clone(),
     };
+    let enc_keys: Arc<[[u8; 16]]> = crate::keysource::parse_enc_title_keys(&inputs).into();
     let built = sources();
     let n_src = built.len();
     let vid_consumer = built.iter().any(|s| s.uses_vid());
@@ -413,7 +417,8 @@ pub(crate) fn acquire(
         format: ev.container,
         sources: built,
         dead: vec![false; n_src],
-        inputs,
+        inputs: Arc::new(inputs),
+        enc_keys,
         pool: Vec::new(),
         origin: Vec::new(),
         requests: 0,

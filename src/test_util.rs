@@ -81,8 +81,8 @@ pub fn aacs_state() -> AacsStateBuilder {
             mkb_version: None,
             disc_hash: String::new(),
             volume_id: [0u8; 16],
-            uk_ro: Vec::new(),
-            mkb: Vec::new(),
+            uk_ro: Vec::<u8>::new().into(),
+            mkb: Vec::<u8>::new().into(),
         },
     }
 }
@@ -108,12 +108,12 @@ impl AacsStateBuilder {
         self.state.volume_id = vid;
         self
     }
-    pub fn uk_ro(mut self, bytes: Vec<u8>) -> Self {
-        self.state.uk_ro = bytes;
+    pub fn uk_ro(mut self, bytes: impl Into<Arc<[u8]>>) -> Self {
+        self.state.uk_ro = bytes.into();
         self
     }
-    pub fn mkb(mut self, bytes: Vec<u8>) -> Self {
-        self.state.mkb = bytes;
+    pub fn mkb(mut self, bytes: impl Into<Arc<[u8]>>) -> Self {
+        self.state.mkb = bytes.into();
         self
     }
     pub fn build(self) -> AacsState {

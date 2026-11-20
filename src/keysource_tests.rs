@@ -93,8 +93,8 @@ fn disc_inputs_ctx_maps_fields() {
         disc_hash: "0xABC".into(),
         volume_id: [0u8; 16],
         version: crate::aacs::mkb::AACS_MAJOR_BD,
-        mkb: vec![1, 2, 3],
-        unit_key_ro: uk_ro,
+        mkb: vec![1u8, 2, 3].into(),
+        unit_key_ro: uk_ro.into(),
         samples: vec![vec![9u8; 4], vec![8u8; 4], vec![7u8; 4]],
         volume_label: Some("TITLE_X".into()),
     };
@@ -114,6 +114,23 @@ fn disc_inputs_ctx_maps_fields() {
     inputs2.volume_id = [0x42u8; 16];
     let ctx2 = DiscInputsCtx::new(&inputs2);
     assert_eq!(ctx2.vid(), Some(Vid([0x42u8; 16])));
+
+    // Cloning the inputs shares the MKB and title-key file rather than copying them.
+    assert!(std::sync::Arc::ptr_eq(&inputs.mkb, &inputs2.mkb));
+    assert!(std::sync::Arc::ptr_eq(
+        &inputs.unit_key_ro,
+        &inputs2.unit_key_ro
+    ));
+
+    // The resolver's borrowed ctx answers like `new`, with its own samples.
+    let keys = super::parse_enc_title_keys(&inputs);
+    let samples = vec![vec![5u8; 4]];
+    let b = DiscInputsCtx::borrowed(&inputs, &samples, &keys);
+    assert_eq!(b.enc_title_keys().unwrap(), ctx.enc_title_keys().unwrap());
+    assert_eq!(b.mkb().unwrap(), ctx.mkb().unwrap());
+    assert_eq!(b.unit_key_ro(), ctx.unit_key_ro());
+    assert_eq!((b.disc_hash(), b.title()), (ctx.disc_hash(), ctx.title()));
+    assert_eq!(b.samples(8).unwrap(), samples);
 }
 
 // The documented contract: garbage Unit_Key_RO parses to no keys, not an error.
@@ -121,7 +138,7 @@ fn disc_inputs_ctx_maps_fields() {
 fn malformed_unit_key_ro_yields_an_empty_key_set() {
     for garbage in [vec![0xFFu8; 7], vec![0xFF; 96], vec![0u8; 3]] {
         let mut inputs = empty_inputs();
-        inputs.unit_key_ro = garbage;
+        inputs.unit_key_ro = garbage.into();
         let ctx = DiscInputsCtx::new(&inputs);
         assert!(ctx.enc_title_keys().unwrap().is_empty());
     }
@@ -238,8 +255,8 @@ fn empty_inputs() -> DiscInputs {
         disc_hash: String::new(),
         volume_id: [0u8; 16],
         version: crate::aacs::mkb::AACS_MAJOR_UHD,
-        mkb: Vec::new(),
-        unit_key_ro: Vec::new(),
+        mkb: Vec::<u8>::new().into(),
+        unit_key_ro: Vec::<u8>::new().into(),
         samples: Vec::new(),
         volume_label: None,
     }
@@ -432,8 +449,8 @@ fn disc_inputs_ctx_parses_unit_keys_at_the_version_stride() {
         disc_hash: String::new(),
         volume_id: [0u8; 16],
         version: AACS_MAJOR_UHD,
-        mkb: Vec::new(),
-        unit_key_ro: inf,
+        mkb: Vec::<u8>::new().into(),
+        unit_key_ro: inf.into(),
         samples: Vec::new(),
         volume_label: None,
     };
@@ -465,8 +482,8 @@ fn disc_inputs_debug_is_redacted() {
         disc_hash: "0xAA".into(),
         volume_id: [0xD5; 16],
         version: 2,
-        mkb: vec![0xD5; 64],
-        unit_key_ro: vec![0xD5; 48],
+        mkb: vec![0xD5u8; 64].into(),
+        unit_key_ro: vec![0xD5u8; 48].into(),
         samples: vec![vec![0xD5; 6144]],
         volume_label: Some("TITLE_2024".into()),
     };
@@ -624,7 +641,7 @@ fn disc_inputs_ctx_parses_hddvd_vtkf_title_keys() {
     vtkf.resize(0x80 + 64 * 0x24, 0);
     let mut inputs = empty_inputs();
     inputs.version = crate::aacs::mkb::AACS_MAJOR_BD;
-    inputs.unit_key_ro = vtkf;
+    inputs.unit_key_ro = vtkf.into();
     let ctx = DiscInputsCtx::new(&inputs);
     assert_eq!(ctx.enc_title_keys().unwrap(), &[key]);
 }

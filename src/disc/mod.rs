@@ -1719,11 +1719,25 @@ pub struct AacsState {
     pub volume_id: [u8; 16],
     /// Raw `Unit_Key_RO.inf` bytes (encrypted unit keys + CPS map). Stashed at
     /// scan so an external resolver (key-resolver) can derive the unit keys
-    /// from a VUK without re-reading the disc. Empty when not captured.
-    pub uk_ro: Vec<u8>,
+    /// from a VUK without re-reading the disc. Empty when not captured. Shared:
+    /// [`Disc::inputs`] and key acquisition take a refcount, never a copy.
+    pub uk_ro: std::sync::Arc<[u8]>,
     /// Raw MKB bytes (`MKB_RO.inf`). Stashed at scan so an external resolver can
     /// walk it (device/processing key → media key). Empty when not captured.
-    pub mkb: Vec<u8>,
+    /// Shared like `uk_ro` (1-4 MB on UHD).
+    pub mkb: std::sync::Arc<[u8]>,
+}
+
+impl AacsState {
+    /// The raw `Unit_Key_RO.inf` bytes (empty when not captured).
+    pub fn uk_ro_bytes(&self) -> &[u8] {
+        &self.uk_ro
+    }
+
+    /// The raw MKB bytes (empty when not captured).
+    pub fn mkb_bytes(&self) -> &[u8] {
+        &self.mkb
+    }
 }
 
 // Redacting `Debug`: `AacsState` is public via `Disc.aacs` and carries VUK /

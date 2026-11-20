@@ -921,8 +921,8 @@ fn aacs_state_and_key_debug_are_redacted() {
         mkb_version: Some(77),
         disc_hash: "0xAA".into(),
         volume_id: [0xD5; 16],
-        uk_ro: vec![1, 2, 3],
-        mkb: vec![4, 5, 6],
+        uk_ro: vec![1u8, 2, 3].into(),
+        mkb: vec![4u8, 5, 6].into(),
     };
     let d = format!("{st:?}");
     assert!(!d.contains("213"), "AacsState leaked key bytes: {d}");
@@ -3168,8 +3168,8 @@ fn aacs_empty() -> AacsState {
         mkb_version: None,
         disc_hash: String::new(),
         volume_id: [0u8; 16],
-        uk_ro: Vec::new(),
-        mkb: Vec::new(),
+        uk_ro: Vec::<u8>::new().into(),
+        mkb: Vec::<u8>::new().into(),
     }
 }
 
@@ -5764,13 +5764,17 @@ fn main_title_prefers_the_largest_title_with_video() {
 fn inputs_label_is_the_trimmed_volume_id_else_the_meta_title() {
     let mut disc = make_test_disc(1_000, "  TITLE_2024  ");
     let mut st = aacs_empty();
-    st.uk_ro = vec![1, 2, 3];
-    st.mkb = vec![4, 5];
+    st.uk_ro = vec![1u8, 2, 3].into();
+    st.mkb = vec![4u8, 5].into();
     disc.aacs = Some(st);
     let i = disc.inputs().expect("inputs");
     assert_eq!(i.volume_label.as_deref(), Some("TITLE_2024"));
-    assert_eq!(i.unit_key_ro, vec![1, 2, 3]);
-    assert_eq!(i.mkb, vec![4, 5]);
+    assert_eq!(&i.unit_key_ro[..], &[1u8, 2, 3]);
+    assert!(std::sync::Arc::ptr_eq(
+        &i.mkb,
+        &disc.aacs.as_ref().unwrap().mkb
+    ));
+    assert_eq!(&i.mkb[..], &[4u8, 5]);
     disc.volume_id = "   ".into();
     disc.meta_title = Some("Meta".into());
     assert_eq!(

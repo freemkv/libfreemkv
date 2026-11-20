@@ -96,8 +96,8 @@ impl Piece {
 // The AACS structures a source supplied. Key material: never printed.
 pub(crate) struct AacsEvidence {
     pub(crate) version: u8,
-    pub(crate) mkb: Vec<u8>,
-    pub(crate) unit_key_ro: Vec<u8>,
+    pub(crate) mkb: std::sync::Arc<[u8]>,
+    pub(crate) unit_key_ro: std::sync::Arc<[u8]>,
     // In memory only; `None` when no handshake read one.
     pub(crate) vid: Option<[u8; 16]>,
     // `Num_of_CPS_Unit` the title-key file declares (KS-14); `None` if unparseable.

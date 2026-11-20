@@ -2950,7 +2950,7 @@ fn resolve_returns_the_trace_on_ok_and_on_err() {
 fn the_resolution_trace_holds_no_key_vid_or_mkb_bytes() {
     let mut fx = two_units();
     let mkb = vec![0x9Du8; 64];
-    fx.disc.aacs.as_mut().unwrap().mkb = mkb.clone();
+    fx.disc.aacs.as_mut().unwrap().mkb = mkb.clone().into();
     let calls = Calls::default();
     let km_no_vid = Spec {
         no_vid: true,
@@ -3166,7 +3166,7 @@ fn declared_cps_units_reads_hd_dvd_title_keys_too() {
     let mut fx = two_units();
     fx.disc.format = DiscFormat::HdDvd;
     fx.disc.content_format = ContentFormat::MpegPs;
-    fx.disc.aacs.as_mut().unwrap().uk_ro = vtkf;
+    fx.disc.aacs.as_mut().unwrap().uk_ro = vtkf.into();
     assert_eq!(fx.disc.declared_cps_units(), Some(1));
 }
 
