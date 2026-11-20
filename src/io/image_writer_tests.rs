@@ -70,8 +70,8 @@ fn clear_aacs_unit() -> Vec<u8> {
     unit
 }
 
-// Batches are not whole AACS units: an unwrapped AACS decrypting source fails
-// loud at the first misaligned batch that touches content, never ships ciphertext.
+// Batches sit on LBA 0's grid, not a file's: an unwrapped AACS decrypting source fails
+// loud at the first off-grid batch that touches content, never ships ciphertext.
 #[test]
 fn write_image_over_an_unwrapped_aacs_source_fails_loud_at_a_misaligned_batch() {
     use crate::decrypt::{DecryptKeys, Phase};
@@ -79,20 +79,20 @@ fn write_image_over_an_unwrapped_aacs_source_fails_loud_at_a_misaligned_batch() 
     let key = [0x5A; 16];
     let mut unit = clear_aacs_unit();
     assert!(crate::aacs::content::encrypt_unit(&mut unit, &key));
-    let src = AacsFileImage { file: 3000, unit };
+    let src = AacsFileImage { file: 3001, unit };
     let keys = DecryptKeys::Aacs {
         unit_keys: vec![(0, key)],
         format: crate::disc::ContentFormat::BdTs,
     };
-    let map = crate::keys::test_key_map(vec![(3000, 3030, 0, Phase::All)]);
+    let map = crate::keys::test_key_map(vec![(3001, 3031, 0, Phase::All)]);
     let dec = crate::sector::DecryptingSectorSource::new(src, keys);
     let mut dec = crate::keys::test_keyed_source(dec, map)
-        .with_content_ranges(Arc::from(vec![(3000u32, 30u32)]));
-    dec.set_unit_base(0); // file grid (3000 % 3 == 0): fails loud past the no-base gate
+        .with_content_ranges(Arc::from(vec![(3001u32, 30u32)]));
+    dec.set_unit_base(1); // the file's grid (3001 % 3 == 1): batch 1536 is off it
     let dest = tmp("aacs-batch");
     let r = write_image(&mut dec, &dest, 3100, &Ctx::default());
     let _ = std::fs::remove_file(&dest);
-    let e = r.expect_err("batch 2048 is off the unit grid and touches content");
+    let e = r.expect_err("batch 1536 is off the file's unit grid and touches content");
     assert_eq!(e.code(), Error::DecryptFailed.code());
 }
 
@@ -148,9 +148,10 @@ fn writes_every_sector_in_order() {
 
     let data = std::fs::read(&dest).expect("read back");
     assert_eq!(data.len(), 5000 * SECTOR_BYTES);
-    // Spot-check across batch boundaries (BATCH_SECTORS = 2048): the last
-    // sector of batch 0, the first of batch 1, and the final sector.
-    for lba in [0usize, 2047, 2048, 4095, 4096, 4999] {
+    // Spot-check across batch boundaries: the last sector of batch 0, the first of
+    // batch 1, and the final sector.
+    let b = BATCH_SECTORS as usize;
+    for lba in [0usize, b - 1, b, 2 * b - 1, 2 * b, 4999] {
         let want = (lba % 251) as u8;
         assert_eq!(
             data[lba * SECTOR_BYTES],
@@ -195,7 +196,7 @@ fn short_read_is_an_error_not_a_zero_fill() {
     };
     let err = write_image(&mut src, &dest, 4096, &Ctx::default()).expect_err("must fail");
     assert!(
-        matches!(err, Error::ShortImageRead { lba: 2048, .. }),
+        matches!(err, Error::ShortImageRead { lba, .. } if lba == 2 * BATCH_SECTORS),
         "got {err:?}"
     );
     let _ = std::fs::remove_file(&dest);
@@ -261,4 +262,169 @@ fn zero_sectors_is_an_error() {
     // The destination must not have been created — a failed run leaves no
     // stub for a later run to mistake for output.
     assert!(!dest.exists(), "empty run created a file");
+}
+
+// A sink that records its writes and how it was finished, failing the write at `fail_at`.
+struct RecordingSink {
+    writes: std::sync::Arc<std::sync::Mutex<Vec<u64>>>,
+    finished: std::sync::Arc<std::sync::Mutex<Option<Finish>>>,
+    fail_at: Option<u64>,
+}
+
+impl BlockSink for RecordingSink {
+    fn write_at(&mut self, lba: u64, bytes: &[u8]) -> FmResult<()> {
+        assert_eq!(bytes.len() % SECTOR_BYTES, 0);
+        if self.fail_at == Some(lba) {
+            return Err(Error::IoError {
+                source: std::io::Error::other("sink full (expected by the test)"),
+            });
+        }
+        self.writes.lock().unwrap().push(lba);
+        Ok(())
+    }
+    fn finish(self: Box<Self>, how: Finish) -> FmResult<u64> {
+        *self.finished.lock().unwrap() = Some(how);
+        Ok(0)
+    }
+}
+
+type Log<T> = std::sync::Arc<std::sync::Mutex<T>>;
+
+fn recording(fail_at: Option<u64>) -> (Box<RecordingSink>, Log<Vec<u64>>, Log<Option<Finish>>) {
+    let sink = RecordingSink {
+        writes: Default::default(),
+        finished: Default::default(),
+        fail_at,
+    };
+    let (w, f) = (sink.writes.clone(), sink.finished.clone());
+    (Box::new(sink), w, f)
+}
+
+// A failed write is reported (not a later read error), ends the copy and finishes incomplete.
+#[test]
+fn a_write_failure_wins_over_the_read_behind_it() {
+    let b = u64::from(BATCH_SECTORS);
+    let (sink, writes, finished) = recording(Some(b));
+    let mut src = PatternSource {
+        sectors: 10 * BATCH_SECTORS,
+        short_after: Some(2 * BATCH_SECTORS),
+    };
+    let r = copy_out(&mut src, sink, 10 * BATCH_SECTORS, &Ctx::default());
+    assert!(matches!(r, Err(Error::IoError { .. })), "{r:?}");
+    assert_eq!(*writes.lock().unwrap(), vec![0]);
+    assert_eq!(*finished.lock().unwrap(), Some(Finish::Incomplete));
+}
+
+// A read failure lands after every earlier batch is written, then finishes incomplete.
+#[test]
+fn a_read_failure_follows_the_batches_already_read() {
+    let (sink, writes, finished) = recording(None);
+    let mut src = PatternSource {
+        sectors: 10 * BATCH_SECTORS,
+        short_after: Some(3 * BATCH_SECTORS),
+    };
+    let r = copy_out(&mut src, sink, 10 * BATCH_SECTORS, &Ctx::default());
+    assert!(matches!(r, Err(Error::ShortImageRead { .. })), "{r:?}");
+    let b = u64::from(BATCH_SECTORS);
+    assert_eq!(*writes.lock().unwrap(), vec![0, b, 2 * b]);
+    assert_eq!(*finished.lock().unwrap(), Some(Finish::Incomplete));
+}
+
+// A Stop mid-copy halts at the next batch; what was read is written, then finished incomplete.
+#[test]
+fn a_stop_mid_copy_halts_after_the_batches_in_flight() {
+    let (sink, writes, finished) = recording(None);
+    let halt = crate::halt::Halt::new();
+    let stop = halt.clone();
+    let ctx = Ctx::new(halt).with_events(std::sync::Arc::new(move |e: &Event<'_>| {
+        if matches!(e, Event::BytesWritten { .. }) {
+            stop.cancel();
+        }
+    }));
+    let mut src = PatternSource {
+        sectors: 50 * BATCH_SECTORS,
+        short_after: None,
+    };
+    let r = copy_out(&mut src, sink, 50 * BATCH_SECTORS, &ctx);
+    assert!(matches!(r, Err(Error::Halted)), "{r:?}");
+    let n = writes.lock().unwrap().len();
+    assert!((1..=3).contains(&n), "{n} batches written");
+    assert_eq!(*finished.lock().unwrap(), Some(Finish::Incomplete));
+}
+
+// The writer takes batch N while batch N+1 is read: a write that waits for the next read to
+// start would hang a serial copy, and completes here.
+#[test]
+fn the_next_read_overlaps_the_current_write() {
+    struct Signals(std::sync::mpsc::Sender<u32>, PatternSource);
+    impl SectorSource for Signals {
+        fn read_sectors(&mut self, lba: u32, n: u16, buf: &mut [u8], r: bool) -> FmResult<usize> {
+            let _ = self.0.send(lba);
+            self.1.read_sectors(lba, n, buf, r)
+        }
+    }
+    struct Waits(std::sync::mpsc::Receiver<u32>);
+    impl BlockSink for Waits {
+        fn write_at(&mut self, lba: u64, _: &[u8]) -> FmResult<()> {
+            let next = u64::from(BATCH_SECTORS) + lba;
+            if next >= u64::from(3 * BATCH_SECTORS) {
+                return Ok(()); // the last batch: no read follows it
+            }
+            loop {
+                match self.0.recv_timeout(std::time::Duration::from_secs(5)) {
+                    Ok(started) if u64::from(started) >= next => return Ok(()),
+                    Ok(_) => continue,
+                    Err(_) => return Err(Error::Halted),
+                }
+            }
+        }
+        fn finish(self: Box<Self>, _: Finish) -> FmResult<u64> {
+            Ok(0)
+        }
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    let total = 3 * BATCH_SECTORS;
+    let mut src = Signals(
+        tx,
+        PatternSource {
+            sectors: total,
+            short_after: None,
+        },
+    );
+    // The last batch has no read after it: its write would wait out the timeout.
+    let r = copy_out(&mut src, Box::new(Waits(rx)), total, &Ctx::default());
+    assert!(
+        matches!(r, Err(Error::Halted)),
+        "only the final write times out: {r:?}"
+    );
+}
+
+// An AACS whole-disc copy through the keyed reader, whatever each file's grid, writes the
+// plaintext byte for byte (CPI cleared in the keyed file only).
+#[test]
+fn a_keyed_copy_writes_the_plaintext_image() {
+    use crate::test_util::{BdFile, encrypted_bd_image, keyed_reader, unit_key_ro};
+    let key = [0x2D; 16];
+    let inf = unit_key_ro(crate::aacs::mkb::AacsVersion::V10, &[[0u8; 16]], &[1]);
+    let img = encrypted_bd_image(
+        &[
+            BdFile::new("BDMV/STREAM/00001.m2ts", 1700 * 3, Some(key)),
+            BdFile::new("BDMV/STREAM/00002.m2ts", 31, None),
+        ],
+        &inf,
+    );
+    let (start, sectors) = img.files[0];
+    let mut want = img.plain.clone();
+    let at = start as usize * SECTOR_BYTES;
+    for p in want[at..at + sectors as usize * SECTOR_BYTES]
+        .chunks_mut(crate::consts::BD_SOURCE_PACKET_BYTES)
+    {
+        p[0] &= 0x3F;
+    }
+    let mut r = keyed_reader(img.source(), key, &[(start, start + sectors)]);
+    let td = tempfile::tempdir().unwrap();
+    let dest = td.path().join("copy.iso");
+    let cap = (img.image.len() / SECTOR_BYTES) as u32;
+    write_image(&mut r, &dest, cap, &Ctx::default()).expect("copy");
+    assert!(std::fs::read(&dest).unwrap() == want, "start {start}");
 }
