@@ -976,7 +976,7 @@ fn complete_truehd(
                 continue;
             }
             buf.extend_from_slice(&f.data);
-            let has_sync = f.data.windows(4).any(|w| w == [0xF8, 0x72, 0x6F, 0xBA]);
+            let has_sync = memchr::memmem::find(&f.data, &[0xF8, 0x72, 0x6F, 0xBA]).is_some();
             if let (true, Track::Audio(a)) = (has_sync, &mut streams[f.track])
                 && crate::disc::correct_truehd_stream(a, buf)
             {
