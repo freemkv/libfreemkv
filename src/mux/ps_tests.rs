@@ -1554,3 +1554,111 @@ fn the_program_stream_map_is_kept_and_skipped() {
     );
     assert_eq!(d.psm(), Some(&psm[..]));
 }
+
+// A synthetic program stream: odd-sized packs (not 2048-aligned) of bounded video, AC-3
+// and subpicture PES, a PSM, garbage between units, unbounded video PES carrying embedded
+// start codes, and a trailing unbounded PES only EOF ends.
+fn mixed_program_stream() -> Vec<u8> {
+    let pack = |extra: u8| -> Vec<u8> {
+        let mut p = vec![
+            0,
+            0,
+            1,
+            0xBA,
+            0x44,
+            0,
+            4,
+            0,
+            4,
+            1,
+            1,
+            0x89,
+            0xC3,
+            0xF8 | extra,
+        ];
+        p.extend(std::iter::repeat_n(0xFF, extra as usize));
+        p
+    };
+    let pes = |id: u8, sub: Option<u8>, pts: u64, body: &[u8], bounded: bool| -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&encode_pts(pts, 0x21));
+        if let Some(s) = sub {
+            payload.extend_from_slice(&[s, 1, 0, 1]);
+        }
+        payload.extend_from_slice(body);
+        let len = if bounded { payload.len() + 3 } else { 0 };
+        let mut v = vec![0, 0, 1, id, (len >> 8) as u8, len as u8, 0x80, 0x80, 5];
+        v.extend(payload);
+        v
+    };
+    let mut s = vec![0x47, 0x00, 0x01];
+    s.extend([0, 0, 1, 0xBC, 0, 4, 0xE0, 0xFF, 0, 0]);
+    for i in 0..60u64 {
+        s.extend(pack((i % 4) as u8));
+        let video: Vec<u8> = (0..(300 + i * 97) % 4000)
+            .map(|b| (b * 13 + i) as u8 | 1)
+            .collect();
+        let bounded = i % 5 != 0;
+        let mut body = video.clone();
+        if !bounded {
+            body.extend([0, 0, 1, 0x00, 0xAB, 0, 0, 1, 0xB5, 0x11]);
+        }
+        s.extend(pes(0xE0, None, 3_000 * i, &body, bounded));
+        s.extend(pack(0));
+        s.extend(pes(
+            0xBD,
+            Some(0x80),
+            3_000 * i + 7,
+            &video[..video.len() / 3],
+            true,
+        ));
+        if i % 7 == 3 {
+            s.extend(pes(0xBD, Some(0x20), 3_000 * i, &[9; 40], true));
+            s.extend([0x12, 0x34, 0x00]);
+        }
+    }
+    s.extend(pack(1));
+    s.extend(pes(0xE0, None, 999_999, &[0x55; 3_000], false));
+    s
+}
+
+fn demux_in_feeds(stream: &[u8], step: usize) -> Vec<PsPacket> {
+    let mut d = PsDemuxer::new();
+    let mut out = Vec::new();
+    for (i, chunk) in stream.chunks(step).enumerate() {
+        out.extend(d.feed_at(1_000 + (i * step) as u64, chunk));
+    }
+    out.extend(d.flush());
+    out
+}
+
+// Parsing in place (and completing carried units a step at a time) yields exactly the
+// packets one whole buffer does, provenance included, at every feed split.
+#[test]
+fn feed_splits_yield_the_same_packets_as_one_buffer() {
+    let stream = mixed_program_stream();
+    let key = |p: &PsPacket| {
+        (
+            p.stream_id,
+            p.sub_stream_id,
+            p.pts,
+            p.dts,
+            p.data.clone(),
+            p.source,
+        )
+    };
+    let whole: Vec<_> = demux_in_feeds(&stream, stream.len())
+        .iter()
+        .map(key)
+        .collect();
+    assert!(whole.len() > 120, "{} packets", whole.len());
+    assert!(
+        whole
+            .iter()
+            .any(|p| p.4.windows(4).any(|w| w == [0, 0, 1, 0xB5]))
+    );
+    for step in [1, 3, 14, 100, 2047, 2048, 4099, 65_536, 70_001] {
+        let split: Vec<_> = demux_in_feeds(&stream, step).iter().map(key).collect();
+        assert!(split == whole, "step {step}");
+    }
+}
