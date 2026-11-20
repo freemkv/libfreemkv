@@ -258,6 +258,13 @@ impl AacsKeyMap {
         Self::from_ranges_phased(phased)
     }
 
+    /// Key 0 over every `[start_lba, end_lba)` of `ranges`: the map the test fixtures'
+    /// keyed readers decrypt through.
+    #[cfg(any(test, feature = "test-util"))]
+    pub(crate) fn key_zero_over(ranges: &[(u32, u32)]) -> Self {
+        Self::from_ranges(ranges.iter().map(|&(s, e)| (s, e, 0)).collect())
+    }
+
     /// Build a PHASE-AWARE map (FMTS): each range carries which unit-parity its key
     /// opens ([`Phase::Even`]/[`Phase::Odd`] for a forensic segment, [`Phase::All`]
     /// for base/CPS). Ranges are sorted; an LBA in no range is passed through.

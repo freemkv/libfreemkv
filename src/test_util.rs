@@ -424,8 +424,7 @@ pub fn keyed_reader<S: SectorSource>(
         unit_keys: vec![(0, unit_key)],
         format: crate::disc::ContentFormat::BdTs,
     };
-    let map =
-        crate::decrypt::AacsKeyMap::from_ranges(ranges.iter().map(|&(s, e)| (s, e, 0)).collect());
+    let map = crate::decrypt::AacsKeyMap::key_zero_over(ranges);
     let spans: Vec<crate::whole_disc::UnitSpan> = ranges
         .iter()
         .map(|&(s, e)| (s, e.saturating_sub(s), s as u64))

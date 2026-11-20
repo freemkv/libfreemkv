@@ -40,7 +40,7 @@ fn job(lba: u32, mapped: (u32, u32), tally: &Tally) -> Job {
             unit_keys: vec![(0, KEY)],
             format: crate::disc::ContentFormat::BdTs,
         },
-        map: Arc::new(AacsKeyMap::from_ranges(vec![(mapped.0, mapped.1, 0)])),
+        map: Arc::new(AacsKeyMap::key_zero_over(&[mapped])),
         content: None,
         tally: tally.clone(),
     }
@@ -216,7 +216,7 @@ fn a_reader_over_a_deferring_reader_settles_it_first() {
         unit_keys: vec![(0, KEY)],
         format: crate::disc::ContentFormat::BdTs,
     };
-    let map = Arc::new(AacsKeyMap::from_ranges(vec![(0, 9, 0)]));
+    let map = Arc::new(AacsKeyMap::key_zero_over(&[(0, 9)]));
     let mut inner = DecryptingSectorSource::new(
         crate::test_util::MemSource::new(image),
         Keying::ring(keys, map, None),
@@ -246,7 +246,7 @@ fn an_armed_keyed_read_defers_and_runs_to_the_same_bytes() {
         unit_keys: vec![(0, KEY)],
         format: crate::disc::ContentFormat::BdTs,
     };
-    let map = Arc::new(AacsKeyMap::from_ranges(vec![(0, 9, 0)]));
+    let map = Arc::new(AacsKeyMap::key_zero_over(&[(0, 9)]));
     let mut r = DecryptingSectorSource::new(
         crate::test_util::MemSource::new(encrypted(&plain)),
         Keying::ring(keys, map, None),

@@ -1432,8 +1432,7 @@ fn overlap_reader(
         unit_keys: vec![(0, OVERLAP_KEY)],
         format: crate::disc::ContentFormat::BdTs,
     };
-    let map =
-        crate::decrypt::AacsKeyMap::from_ranges(files.iter().map(|&(s, e)| (s, e, 0)).collect());
+    let map = crate::decrypt::AacsKeyMap::key_zero_over(files);
     let mut content: Vec<(u32, u32)> = files.iter().map(|&(s, e)| (s, e - s)).collect();
     if let Some(end) = content_end {
         content[0].1 = end - content[0].0;
