@@ -241,6 +241,9 @@ pub struct AacsKeyMap {
     // construction so the per-batch decrypt bounds check does not re-allocate/sort
     // it on every read. Kept in sync by building both in `from_ranges_phased`.
     key_indices: Vec<usize>,
+    // Whether any range is a forensic phase (Even, Odd or Verify): only then does a read
+    // keep per-key verify tallies.
+    forensic: bool,
 }
 
 impl AacsKeyMap {
@@ -297,10 +300,12 @@ impl AacsKeyMap {
         let mut key_indices: Vec<usize> = ranges.iter().map(|&(_, _, i, _)| i).collect();
         key_indices.sort_unstable();
         key_indices.dedup();
+        let forensic = ranges.iter().any(|r| r.3 != Phase::All);
         Self {
             ranges,
             anchors,
             key_indices,
+            forensic,
         }
     }
 
@@ -509,8 +514,12 @@ fn apply_aacs_map(
     // Cheap safety net: a correct map decrypts CORRECT-PHASE forensic units to clean TS, so
     // a map bug surfaces as loud DecryptFailed, not silent corruption (verdict at the end).
     let verify_failed = std::sync::atomic::AtomicBool::new(false);
-    // Per mapped key: (failed, verified) FMTS units of this read.
-    let tally: Vec<[AtomicUsize; 2]> = unit_keys.iter().map(|_| Default::default()).collect();
+    // Per mapped key: (failed, verified) FMTS units of this read; none without a forensic range.
+    let tally: Vec<[AtomicUsize; 2]> = if map.forensic {
+        unit_keys.iter().map(|_| Default::default()).collect()
+    } else {
+        Vec::new()
+    };
     // A failing FMTS unit another held key opens: a wrong mapped key, never damage.
     let opened_elsewhere = std::sync::atomic::AtomicBool::new(false);
     // Each key's encrypt schedule, built the first time a unit of this read needs it (KS-4).
@@ -693,7 +702,8 @@ pub(crate) fn decrypt_hddvd_packs(
         });
     };
     let mut cur = lead;
-    let mut jobs: Vec<Option<(&[u8; 16], aacs::hddvd::Cpi)>> = Vec::new();
+    let mut jobs: Vec<Option<(&[u8; 16], aacs::hddvd::Cpi)>> =
+        Vec::with_capacity(buf.len() / PACK_LEN);
     let mut blank = Vec::new();
     let mut refusal: Option<&'static str> = None;
     for (i, pack) in buf.as_chunks::<PACK_LEN>().0.iter().enumerate() {

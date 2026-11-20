@@ -1798,3 +1798,13 @@ fn decrypt_unit_with_a_prebuilt_schedule_matches_decrypt_unit() {
         assert_eq!(a, b, "salt {salt}");
     }
 }
+
+// Only a map with a forensic range keeps per-key verify tallies; a plain CPS map has none.
+#[test]
+fn only_a_forensic_map_keeps_verify_tallies() {
+    assert!(!AacsKeyMap::from_ranges(vec![(0, 30, 0), (30, 60, 1)]).forensic);
+    for phase in [Phase::Even, Phase::Odd, Phase::Verify] {
+        let map = AacsKeyMap::from_ranges_phased(vec![(0, 30, 0, Phase::All), (30, 60, 1, phase)]);
+        assert!(map.forensic, "{phase:?}");
+    }
+}

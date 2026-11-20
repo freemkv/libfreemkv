@@ -64,6 +64,9 @@ pub struct DecryptingSectorSource<S: SectorSource> {
     /// HD DVD: the sector after the last read and the CPI in force there, so a read that
     /// continues it decrypts the packs before its first NV_PCK.
     hd_cpi: Option<(u32, Option<crate::aacs::hddvd::Cpi>)>,
+    // HD DVD: the look-back read buffer, kept so a read that does not continue the last
+    // one allocates nothing.
+    hd_tmp: Vec<u8>,
     css_titles: Option<crate::css::disc::DiscKeys>,
 }
 
@@ -169,6 +172,7 @@ impl<S: SectorSource> DecryptingSectorSource<S> {
             watch_css: false,
             refused: false,
             hd_cpi: None,
+            hd_tmp: Vec::new(),
             css_titles: None,
         };
         match keying.into().0 {
@@ -594,7 +598,8 @@ impl<S: SectorSource> DecryptingSectorSource<S> {
         }
         let floor = lba.saturating_sub(HD_LOOKBACK_SECTORS);
         let mut end = lba;
-        let mut tmp = vec![0u8; HD_LOOKBACK_STEP as usize * SECTOR_BYTES];
+        let tmp = &mut self.hd_tmp;
+        tmp.resize(HD_LOOKBACK_STEP as usize * SECTOR_BYTES, 0);
         while end > floor {
             let start = end.saturating_sub(HD_LOOKBACK_STEP).max(floor);
             let len = (end - start) as usize * SECTOR_BYTES;
