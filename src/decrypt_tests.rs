@@ -1755,7 +1755,6 @@ fn a_mapped_read_builds_one_unit_key_schedule_per_key() {
     use crate::aacs::crypto::UNIT_KEY_SCHEDULES;
     use crate::disc::ContentFormat;
     let (k1, k2, unused) = ([0x7Au8; 16], [0x7Bu8; 16], [0x7Cu8; 16]);
-    let ul = aacs::content::ALIGNED_UNIT_LEN;
     let n = 10; // below the fan-out threshold: decrypted on this thread
     let mut plain = Vec::new();
     let mut buf = Vec::new();
