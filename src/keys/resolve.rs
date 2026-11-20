@@ -5,7 +5,7 @@ use super::{
     AcquireOptions, ArrivalPiece, ForensicState, Inner, KeyResolution, KeyRing, KeyScope,
     ProofCache, overlaps,
 };
-use crate::aacs::content::{decrypt_unit, is_clean};
+use crate::aacs::content::{ALIGNED_UNIT_LEN, decrypt_unit, is_clean, ts_unit_key_opens};
 use crate::aacs::trace::{KeyNode, KeyOutcome, KeyStep, ResolutionTrace};
 use crate::ctx::Ctx;
 use crate::decrypt::{AacsKeyMap, Phase};
@@ -147,6 +147,11 @@ impl Run<'_> {
     }
 
     fn opens(&self, unit: &[u8], slot: usize) -> bool {
+        // BD-TS: decrypt only each packet's head block, the same verdict as a full decrypt;
+        // a wrong key fails without a copy or a whole-unit CBC pass.
+        if self.format == ContentFormat::BdTs && unit.len() == ALIGNED_UNIT_LEN {
+            return ts_unit_key_opens(unit, &self.pool[slot]);
+        }
         let mut u = unit.to_vec();
         decrypt_unit(&mut u, &self.pool[slot]);
         is_clean(&u, self.format)

@@ -208,9 +208,9 @@ pub fn unit_key_opens(
 }
 
 /// [`is_clean_ts`]'s verdict for `decrypt_unit(unit, unit_key)`, from the packet counts of
-/// `ts_unit_key_proof`.
-#[cfg(test)]
-fn ts_unit_key_opens(unit: &[u8], unit_key: &[u8; 16]) -> bool {
+/// `ts_unit_key_proof`: one AES block per packet head, no copy. `unit` is one whole
+/// [`ALIGNED_UNIT_LEN`] unit (key proofs during acquisition).
+pub(crate) fn ts_unit_key_opens(unit: &[u8], unit_key: &[u8; 16]) -> bool {
     let (content, synced) = ts_unit_key_proof(unit, unit_key);
     content == 0 || synced >= content.min(KEY_PROOF_PACKETS)
 }
@@ -220,7 +220,6 @@ fn ts_unit_key_opens(unit: &[u8], unit_key: &[u8; 16]) -> bool {
 /// (`P[i] = AES_dec(C[i]) ⊕ C[i-1]`), and packet heads sit at block-aligned offsets ≥ 192.
 /// Packet 0 is skipped (its sync byte is in the clear seed), as are all-zero padding
 /// packets, which `decrypt_unit` zeroes.
-#[cfg(any(test, feature = "keyproof"))]
 fn ts_unit_key_proof(unit: &[u8], unit_key: &[u8; 16]) -> (usize, usize) {
     use aes::cipher::{Array, BlockCipherDecrypt, BlockCipherEncrypt, KeyInit};
     use aes::{Aes128, Block};

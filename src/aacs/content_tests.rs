@@ -1407,3 +1407,23 @@ fn unit_key_opens_answers_only_for_a_provable_encrypted_bd_ts_unit() {
         "below the proof floor"
     );
 }
+
+// Key proofs in acquisition take the fast path: a unit with no content packets (all
+// padding after the clear seed) proves nothing either way, so every key "opens" it
+// exactly as `decrypt_unit` + `is_clean` says.
+#[test]
+fn ts_unit_key_opens_agrees_on_an_all_padding_unit() {
+    let fmt = crate::disc::ContentFormat::BdTs;
+    let mut enc = vec![0u8; ALIGNED_UNIT_LEN];
+    enc[..16].copy_from_slice(&[0xC0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
+    for n in 0..8u8 {
+        let key = [n; 16];
+        let mut full = enc.clone();
+        decrypt_unit(&mut full, &key);
+        assert_eq!(
+            ts_unit_key_opens(&enc, &key),
+            is_clean(&full, fmt),
+            "key {n}"
+        );
+    }
+}
