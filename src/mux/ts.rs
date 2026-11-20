@@ -52,6 +52,8 @@ struct PesAssembler {
     /// declares.
     cap: usize,
     buffer: Vec<u8>,
+    /// Decaying peak of this PID's completed PES sizes, for the next buffer's capacity.
+    peak_len: usize,
     pts: Option<i64>,
     dts: Option<i64>,
     active: bool,
@@ -95,6 +97,10 @@ struct PesAssembler {
 // video PES grows via Vec doubling, hitting allocator slab caches instead of
 // the 64-page first-touch faults the old with_capacity(256 KiB) caused per PES.
 const PES_BUFFER_INIT_CAP: usize = 16 * 1024;
+// Floor and ceiling of the per-PID size hint (`PesAssembler::next_capacity`). A PES past
+// the ceiling (a large UHD I-frame) still grows by doubling from it.
+const PES_BUFFER_MIN_CAP: usize = 1024;
+const PES_BUFFER_HINT_MAX: usize = 8 * 1024 * 1024;
 
 // Hard cap on a single PID's PES buffer: an HEVC/UHD AU is ~1-3 MiB, so 64 MiB
 // is a wide margin. Guards against a corrupt/crafted stream that never sends a
@@ -113,6 +119,7 @@ impl PesAssembler {
             pid,
             cap,
             buffer: Vec::with_capacity(PES_BUFFER_INIT_CAP),
+            peak_len: 0,
             pts: None,
             dts: None,
             active: false,
@@ -138,11 +145,12 @@ impl PesAssembler {
         let completed = if self.active && !self.buffer.is_empty() {
             let discontinuity = self.pending_discontinuity;
             self.pending_discontinuity = false;
+            let next = Vec::with_capacity(self.next_capacity(self.buffer.len()));
             Some(PesPacket {
                 pid: self.pid,
                 pts: self.pts,
                 dts: self.dts,
-                data: std::mem::replace(&mut self.buffer, Vec::with_capacity(PES_BUFFER_INIT_CAP)),
+                data: std::mem::replace(&mut self.buffer, next),
                 source: self.pes_source,
                 discontinuity,
             })
@@ -155,6 +163,17 @@ impl PesAssembler {
         self.active = true;
         self.pes_source = source;
         completed
+    }
+
+    // Capacity for this PID's next PES: 5/4 of a slowly decaying peak of its recent PES
+    // sizes, so a video AU fits its first allocation (no doubling copies) while an audio
+    // or subtitle PID allocates near its own size. Bounded by the PID's cap.
+    fn next_capacity(&mut self, len: usize) -> usize {
+        self.peak_len = len.max(self.peak_len - self.peak_len / 8);
+        let limit = self.cap.min(PES_BUFFER_HINT_MAX);
+        (self.peak_len + self.peak_len / 4)
+            .max(PES_BUFFER_MIN_CAP)
+            .min(limit)
     }
 
     // Append payload data. If the buffer would exceed this PID's `cap` (its share of

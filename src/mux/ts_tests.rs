@@ -1048,7 +1048,6 @@ fn psi_packets(pid: u16, section: &[u8]) -> Vec<Vec<u8>> {
     p0[1..1 + head_len].copy_from_slice(&section[..head_len]);
     pkts.push(bdts_packet(p0, pid, true));
     let mut pos = head_len;
-    let mut cc = 0u8;
     while pos < section.len() {
         let n = 184.min(section.len() - pos);
         let mut p = [0xFFu8; 184];
@@ -2375,4 +2374,50 @@ fn scan_streams_honours_the_high_nibble_of_es_info_length() {
             .any(|s| matches!(s, Stream::Audio(a) if a.pid == 0x1100)),
         "the second entry sits inside the first's descriptors"
     );
+}
+
+// A PID's next PES buffer is sized from its recent PES (no doubling copies for a video AU,
+// no 16 KiB per small audio PES), decays after a large one, and never passes the cap.
+#[test]
+fn pes_buffer_capacity_follows_the_pid_s_recent_pes_sizes() {
+    let mut a = PesAssembler::new(0x1011, 64 * 1024 * 1024);
+    assert_eq!(a.next_capacity(100_000), 125_000);
+    assert!(
+        a.next_capacity(1_000) >= 100_000,
+        "a small PES keeps most of the peak"
+    );
+    for _ in 0..80 {
+        a.next_capacity(2_000);
+    }
+    assert_eq!(
+        a.next_capacity(2_000),
+        2_500,
+        "the peak decays to the PID's own size"
+    );
+    assert_eq!(a.next_capacity(10), 1_750 + 1_750 / 4);
+    assert!(PesAssembler::new(1, 1 << 20).next_capacity(10) == PES_BUFFER_MIN_CAP);
+    assert_eq!(a.next_capacity(50_000_000), PES_BUFFER_HINT_MAX);
+    let mut small = PesAssembler::new(0x1100, 4096);
+    assert_eq!(
+        small.next_capacity(1_000_000),
+        4096,
+        "bounded by the PID's cap"
+    );
+
+    // Through the demuxer: the buffer after a completed PES already holds the next AU.
+    let pid = 0x1011;
+    let mut demux = TsDemuxer::new(&[pid]);
+    let mut data = Vec::new();
+    for es_len in [60_000usize, 60_000] {
+        let mut pes = pes_start(&[]);
+        pes.extend((0..es_len).map(|i| i as u8));
+        for (i, chunk) in pes.chunks(184).enumerate() {
+            data.extend(es_packet_exact(pid, i == 0, chunk));
+        }
+    }
+    let out = demux.feed(&data);
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].data.len(), 60_000);
+    assert!(demux.assemblers[0].buffer.capacity() >= 60_000);
+    assert_eq!(demux.flush()[0].data, out[0].data);
 }
