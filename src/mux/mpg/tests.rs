@@ -91,7 +91,7 @@ fn fixture(o: &Opts) -> Fx {
         color_space: ColorSpace::Bt470bg,
         display_aspect: None,
         secondary: false,
-        label: String::new(),
+        label: Default::default(),
         measured_cicp: None,
     })];
     let audio = |pid: u16, codec: Codec, lang: &str, label: &str| {
@@ -103,7 +103,7 @@ fn fixture(o: &Opts) -> Fx {
             sample_rate: SampleRate::S48,
             secondary: false,
             purpose: LabelPurpose::Normal,
-            label: label.into(),
+            label: label.to_string().into(),
         })
     };
     streams.push(audio(0x00C0, Codec::Mp2, "eng", ""));

@@ -9,7 +9,7 @@ fn mp2_track(pid: u16, label: &str) -> AudioStream {
         sample_rate: SampleRate::S48,
         secondary: false,
         purpose: LabelPurpose::Normal,
-        label: label.into(),
+        label: label.to_string().into(),
     }
 }
 
@@ -1040,7 +1040,7 @@ fn title_with_video(codec: Codec, resolution: Resolution) -> DiscTitle {
             color_space: ColorSpace::Bt709,
             display_aspect: None,
             secondary: false,
-            label: String::new(),
+            label: Default::default(),
             measured_cicp: None,
         })],
         chapters: Vec::new(),
@@ -1601,7 +1601,7 @@ fn canonical_title_order_prefers_stream_richer_sibling_issue_45() {
         color_space: ColorSpace::Bt709,
         display_aspect: None,
         secondary: true,
-        label: String::new(),
+        label: Default::default(),
         measured_cicp: None,
     }));
     let mut vv = [base(40), richer_v];
@@ -3578,7 +3578,7 @@ fn correct_truehd_channels_skips_probe_when_no_truehd_stream() {
         sample_rate: SampleRate::S48,
         secondary: false,
         purpose: LabelPurpose::Normal,
-        label: String::new(),
+        label: Default::default(),
     })];
     title.extents = vec![Extent {
         start_lba: 0,
@@ -4285,7 +4285,7 @@ fn disc_title_stream_filters_select_their_own_kind_in_order() {
             color_space: ColorSpace::Bt2020,
             display_aspect: None,
             secondary: false,
-            label: String::new(),
+            label: Default::default(),
             measured_cicp: None,
         }),
         Stream::Audio(AudioStream {
@@ -4296,7 +4296,7 @@ fn disc_title_stream_filters_select_their_own_kind_in_order() {
             sample_rate: SampleRate::S48,
             secondary: false,
             purpose: LabelPurpose::Normal,
-            label: String::new(),
+            label: Default::default(),
         }),
         Stream::Audio(AudioStream {
             pid: 0x1101,
@@ -4306,7 +4306,7 @@ fn disc_title_stream_filters_select_their_own_kind_in_order() {
             sample_rate: SampleRate::S48,
             secondary: true,
             purpose: LabelPurpose::Commentary,
-            label: String::new(),
+            label: Default::default(),
         }),
         // Blu-ray 3D dependent view: a second video stream.
         Stream::Video(VideoStream {
@@ -4318,7 +4318,7 @@ fn disc_title_stream_filters_select_their_own_kind_in_order() {
             color_space: ColorSpace::Bt709,
             display_aspect: None,
             secondary: true,
-            label: String::new(),
+            label: Default::default(),
             measured_cicp: None,
         }),
     ];
@@ -4470,7 +4470,7 @@ fn title_with_audio(audio: &[(Codec, AudioChannels)]) -> DiscTitle {
                     sample_rate: SampleRate::S48,
                     secondary: false,
                     purpose: LabelPurpose::Normal,
-                    label: String::new(),
+                    label: Default::default(),
                 })
             })
             .collect(),

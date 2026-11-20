@@ -406,7 +406,7 @@ fn meta_codec_roundtrip() {
             color_space: ColorSpace::Bt709,
             display_aspect: None,
             secondary: false,
-            label: String::new(),
+            label: Default::default(),
             measured_cicp: None,
         }));
     }
@@ -419,7 +419,7 @@ fn meta_codec_roundtrip() {
             sample_rate: SampleRate::S48,
             secondary: false,
             purpose: libfreemkv::LabelPurpose::Normal,
-            label: String::new(),
+            label: Default::default(),
         }));
     }
     for (i, &codec) in codecs_sub.iter().enumerate() {

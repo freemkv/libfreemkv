@@ -14,7 +14,7 @@ fn keyframe_survives_roundtrip_for_duration_bearing_frames() {
         color_space: ColorSpace::Bt470bg,
         display_aspect: None,
         secondary: false,
-        label: String::new(),
+        label: Default::default(),
         measured_cicp: None,
     };
     // ── BlockGroup path: every frame carries a duration (the MPEG-2 shape).
@@ -105,7 +105,7 @@ fn keyframe_survives_roundtrip_for_simple_blocks() {
         color_space: ColorSpace::Bt470bg,
         display_aspect: None,
         secondary: false,
-        label: String::new(),
+        label: Default::default(),
         measured_cicp: None,
     };
     let t = MkvTrack::video(&v);
@@ -144,7 +144,7 @@ fn mkvstream_preserves_video_keyframe_after_audio_preroll() {
         color_space: ColorSpace::Bt470bg,
         display_aspect: None,
         secondary: false,
-        label: String::new(),
+        label: Default::default(),
         measured_cicp: None,
     };
     let a = crate::disc::AudioStream {
@@ -155,7 +155,7 @@ fn mkvstream_preserves_video_keyframe_after_audio_preroll() {
         sample_rate: crate::disc::SampleRate::S48,
         secondary: false,
         purpose: crate::disc::LabelPurpose::Normal,
-        label: String::new(),
+        label: Default::default(),
     };
     let mut title = crate::disc::DiscTitle::empty();
     title.streams.push(crate::disc::Stream::Video(v));
@@ -237,7 +237,7 @@ fn video_track_anamorphic_display_aspect() {
         color_space: ColorSpace::Bt709,
         display_aspect: Some((16, 9)),
         secondary: false,
-        label: String::new(),
+        label: Default::default(),
         measured_cicp: None,
     };
     let t = MkvTrack::video(&base);
@@ -274,7 +274,7 @@ fn measured_cicp_overrides_color_space_enum() {
         color_space: ColorSpace::Bt2020,
         display_aspect: None,
         secondary: false,
-        label: String::new(),
+        label: Default::default(),
         measured_cicp: None,
     };
 
@@ -327,7 +327,7 @@ fn unknown_color_space_emits_unspecified_cicp() {
         color_space: ColorSpace::Unknown,
         display_aspect: None,
         secondary: false,
-        label: String::new(),
+        label: Default::default(),
         measured_cicp: None,
     };
     let t = MkvTrack::video(&v);
@@ -435,7 +435,7 @@ fn audio_stream(codec: Codec) -> AudioStream {
         sample_rate: SampleRate::S48,
         secondary: false,
         purpose: LabelPurpose::Normal,
-        label: String::new(),
+        label: Default::default(),
     }
 }
 
@@ -564,7 +564,7 @@ fn every_video_codec_gets_its_own_registered_codec_id() {
             color_space: ColorSpace::Bt709,
             display_aspect: None,
             secondary: false,
-            label: String::new(),
+            label: Default::default(),
             measured_cicp: None,
         };
         let got = MkvTrack::video(&v).codec_id;
@@ -1304,7 +1304,7 @@ fn dvd_two_letter_language_becomes_iso_639_2_in_language_element() {
         sample_rate: crate::disc::SampleRate::from_hz(attr.sample_rate),
         secondary: false,
         purpose: crate::disc::LabelPurpose::Normal,
-        label: String::new(),
+        label: Default::default(),
     };
     let track = MkvTrack::audio(&audio_stream);
 
@@ -1334,7 +1334,7 @@ fn a_source_with_no_language_emits_und_not_an_empty_language_element() {
         sample_rate: crate::disc::SampleRate::S48,
         secondary: false,
         purpose: crate::disc::LabelPurpose::Normal,
-        label: String::new(),
+        label: Default::default(),
     };
     let subtitle_stream = crate::disc::SubtitleStream {
         pid: 0x1200,
@@ -1401,7 +1401,7 @@ fn dvd_unmapped_or_empty_language_becomes_und_in_language_element() {
             sample_rate: crate::disc::SampleRate::from_hz(attr.sample_rate),
             secondary: false,
             purpose: crate::disc::LabelPurpose::Normal,
-            label: String::new(),
+            label: Default::default(),
         };
         let track = MkvTrack::audio(&audio_stream);
         let buf = Cursor::new(Vec::new());
@@ -1435,7 +1435,7 @@ fn emitted_language_for_dvd_code(code: &[u8; 2]) -> String {
         sample_rate: crate::disc::SampleRate::from_hz(attr.sample_rate),
         secondary: false,
         purpose: crate::disc::LabelPurpose::Normal,
-        label: String::new(),
+        label: Default::default(),
     };
     let track = MkvTrack::audio(&audio_stream);
     let buf = Cursor::new(Vec::new());
@@ -3818,7 +3818,7 @@ fn video_576i_field_order_undetermined_at_track_build() {
         color_space: ColorSpace::Bt470bg,
         display_aspect: Some((16, 9)),
         secondary: false,
-        label: String::new(),
+        label: Default::default(),
         measured_cicp: None,
     };
     let t = MkvTrack::video(&v);
@@ -3844,7 +3844,7 @@ fn interlaced_576i_omits_default_decoded_field_duration_keeps_full_frame_duratio
         color_space: ColorSpace::Bt470bg,
         display_aspect: None,
         secondary: false,
-        label: String::new(),
+        label: Default::default(),
         measured_cicp: None,
     };
     let t = MkvTrack::video(&v);
@@ -3981,7 +3981,7 @@ fn pal_576i_emits_bt470bg_colour_codes() {
         color_space: ColorSpace::Bt470bg,
         display_aspect: Some((16, 9)),
         secondary: false,
-        label: String::new(),
+        label: Default::default(),
         measured_cicp: None,
     };
     let t = MkvTrack::video(&v);
@@ -4041,7 +4041,7 @@ fn ntsc_480i_emits_smpte170m_colour_codes() {
         color_space: ColorSpace::Smpte170m,
         display_aspect: Some((4, 3)),
         secondary: false,
-        label: String::new(),
+        label: Default::default(),
         measured_cicp: None,
     };
     let t = MkvTrack::video(&v);
@@ -4100,7 +4100,7 @@ fn ntsc_480i_duration_metadata_and_field_order_undetermined_at_build() {
         color_space: ColorSpace::Smpte170m,
         display_aspect: Some((4, 3)),
         secondary: false,
-        label: String::new(),
+        label: Default::default(),
         measured_cicp: None,
     };
     let t = MkvTrack::video(&v);
@@ -4875,7 +4875,7 @@ fn video_track_with_codec_private(codec: Codec, cp: Vec<u8>) -> MkvTrack {
         color_space: ColorSpace::Bt709,
         display_aspect: None,
         secondary: false,
-        label: String::new(),
+        label: Default::default(),
         measured_cicp: None,
     };
     let mut t = MkvTrack::video(&v);
@@ -5007,7 +5007,7 @@ fn emitted_default_duration_ns(frame_rate: crate::disc::FrameRate) -> u64 {
         color_space: ColorSpace::Bt709,
         display_aspect: None,
         secondary: false,
-        label: String::new(),
+        label: Default::default(),
         measured_cicp: None,
     };
     let t = MkvTrack::video(&v);
@@ -5064,7 +5064,7 @@ fn video_track_survives_a_zero_frame_rate_and_zero_aspect_denominator() {
         color_space: ColorSpace::Bt709,
         display_aspect: None,
         secondary: false,
-        label: String::new(),
+        label: Default::default(),
         measured_cicp: None,
     };
     // An unknown frame rate has no numerator: DefaultDuration is 0 (element
@@ -5128,7 +5128,7 @@ fn secondary_streams_are_never_the_default_track() {
         color_space: ColorSpace::Bt709,
         display_aspect: None,
         secondary: false,
-        label: String::new(),
+        label: Default::default(),
         measured_cicp: None,
     };
     assert!(
@@ -5200,7 +5200,7 @@ fn hdr_format_overrides_the_transfer_even_on_a_non_bt2020_color_space() {
         color_space: ColorSpace::Bt709,
         display_aspect: None,
         secondary: false,
-        label: String::new(),
+        label: Default::default(),
         measured_cicp: None,
     };
     let (m, t, p, _) = cicp_for_video(&v);
@@ -5374,7 +5374,7 @@ fn uhd_video(hdr: HdrFormat, color_space: ColorSpace) -> VideoStream {
         color_space,
         display_aspect: None,
         secondary: false,
-        label: String::new(),
+        label: Default::default(),
         measured_cicp: None,
     }
 }
@@ -5436,7 +5436,7 @@ fn mkv_stream_leaves_out_unmappable_codecs() {
             sample_rate: crate::disc::SampleRate::S48,
             secondary: false,
             purpose: crate::disc::LabelPurpose::Normal,
-            label: String::new(),
+            label: Default::default(),
         })
     };
     let sub = |codec| {

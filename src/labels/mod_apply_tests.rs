@@ -13,7 +13,7 @@ fn audio(pid: u16, codec: Codec, channels: AudioChannels, language: &str) -> Str
         sample_rate: SampleRate::S48,
         secondary: false,
         purpose: LabelPurpose::Normal,
-        label: String::new(),
+        label: Default::default(),
     })
 }
 
@@ -38,7 +38,7 @@ fn video() -> Stream {
         color_space: ColorSpace::Bt2020,
         display_aspect: None,
         secondary: false,
-        label: String::new(),
+        label: Default::default(),
         measured_cicp: None,
     })
 }
@@ -194,7 +194,7 @@ fn apply_skips_mp2_extension_tracks() {
         .streams
         .iter()
         .filter_map(|s| match s {
-            Stream::Audio(a) => Some(a.label.clone()),
+            Stream::Audio(a) => Some(a.label.to_string()),
             _ => None,
         })
         .collect();
@@ -276,7 +276,7 @@ fn apply_unshuffles_cross_labeled_streams() {
         .iter()
         .filter_map(|s| {
             if let Stream::Audio(a) = s {
-                Some(a.label.clone())
+                Some(a.label.to_string())
             } else {
                 None
             }
@@ -796,7 +796,7 @@ fn fill_defaults_video_label_honors_interlaced_scan_type() {
         color_space: ColorSpace::Bt470bg,
         display_aspect: None,
         secondary: false,
-        label: String::new(),
+        label: Default::default(),
         measured_cicp: None,
     });
     let mut titles = vec![title_with(vec![interlaced])];
@@ -819,7 +819,7 @@ fn fill_defaults_video_label_honors_interlaced_scan_type() {
         color_space: ColorSpace::Bt470bg,
         display_aspect: None,
         secondary: false,
-        label: String::new(),
+        label: Default::default(),
         measured_cicp: None,
     });
     let mut titles = vec![title_with(vec![progressive])];

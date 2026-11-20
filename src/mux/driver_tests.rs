@@ -190,7 +190,7 @@ fn audio_stream() -> crate::disc::Stream {
         sample_rate: SampleRate::S48,
         secondary: false,
         purpose: LabelPurpose::Normal,
-        label: String::new(),
+        label: Default::default(),
     })
 }
 
@@ -405,7 +405,7 @@ fn unsynced_truehd_stream(n: usize, size: usize) -> FakeStream {
         sample_rate: SampleRate::S48,
         secondary: false,
         purpose: LabelPurpose::Normal,
-        label: String::new(),
+        label: Default::default(),
     })];
     for pts in 0..n as i64 {
         s.frames.push_back(PesFrame {
@@ -470,7 +470,7 @@ fn mp2_ext_title() -> DiscTitle {
             sample_rate: SampleRate::S48,
             secondary: false,
             purpose: LabelPurpose::Normal,
-            label: label.into(),
+            label: label.to_string().into(),
         })
     };
     let mut t = DiscTitle::empty();
@@ -944,7 +944,7 @@ fn aac_audio_title(pid: u16) -> DiscTitle {
         sample_rate: SampleRate::S48,
         secondary: false,
         purpose: LabelPurpose::Normal,
-        label: String::new(),
+        label: Default::default(),
     }));
     t
 }
@@ -1222,7 +1222,7 @@ impl LateAacStream {
                 color_space: ColorSpace::Bt709,
                 display_aspect: None,
                 secondary: false,
-                label: String::new(),
+                label: Default::default(),
                 measured_cicp: None,
             }),
             S::Audio(AudioStream {
@@ -1233,7 +1233,7 @@ impl LateAacStream {
                 sample_rate: SampleRate::S44_1,
                 secondary: true,
                 purpose: LabelPurpose::Commentary,
-                label: String::new(),
+                label: Default::default(),
             }),
         ];
         let frame = |track: usize, pts: i64| PesFrame {
@@ -1384,7 +1384,7 @@ fn mkv_late_codec_private_follows_the_mvc_track_remap() {
     };
     let dep = crate::disc::VideoStream {
         pid: 0x1012,
-        label: crate::disc::MVC_DEPENDENT_LABEL.to_string(),
+        label: std::borrow::Cow::Borrowed(crate::disc::MVC_DEPENDENT_LABEL),
         ..base
     };
     title.streams.insert(1, crate::disc::Stream::Video(dep));
@@ -1756,7 +1756,7 @@ fn mkv_opened_title_omits_a_declared_mp2_extension_without_warning() {
         sample_rate: SampleRate::S48,
         secondary: false,
         purpose: LabelPurpose::Normal,
-        label: crate::disc::MP2_EXTENSION_LABEL.into(),
+        label: std::borrow::Cow::Borrowed(crate::disc::MP2_EXTENSION_LABEL),
     }));
     let spy = Arc::new(TitleSpy::default());
     let (out, ev) = crate::testlog::capture(|| run(src, &url, &spy));
@@ -2079,7 +2079,7 @@ fn track_timing_propagates_from_source_to_mkv_output() {
             color_space: ColorSpace::Bt709,
             display_aspect: None,
             secondary: false,
-            label: String::new(),
+            label: Default::default(),
             measured_cicp: None,
         })],
         ..DiscTitle::empty()

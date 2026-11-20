@@ -965,7 +965,7 @@ pub fn scan_streams(data: &[u8]) -> Option<Vec<crate::disc::Stream>> {
                         // TS is a passthrough container — aspect stays in the ES.
                         display_aspect: None,
                         secondary: false,
-                        label: String::new(),
+                        label: Default::default(),
                         measured_cicp: None,
                     }))
                 }
@@ -977,7 +977,7 @@ pub fn scan_streams(data: &[u8]) -> Option<Vec<crate::disc::Stream>> {
                     sample_rate: SampleRate::S48,
                     secondary: false,
                     purpose: crate::disc::LabelPurpose::Normal,
-                    label: String::new(),
+                    label: Default::default(),
                 })),
                 CodecKind::Subtitle => Some(Stream::Subtitle(SubtitleStream {
                     pid: es_pid,

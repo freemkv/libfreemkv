@@ -56,7 +56,7 @@ fn video_stream(codec: Codec) -> DiscStream {
         color_space: ColorSpace::Bt709,
         display_aspect: None,
         secondary: false,
-        label: String::new(),
+        label: Default::default(),
         measured_cicp: None,
     })
 }
@@ -70,7 +70,7 @@ fn audio_stream(codec: Codec, lang: &str) -> DiscStream {
         sample_rate: SampleRate::S48,
         secondary: false,
         purpose: LabelPurpose::Normal,
-        label: String::new(),
+        label: Default::default(),
     })
 }
 

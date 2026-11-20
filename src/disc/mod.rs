@@ -590,7 +590,7 @@ pub struct VideoStream {
     /// Whether this is a secondary stream (PiP, Dolby Vision EL)
     pub secondary: bool,
     /// Extra label (e.g. "Dolby Vision EL")
-    pub label: String,
+    pub label: std::borrow::Cow<'static, str>,
     /// CICP colour signalling (matrix, transfer, primaries, full_range) MEASURED
     /// from the bitstream — HEVC/H.264 VUI `colour_description` or MPEG-2
     /// `sequence_display_extension`. `Some(...)` takes precedence over the
@@ -608,6 +608,11 @@ pub struct VideoStream {
 pub const MVC_DEPENDENT_LABEL: &str = "MVC dependent view (3D right eye)";
 
 impl VideoStream {
+    /// The label text (empty when none).
+    pub fn label_str(&self) -> &str {
+        &self.label
+    }
+
     /// Whether this video stream is the MVC dependent (right-eye) view — the
     /// 3D substream that the muxer merges into the base track as a per-frame
     /// `BlockAdditional` rather than emitting as an independent track.
@@ -650,7 +655,7 @@ pub struct AudioStream {
     pub purpose: LabelPurpose,
     /// Codec / variant text (e.g. "Dolby TrueHD 5.1", "(US)").
     /// NEVER contains English purpose words — see `purpose` for that.
-    pub label: String,
+    pub label: std::borrow::Cow<'static, str>,
 }
 
 /// Label marking an [`AudioStream`] as a DVD MPEG-2 multichannel extension bit stream (PES
@@ -659,6 +664,11 @@ pub struct AudioStream {
 pub const MP2_EXTENSION_LABEL: &str = "MPEG-2 multichannel extension";
 
 impl AudioStream {
+    /// The label text (empty when none).
+    pub fn label_str(&self) -> &str {
+        &self.label
+    }
+
     /// Whether this is a DVD MPEG-2 multichannel extension track ([`MP2_EXTENSION_LABEL`] on
     /// PID `0xD0..=0xD7`), which a sink either writes next to its base or lists as excluded.
     /// Its base is PID `0xC0 | (pid & 7)`.

@@ -453,3 +453,28 @@ fn allocation_free_label_compares_match_the_lowercasing_forms() {
         }
     }
 }
+
+// Generated labels come from the static table: the same text is one shared &'static str,
+// never an allocation per stream, and the text is what the generators always produced.
+#[test]
+fn generated_labels_are_shared_static_text() {
+    let a = generate_audio_label(&Codec::TrueHd, &AudioChannels::Surround71, false);
+    let b = generate_audio_label(&Codec::TrueHd, &AudioChannels::Surround71, false);
+    assert_eq!(a, "Dolby TrueHD 7.1");
+    assert!(matches!(a, std::borrow::Cow::Borrowed(_)));
+    assert!(
+        std::ptr::eq(a.as_ref(), b.as_ref()),
+        "label allocated per call"
+    );
+    let v1 = generate_video_label(&Codec::Hevc, (3840, 2160), false, &HdrFormat::Hdr10, false);
+    let v2 = generate_video_label(&Codec::Hevc, (3840, 2160), false, &HdrFormat::Hdr10, false);
+    assert!(std::ptr::eq(v1.as_ref(), v2.as_ref()));
+    assert_eq!(
+        v1,
+        video_label_text(&Codec::Hevc, (3840, 2160), false, &HdrFormat::Hdr10, false)
+    );
+    assert_eq!(
+        generate_audio_label(&Codec::Pgs, &AudioChannels::Stereo, false),
+        ""
+    );
+}

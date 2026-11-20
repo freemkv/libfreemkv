@@ -669,7 +669,7 @@ pub(crate) fn apply_labels(labels: &[StreamLabel], titles: &mut [DiscTitle]) {
                         // TrueHD); if it CONTRADICTS, derive from the stream itself.
                         let codec_desc = if label.codec_hint.is_empty() {
                             // No codec hint — leave for fill_defaults.
-                            String::new()
+                            std::borrow::Cow::Borrowed("")
                         } else if !codec_hint_consistent(&label.codec_hint, &a.codec) {
                             // Hint contradicts the stream (mis-bound / shuffled):
                             // derive from the stream itself.
@@ -677,7 +677,7 @@ pub(crate) fn apply_labels(labels: &[StreamLabel], titles: &mut [DiscTitle]) {
                         } else if codec_hint_adds_detail(&label.codec_hint) {
                             // Consistent AND richer than the spec codec can express
                             // (e.g. "Dolby Atmos", "DTS:X") — keep the parser's hint.
-                            label.codec_hint.clone()
+                            std::borrow::Cow::Owned(label.codec_hint.clone())
                         } else {
                             // Consistent but a plain codec/channel restatement —
                             // normalize to the stream's own marketing descriptor so
@@ -687,20 +687,21 @@ pub(crate) fn apply_labels(labels: &[StreamLabel], titles: &mut [DiscTitle]) {
 
                         // a.label only carries codec/variant info. NEVER any
                         // English purpose text — the CLI handles that via i18n.
-                        let mut parts = Vec::new();
+                        // A bare codec descriptor stays shared; a variant joins it.
                         if !label.variant.is_empty() {
-                            parts.push(format!("({})", label.variant));
-                        }
-                        if !codec_desc.is_empty() {
-                            parts.push(codec_desc);
-                        }
-                        if !parts.is_empty() {
-                            a.label = parts.join(" ");
+                            let variant = format!("({})", label.variant);
+                            a.label = if codec_desc.is_empty() {
+                                variant.into()
+                            } else {
+                                format!("{variant} {codec_desc}").into()
+                            };
+                        } else if !codec_desc.is_empty() {
+                            a.label = codec_desc;
                         } else if !label.name.is_empty() && label.purpose == LabelPurpose::Normal {
                             // Only fall back to the parser-supplied display
                             // name when there's no purpose to flag — the CLI
                             // handles purpose rendering itself.
-                            a.label = label.name.clone();
+                            a.label = label.name.clone().into();
                         }
                     }
                 }
@@ -757,7 +758,35 @@ pub fn fill_defaults(titles: &mut [crate::disc::DiscTitle]) {
     }
 }
 
+// Generated labels come from finite codec × layout × resolution × HDR tables, so each
+// distinct text is leaked once into this table and shared by every stream naming it.
+fn static_label(text: String) -> std::borrow::Cow<'static, str> {
+    use std::collections::HashSet;
+    use std::sync::{LazyLock, Mutex};
+    static TABLE: LazyLock<Mutex<HashSet<&'static str>>> = LazyLock::new(Default::default);
+    if text.is_empty() {
+        return std::borrow::Cow::Borrowed("");
+    }
+    let mut table = TABLE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&known) = table.get(text.as_str()) {
+        return std::borrow::Cow::Borrowed(known);
+    }
+    let leaked: &'static str = Box::leak(text.into_boxed_str());
+    table.insert(leaked);
+    std::borrow::Cow::Borrowed(leaked)
+}
+
 fn generate_video_label(
+    codec: &crate::disc::Codec,
+    pixels: (u32, u32),
+    interlaced: bool,
+    hdr: &crate::disc::HdrFormat,
+    secondary: bool,
+) -> std::borrow::Cow<'static, str> {
+    static_label(video_label_text(codec, pixels, interlaced, hdr, secondary))
+}
+
+fn video_label_text(
     codec: &crate::disc::Codec,
     pixels: (u32, u32),
     interlaced: bool,
@@ -893,15 +922,18 @@ pub fn audio_codec_label(
     codec: &crate::disc::Codec,
     channels: &crate::disc::AudioChannels,
 ) -> String {
-    generate_audio_label(codec, channels, false)
+    generate_audio_label(codec, channels, false).into_owned()
 }
 
+// The generated label, shared from the static label table (no allocation per stream).
 pub(crate) fn generate_audio_label(
     codec: &crate::disc::Codec,
     channels: &crate::disc::AudioChannels,
     secondary: bool,
-) -> String {
-    generate_audio_label_inner(codec, channels, secondary, false)
+) -> std::borrow::Cow<'static, str> {
+    static_label(generate_audio_label_inner(
+        codec, channels, secondary, false,
+    ))
 }
 
 // Atmos-aware variant of generate_audio_label: folds the object-audio marker into the codec
@@ -910,8 +942,8 @@ pub(crate) fn generate_audio_label_atmos(
     codec: &crate::disc::Codec,
     channels: &crate::disc::AudioChannels,
     secondary: bool,
-) -> String {
-    generate_audio_label_inner(codec, channels, secondary, true)
+) -> std::borrow::Cow<'static, str> {
+    static_label(generate_audio_label_inner(codec, channels, secondary, true))
 }
 
 fn generate_audio_label_inner(

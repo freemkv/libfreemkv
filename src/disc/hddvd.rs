@@ -271,7 +271,7 @@ fn probe_evo_streams(
             color_space: ColorSpace::Bt709,
             display_aspect: None,
             secondary: false,
-            label: String::new(),
+            label: Default::default(),
             measured_cicp: None,
         }));
     }
@@ -293,7 +293,7 @@ fn probe_evo_streams(
             sample_rate: SampleRate::S48,
             secondary: false,
             purpose: crate::disc::LabelPurpose::Normal,
-            label: String::new(),
+            label: Default::default(),
         }));
     }
     Ok(streams)

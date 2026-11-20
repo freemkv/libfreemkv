@@ -281,7 +281,7 @@ fn audio(
         sample_rate: rate,
         secondary: false,
         purpose: LabelPurpose::Normal,
-        label,
+        label: label.into(),
     })
 }
 
@@ -400,7 +400,7 @@ pub(crate) fn scan(head: &[u8]) -> Option<Scan> {
                     color_space: colour,
                     display_aspect: dar,
                     secondary: false,
-                    label: String::new(),
+                    label: Default::default(),
                     measured_cicp: None,
                 }));
             }

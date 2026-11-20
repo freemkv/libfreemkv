@@ -147,7 +147,7 @@ impl<R: Read + Seek> Mp4Reader<R> {
                     }),
                     display_aspect: None,
                     secondary: false,
-                    label: String::new(),
+                    label: Default::default(),
                     measured_cicp: cicp,
                 }),
                 Some(h) if &h == b"soun" => DiscStream::Audio(AudioStream {
@@ -163,7 +163,7 @@ impl<R: Read + Seek> Mp4Reader<R> {
                     ),
                     secondary: false,
                     purpose: LabelPurpose::Normal,
-                    label: String::new(),
+                    label: Default::default(),
                 }),
                 _ => {
                     tracing::debug!(

@@ -14,7 +14,7 @@ fn video(codec: Codec) -> Stream {
         color_space: ColorSpace::Bt709,
         display_aspect: None,
         secondary: false,
-        label: String::new(),
+        label: Default::default(),
         measured_cicp: None,
     })
 }
@@ -27,7 +27,7 @@ fn audio(pid: u16, codec: Codec, rate: SampleRate, label: &str) -> Stream {
         sample_rate: rate,
         secondary: false,
         purpose: LabelPurpose::Normal,
-        label: label.into(),
+        label: label.to_string().into(),
     })
 }
 fn sub(pid: u16, codec: Codec) -> Stream {

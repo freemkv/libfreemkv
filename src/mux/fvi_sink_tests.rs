@@ -22,7 +22,7 @@ fn mpeg2_title() -> DiscTitle {
         color_space: ColorSpace::Smpte170m,
         display_aspect: Some((16, 9)),
         secondary: false,
-        label: String::new(),
+        label: Default::default(),
         measured_cicp: None,
     })];
     t.content_format = ContentFormat::MpegPs;
@@ -40,7 +40,7 @@ fn hevc_title() -> DiscTitle {
         color_space: ColorSpace::Bt2020,
         display_aspect: None,
         secondary: false,
-        label: String::new(),
+        label: Default::default(),
         measured_cicp: None,
     })];
     t.content_format = ContentFormat::BdTs;

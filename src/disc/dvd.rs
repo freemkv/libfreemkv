@@ -192,7 +192,7 @@ impl Disc {
                     crate::ifo::DvdAspect::R4x3 => (4, 3),
                 }),
                 secondary: false,
-                label: String::new(),
+                label: Default::default(),
                 // TODO(spec): measured colour/TFF await a CodecParser->title channel.
                 measured_cicp: None,
             });
@@ -560,7 +560,7 @@ fn title_audio_streams(ts: &ifo::DvdTitleSet, t: &ifo::DvdTitle, title: u16) -> 
             sample_rate: SampleRate::from_hz(a.sample_rate),
             secondary: false,
             purpose: audio_purpose(a.code_extension),
-            label: String::new(),
+            label: Default::default(),
         }));
         // Coding mode 3, "MPEG-2 with extension bitstream" (EP0867877A2): its extension stream
         // `0xD0|n` becomes a dependent track right after the base (pairing inferred, see
@@ -577,7 +577,7 @@ fn title_audio_streams(ts: &ifo::DvdTitleSet, t: &ifo::DvdTitle, title: u16) -> 
                 sample_rate: SampleRate::from_hz(a.sample_rate),
                 secondary: false,
                 purpose: audio_purpose(a.code_extension),
-                label: crate::disc::MP2_EXTENSION_LABEL.to_string(),
+                label: std::borrow::Cow::Borrowed(crate::disc::MP2_EXTENSION_LABEL),
             }));
         }
     }

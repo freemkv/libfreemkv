@@ -423,7 +423,7 @@ impl Disc {
                         // No user-facing English (numeric-code rule): Dolby Vision
                         // is signalled structurally (secondary + DolbyVision hdr);
                         // `label` stays empty for disc video streams.
-                        label: String::new(),
+                        label: Default::default(),
                         // TODO(spec): surface measured field order instead of the TFF
                         // fallback (needs a parser→title channel, see dvd.rs); prefer
                         // measured VUI CICP over this MPLS nibble guess once surfaced.
@@ -450,7 +450,7 @@ impl Disc {
                                 sample_rate: SampleRate::from_audio_rate(s.audio_rate),
                                 secondary: s.stream_type == 5,
                                 purpose: crate::disc::LabelPurpose::Normal,
-                                label: String::new(),
+                                label: Default::default(),
                             }))
                         }
                     }
@@ -496,7 +496,7 @@ impl Disc {
                 streams.push(Stream::Video(VideoStream {
                     pid: dep_pid,
                     secondary: true,
-                    label: crate::disc::MVC_DEPENDENT_LABEL.to_string(),
+                    label: std::borrow::Cow::Borrowed(crate::disc::MVC_DEPENDENT_LABEL),
                     ..base
                 }));
             }

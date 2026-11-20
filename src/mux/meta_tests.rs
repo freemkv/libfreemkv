@@ -12,7 +12,7 @@ fn video_title(hdr: HdrFormat, cs: ColorSpace) -> DiscTitle {
         color_space: cs,
         display_aspect: None,
         secondary: false,
-        label: String::new(),
+        label: Default::default(),
         measured_cicp: None,
     }));
     t
@@ -149,7 +149,7 @@ fn stream_fields_round_trip_through_the_header() {
             sample_rate: SampleRate::S96,
             secondary: true,
             purpose,
-            label: format!("audio {i}"),
+            label: format!("audio {i}").into(),
         }));
     }
     for qualifier in [
@@ -220,7 +220,7 @@ fn audio_and_subtitle_codec_private_round_trip() {
         sample_rate: SampleRate::S48,
         secondary: false,
         purpose: LabelPurpose::Normal,
-        label: String::new(),
+        label: Default::default(),
     }));
     t.streams.push(Stream::Subtitle(SubtitleStream {
         pid: 0x1200,
@@ -548,7 +548,7 @@ fn pid_frame_rate_hdr_and_sample_rate_round_trip() {
         sample_rate: SampleRate::S96,
         secondary: false,
         purpose: LabelPurpose::Normal,
-        label: String::new(),
+        label: Default::default(),
     }));
     let mut buf = Vec::new();
     write_header(&mut buf, &M2tsMeta::from_title(&t)).unwrap();
@@ -632,7 +632,7 @@ fn full_title() -> DiscTitle {
         sample_rate: crate::disc::SampleRate::S48,
         secondary: false,
         purpose: crate::disc::LabelPurpose::Commentary,
-        label: String::new(),
+        label: Default::default(),
     }));
     t.streams.push(Stream::Subtitle(SubtitleStream {
         pid: 0x20,

@@ -443,7 +443,7 @@ impl MkvTrack {
             track_type: ebml::TRACK_TYPE_VIDEO,
             codec_id,
             language: "und".into(),
-            name: v.label.clone(),
+            name: v.label.to_string(),
             codec_private: None,
             is_default: !v.secondary,
             is_forced: false,
@@ -496,7 +496,7 @@ impl MkvTrack {
         let sr = a.sample_rate.hz();
         let ch = a.channels.count();
 
-        let name = a.label.clone();
+        let name = a.label.to_string();
 
         Some(Self {
             track_type: ebml::TRACK_TYPE_AUDIO,

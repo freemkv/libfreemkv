@@ -2279,7 +2279,7 @@ fn resolve_retains_no_source_and_nothing_asks_after() {
             color_space: crate::disc::ColorSpace::Bt709,
             display_aspect: None,
             secondary: false,
-            label: String::new(),
+            label: Default::default(),
             measured_cicp: None,
         }));
     let r = crate::mux::mux_with_keys(

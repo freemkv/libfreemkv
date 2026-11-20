@@ -80,7 +80,7 @@ fn ac3_stream(pid: u16, channels: AudioChannels) -> Stream {
         sample_rate: SampleRate::S48,
         secondary: false,
         purpose: LabelPurpose::Normal,
-        label: String::new(),
+        label: Default::default(),
     })
 }
 

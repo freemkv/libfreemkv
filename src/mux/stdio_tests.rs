@@ -21,7 +21,7 @@ fn title_with_codec_privates() -> DiscTitle {
         color_space: crate::disc::ColorSpace::Bt2020,
         display_aspect: None,
         secondary: false,
-        label: String::new(),
+        label: Default::default(),
         measured_cicp: None,
     }));
     // Index 0 = the video stream's codec init data.

@@ -44,7 +44,7 @@ fn video(codec: Codec, res: Resolution, secondary: bool) -> Stream {
         color_space: ColorSpace::Bt2020,
         display_aspect: None,
         secondary,
-        label: String::new(),
+        label: Default::default(),
         measured_cicp: None,
     })
 }
@@ -58,7 +58,7 @@ fn audio(lang: &str, secondary: bool, purpose: LabelPurpose, label: &str) -> Str
         sample_rate: SampleRate::S48,
         secondary,
         purpose,
-        label: label.into(),
+        label: label.to_string().into(),
     })
 }
 

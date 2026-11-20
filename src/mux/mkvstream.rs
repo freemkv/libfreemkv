@@ -2537,7 +2537,7 @@ fn parse_track(r: &mut impl Read, size: u64) -> io::Result<ParsedTrack> {
                 // shape (scope, anamorphic) travels as the display aspect.
                 display_aspect: video.display_aspect(res),
                 secondary: is_secondary,
-                label: name,
+                label: name.into(),
                 measured_cicp: cicp,
             }))
         }
@@ -2549,7 +2549,7 @@ fn parse_track(r: &mut impl Read, size: u64) -> io::Result<ParsedTrack> {
             sample_rate: srs,
             secondary: false,
             purpose: crate::disc::LabelPurpose::Normal,
-            label: name,
+            label: name.into(),
         })),
         17 => Some(crate::disc::Stream::Subtitle(SubtitleStream {
             pid: ts_pid,

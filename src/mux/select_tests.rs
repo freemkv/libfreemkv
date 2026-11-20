@@ -14,7 +14,7 @@ fn video(pid: u16) -> Stream {
         color_space: ColorSpace::Bt2020,
         display_aspect: None,
         secondary: false,
-        label: String::new(),
+        label: Default::default(),
         measured_cicp: None,
     })
 }
@@ -27,7 +27,7 @@ fn audio(pid: u16, lang: &str) -> Stream {
         sample_rate: SampleRate::S48,
         secondary: false,
         purpose: LabelPurpose::Normal,
-        label: String::new(),
+        label: Default::default(),
     })
 }
 fn subtitle(pid: u16, lang: &str) -> Stream {
@@ -244,7 +244,7 @@ fn mp2_ext_title() -> DiscTitle {
             sample_rate: SampleRate::S48,
             secondary: false,
             purpose: LabelPurpose::Normal,
-            label: label.into(),
+            label: label.to_string().into(),
         })
     };
     let mut t = DiscTitle::empty();
@@ -312,7 +312,7 @@ fn an_mp2_extension_pairs_with_the_base_of_its_own_index() {
             sample_rate: SampleRate::S48,
             secondary: false,
             purpose: LabelPurpose::Normal,
-            label: label.into(),
+            label: label.to_string().into(),
         })
     };
     let keep = |audio: Vec<u16>| {

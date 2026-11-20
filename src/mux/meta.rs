@@ -182,7 +182,7 @@ impl M2tsMeta {
                     frame_rate: v.frame_rate.to_string(),
                     hdr: v.hdr.id().into(),
                     color_space: v.color_space.id().into(),
-                    label: v.label.clone(),
+                    label: v.label.to_string(),
                     secondary: v.secondary,
                     codec_private: codec_private_b64(i),
                     display_aspect: v.display_aspect.map(|(w, h)| [w, h]),
@@ -196,7 +196,7 @@ impl M2tsMeta {
                     channels: a.channels.to_string(),
                     language: a.language.to_string(),
                     sample_rate: a.sample_rate.to_string(),
-                    label: a.label.clone(),
+                    label: a.label.to_string(),
                     secondary: a.secondary,
                     codec_private: codec_private_b64(i),
                     purpose: purpose_id(a.purpose).into(),
@@ -312,7 +312,7 @@ impl M2tsMeta {
                         color_space: cs,
                         display_aspect: display_aspect.map(|[w, h]| (w, h)),
                         secondary: *secondary,
-                        label: label.clone(),
+                        label: label.clone().into(),
                         measured_cicp: cicp.map(|[matrix, transfer, primaries, range]| {
                             crate::disc::MeasuredCicp {
                                 matrix,
@@ -345,7 +345,7 @@ impl M2tsMeta {
                         .unwrap_or(crate::disc::SampleRate::Unknown),
                     secondary: *secondary,
                     purpose: purpose_from_id(purpose),
-                    label: label.clone(),
+                    label: label.clone().into(),
                 }),
                 MetaStream::Subtitle {
                     pid,
