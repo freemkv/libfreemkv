@@ -6289,7 +6289,8 @@ fn lang_reads_prints_and_compares_like_a_string() {
     let long = "é".repeat(10);
     let cut = Lang::from(long.as_str());
     assert_eq!(cut.as_str(), "é".repeat(7));
-    assert!(Lang::from("deu") < Lang::from("eng"));
+    let (deu, eng) = (Lang::from("deu"), Lang::from("eng"));
+    assert!(deu < eng);
     assert_eq!(Lang::from("fra"), Lang::from(String::from("fra")));
 }
 

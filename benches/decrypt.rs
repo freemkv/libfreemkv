@@ -43,7 +43,7 @@ fn unit_decrypt(total: u64) {
     let rounds = (total / buf.len() as u64).max(1);
     let (wall, cpu) = measure(|| {
         for _ in 0..rounds {
-            for u in buf.chunks_exact_mut(UNIT) {
+            for u in buf.as_chunks_mut::<UNIT>().0 {
                 decrypt_unit(u, &KEY);
             }
         }
@@ -123,7 +123,7 @@ fn label(threads: usize) -> String {
 fn scrambled_packs(sectors: u32) -> Vec<u8> {
     let mut out = vec![0u8; sectors as usize * SECTOR];
     let mut state = 0x1234_5678u32;
-    for s in out.chunks_exact_mut(SECTOR) {
+    for s in out.as_chunks_mut::<SECTOR>().0 {
         for b in s.iter_mut() {
             state ^= state << 13;
             state ^= state >> 17;

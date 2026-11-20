@@ -82,8 +82,8 @@ fn batched_cbc_decrypt_matches_block_at_a_time_and_skips_a_partial_tail() {
         let cipher = Aes128::new(&K.into());
         let mut want = data.clone();
         let mut prev = AACS_IV;
-        for c in want.chunks_exact_mut(16) {
-            let ct: [u8; 16] = c.try_into().unwrap();
+        for c in want.as_chunks_mut::<16>().0 {
+            let ct: [u8; 16] = *c;
             let mut b: Array<u8, _> = ct.into();
             cipher.decrypt_block(&mut b);
             c.iter_mut()
