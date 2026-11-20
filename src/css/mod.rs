@@ -23,6 +23,8 @@ pub(crate) mod verify;
 
 use crate::disc::Extent;
 use crate::sector::SectorSource;
+use rayon::iter::{IndexedParallelIterator, ParallelIterator};
+use rayon::slice::ParallelSliceMut;
 
 // Consecutive CSS-locked reads before the crack scan early-bails, instead of grinding the full
 // 50_000-sector budget. Resets to 0 on any readable batch.
@@ -433,60 +435,80 @@ pub fn descramble_region(buf: &mut [u8], title_key: &mut [u8; 5]) -> crate::erro
     // pending). Reset by a validated cache hit; a fresh run always attempts
     // on its first mismatch, then at most once every RECRACK_RETRY_EVERY.
     let mut mismatches_since_attempt: u32 = 0;
+    let pool = crate::decrypt::pool_for(buf.len() / 2048);
+    // With a pool, a crib-less pack (it never moves the key) waits for phase 2 under the
+    // key in force at its place; a cribbed one may re-crack it, so it runs here, in order.
+    let mut later: Vec<Option<(u8, [u8; 5])>> = Vec::new();
     // The pack test, NOT raw byte 0x14: this sees arbitrary regions (IFO/UDF/ISO 9660).
     // Measured: an IFO misread by 0x14 alone was destroyed, dropping titles 38→10.
-    for chunk in buf.chunks_mut(2048) {
+    for (i, chunk) in buf.chunks_mut(2048).enumerate() {
         let Some(at) = (chunk.len() >= 2048).then(|| scrambled_at(chunk)).flatten() else {
             continue;
         };
-        with_flags_at_0x14(chunk, at, |chunk| {
-            descramble_one(chunk, title_key, &mut mismatches_since_attempt)
+        with_flags_at_0x14(chunk, at, |chunk| match keyless::attack_crib(chunk) {
+            None if pool.is_some() => {
+                later.resize(i + 1, None);
+                later[i] = Some((at as u8, *title_key));
+            }
+            None => lfsr::descramble_sector(title_key, chunk),
+            Some(crib) => descramble_cribbed(chunk, crib, title_key, &mut mismatches_since_attempt),
+        });
+    }
+    // Phase 2: the waiting packs are independent, each under its recorded key.
+    if let (Some(pool), false) = (pool, later.is_empty()) {
+        let run = |(i, chunk): (usize, &mut [u8])| {
+            if let Some(&Some((at, key))) = later.get(i) {
+                with_flags_at_0x14(chunk, usize::from(at), |s| lfsr::descramble_sector(&key, s));
+            }
+        };
+        pool.install(|| {
+            buf.par_chunks_mut(2048)
+                .enumerate()
+                .with_min_len(32)
+                .for_each(run)
         });
     }
     Ok(0)
 }
 
-// One scrambled pack (flags at 0x14), validated against its crib and re-cracked on a miss.
-fn descramble_one(chunk: &mut [u8], title_key: &mut [u8; 5], mismatches_since_attempt: &mut u32) {
-    {
-        let crib = keyless::attack_crib(chunk);
-        // Snapshot the ciphertext (chunk is exactly 2048 here) only when there is
-        // a crib to validate against, so the common cache-hit path costs no
-        // per-sector heap allocation.
-        let mut original = [0u8; 2048];
-        if crib.is_some() {
-            original.copy_from_slice(chunk);
+// One scrambled pack (flags at 0x14) with a crib, validated against it and re-cracked on a miss.
+fn descramble_cribbed(
+    chunk: &mut [u8],
+    crib: [u8; 10],
+    title_key: &mut [u8; 5],
+    mismatches_since_attempt: &mut u32,
+) {
+    // Snapshot the ciphertext (chunk is exactly 2048 here) to restore it for a re-crack.
+    let mut original = [0u8; 2048];
+    original.copy_from_slice(chunk);
+    lfsr::descramble_sector(title_key, chunk);
+    if chunk[0x80..0x80 + 10] == crib[..] {
+        *mismatches_since_attempt = 0; // validated: cached key still matches
+        return;
+    }
+    *mismatches_since_attempt += 1;
+    if *mismatches_since_attempt % RECRACK_RETRY_EVERY != 1 {
+        // Within a suppressed run, not yet due for its periodic retry —
+        // keep the cached key (already applied above).
+        return;
+    }
+    // Due for an attempt: either the first mismatch of a run, or a
+    // periodic retry into an ongoing one. Restore the ciphertext and
+    // crack this sector's own key.
+    chunk.copy_from_slice(&original);
+    #[cfg(test)]
+    RECRACK_ATTEMPTS.with(|c| c.set(c.get() + 1));
+    match keyless::crack_title_key(chunk) {
+        Some(fresh) => {
+            *title_key = fresh;
+            lfsr::descramble_sector(title_key, chunk);
+            *mismatches_since_attempt = 0;
         }
-        lfsr::descramble_sector(title_key, chunk);
-        let Some(crib) = crib else { return };
-        if chunk[0x80..0x80 + 10] == crib[..] {
-            *mismatches_since_attempt = 0; // validated: cached key still matches
-            return;
-        }
-        *mismatches_since_attempt += 1;
-        if *mismatches_since_attempt % RECRACK_RETRY_EVERY != 1 {
-            // Within a suppressed run, not yet due for its periodic retry —
-            // keep the cached key (already applied above).
-            return;
-        }
-        // Due for an attempt: either the first mismatch of a run, or a
-        // periodic retry into an ongoing one. Restore the ciphertext and
-        // crack this sector's own key.
-        chunk.copy_from_slice(&original);
-        #[cfg(test)]
-        RECRACK_ATTEMPTS.with(|c| c.set(c.get() + 1));
-        match keyless::crack_title_key(chunk) {
-            Some(fresh) => {
-                *title_key = fresh;
-                lfsr::descramble_sector(title_key, chunk);
-                *mismatches_since_attempt = 0;
-            }
-            None => {
-                // Re-crack found nothing; descramble with the CACHED key
-                // anyway — mismatch+failure signals a crib false positive,
-                // not a stale key (`DecryptFailed` here made discs unrippable).
-                lfsr::descramble_sector(title_key, chunk);
-            }
+        None => {
+            // Re-crack found nothing; descramble with the CACHED key
+            // anyway — mismatch+failure signals a crib false positive,
+            // not a stale key (`DecryptFailed` here made discs unrippable).
+            lfsr::descramble_sector(title_key, chunk);
         }
     }
 }

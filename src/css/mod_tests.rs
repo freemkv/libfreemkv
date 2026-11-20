@@ -1403,3 +1403,60 @@ fn a_clear_head_then_unreadable_tail_is_not_unencrypted() {
     let out = crack_key_outcome(&mut ClearThenDamaged, &ext, 2, None);
     assert!(matches!(out, CrackOutcome::Unreadable(_)), "got {out:?}");
 }
+
+// A buffer big enough for the pool: crib-less packs descramble in parallel under the key in
+// force at their place, a cribbed pack re-cracks in order, and the result is the serial one.
+#[test]
+fn a_pooled_descramble_keeps_each_packs_key_in_read_order() {
+    let key_a = [0x0A, 0x1B, 0x2C, 0x3D, 0x4E];
+    let key_b = [0x11, 0x22, 0x33, 0x44, 0x55];
+    let (wire_a, plain_a) = checkable_sectors(&key_a, 150, 7);
+    let (wire_b, plain_b) = checkable_sectors(&key_b, 150, 9);
+    let switch = crackable_sector(&key_b, &[0x00, 0xFF, 0x80, 0x7F, 0x01], 5);
+    let mut switch_plain = switch.clone();
+    lfsr::descramble_sector(&key_b, &mut switch_plain);
+    let ifo_like = {
+        let mut s = vec![0x5Au8; 2048];
+        s[0x14] = 0x30;
+        s
+    };
+    let mut buf = Vec::new();
+    let mut want = Vec::new();
+    for (w, p) in [
+        (&wire_a, &plain_a),
+        (&ifo_like, &ifo_like),
+        (&switch, &switch_plain),
+        (&wire_b, &plain_b),
+    ] {
+        buf.extend_from_slice(w);
+        want.extend_from_slice(p);
+    }
+    buf.extend_from_slice(&[0xC3; 100]);
+    want.extend_from_slice(&[0xC3; 100]);
+    crate::decrypt::set_decrypt_threads(4);
+    RECRACK_ATTEMPTS.with(|c| c.set(0));
+    let mut key = key_a;
+    let r = descramble_region(&mut buf, &mut key);
+    crate::decrypt::set_decrypt_threads(0);
+    assert_eq!(r.unwrap(), 0);
+    assert_eq!(key, key_b, "the key change is adopted");
+    assert_eq!(
+        RECRACK_ATTEMPTS.with(|c| c.get()),
+        1,
+        "one re-crack, on this thread"
+    );
+    for (i, (g, w)) in buf.chunks(2048).zip(want.chunks(2048)).enumerate() {
+        assert!(g == w, "sector {i}");
+    }
+}
+
+// Below the pool threshold the same packs take the serial path, with the same result.
+#[test]
+fn a_small_buffer_descrambles_serially_with_the_same_result() {
+    let key = [0x21, 0x43, 0x65, 0x87, 0xA9];
+    let (mut wire, plain) = checkable_sectors(&key, 20, 3);
+    let mut k = key;
+    descramble_region(&mut wire, &mut k).unwrap();
+    assert!(wire == plain);
+    assert_eq!(k, key);
+}
