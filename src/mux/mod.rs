@@ -72,6 +72,12 @@ pub(crate) mod tsmux;
 #[allow(dead_code)]
 pub(crate) mod videomap;
 
+/// Bench-only wrappers over the crate-private mux stages. Not API.
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+#[path = "bench_internals.rs"]
+pub mod __bench;
+
 // `demux://`/`fvi://` sinks are built internally by `output()`; not public API.
 // The provenance types ARE public: `output()` takes a `SourceInfo` so an `fvi://`
 // destination records the INPUT it was built from (§6.2), not the file written.
