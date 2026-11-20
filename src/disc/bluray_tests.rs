@@ -1953,6 +1953,10 @@ impl SectorSource for HaltingReader<'_> {
 /// 00801.mpls at 40000) over one fully wired clip. Both playlists are
 /// keepable, so a scan that returns fewer than two titles has LOST one.
 fn two_playlist_bd_fs(disc: &mut MemDisc) -> udf::UdfFs {
+    two_playlist_bd_fs_with_clpi(disc, build_clpi(4000))
+}
+
+fn two_playlist_bd_fs_with_clpi(disc: &mut MemDisc, clpi: Vec<u8>) -> udf::UdfFs {
     let long_mpls = || {
         build_mpls(
             &[PiSpec {
@@ -1976,7 +1980,7 @@ fn two_playlist_bd_fs(disc: &mut MemDisc) -> udf::UdfFs {
         name: "CLIPINF".to_string(),
         icb_lba: 24,
         dir_data_lba: 25,
-        files: vec![file_with("00001.clpi", 102, 8000, build_clpi(4000), false)],
+        files: vec![file_with("00001.clpi", 102, 8000, clpi, false)],
         subdirs: vec![],
     };
     let playlist = DirSpec {
@@ -2436,6 +2440,31 @@ fn scan_bluray_titles_reads_shared_clpi_once_across_playlists() {
     let titles = Disc::scan_bluray_titles(&mut w, &udf, None).expect("scan");
     assert_eq!(titles.len(), 2);
     assert_eq!(w.hits, 1, "shared .clpi re-read per playlist");
+}
+
+// The scan reads only a .clpi's header sector: the CPI/EP map behind it is never read,
+// and the packet count (so the title size) is the one a full parse gives.
+#[test]
+fn scan_bluray_titles_reads_only_the_clpi_header() {
+    let mut clpi = build_clpi(4000);
+    clpi.resize(3 * 2048, 0xA5);
+    let mut disc = MemDisc::new();
+    let udf = two_playlist_bd_fs_with_clpi(&mut disc, clpi);
+    let mut w = LbaWatch {
+        inner: disc,
+        lba: PART_START + 8001,
+        hits: 0,
+    };
+    let titles = Disc::scan_bluray_titles(&mut w, &udf, None).expect("scan");
+    assert_eq!(titles.len(), 2);
+    assert_eq!(w.hits, 0, "the scan read past the .clpi header");
+    for t in &titles {
+        assert_eq!(
+            t.size_bytes,
+            4000 * 192,
+            "size from the header's packet count"
+        );
+    }
 }
 
 // The in-loop poll must fire before any playlist is read (the post-loop poll alone would

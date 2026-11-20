@@ -1840,6 +1840,23 @@ impl DiscId {
     }
 }
 
+/// How many bytes of the file at `path` the live scan's metadata prefetch loads: `None`
+/// for a file [`scan_parses`] leaves out, the header for a BD `/BDMV/CLIPINF` file (the
+/// scan reads only its packet count, never the EP map), else the whole file.
+pub(crate) fn scan_prefetch_bytes(bd: bool, path: &str) -> Option<u64> {
+    if !scan_parses(bd, path) {
+        return None;
+    }
+    let clpi = bd
+        && path.len() > "/BDMV/CLIPINF/".len()
+        && path.as_bytes()[.."/BDMV/CLIPINF/".len()].eq_ignore_ascii_case(b"/BDMV/CLIPINF/");
+    Some(if clpi {
+        crate::clpi::HEADER_BYTES as u64
+    } else {
+        crate::udf::WHOLE_FILE
+    })
+}
+
 /// Whether a live scan parses the file at `path` (absolute, any case), so the metadata
 /// prefetch bulk-loads it. On a BD tree only what the scan reads: the nav and clip files,
 /// BD-J objects, jar archives and the config files the labels read beside them, META XML,
@@ -2061,7 +2078,7 @@ impl Disc {
         // Pre-read the small files the scan parses (AACS, MPLS, CLPI, META, *.bdmv): one
         // command each otherwise.
         let bd = udf_fs.find_dir("/BDMV").is_some();
-        match udf_fs.metadata_sector_ranges_for(&mut buffered, &|p| scan_parses(bd, p)) {
+        match udf_fs.metadata_sector_ranges_for(&mut buffered, &|p| scan_prefetch_bytes(bd, p)) {
             Ok(ranges) => buffered.prefetch_ranges(&ranges)?,
             Err(Error::Halted) => return Err(Error::Halted),
             Err(_) => {} // prefetch is optional

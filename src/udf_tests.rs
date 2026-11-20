@@ -1938,7 +1938,7 @@ fn metadata_sector_ranges_leave_out_the_files_wanted_refuses() {
     let ranges = fs
         .metadata_sector_ranges_for(&mut reader, &|p| {
             seen.borrow_mut().push(p.to_string());
-            !p.contains("/BACKUP/")
+            (!p.contains("/BACKUP/")).then_some(WHOLE_FILE)
         })
         .expect("the plan is built");
     assert_eq!(
@@ -1950,6 +1950,46 @@ fn metadata_sector_ranges_leave_out_the_files_wanted_refuses() {
         !reader.1.contains(&(PART + 20)),
         "the refused file's File Entry was read: {:?}",
         reader.1
+    );
+}
+
+// A byte limit from `wanted` prefetches only the file's head: whole sectors covering
+// that many bytes, across extents, and nothing past it.
+#[test]
+fn metadata_sector_ranges_honour_a_head_byte_limit() {
+    const PART: u32 = 1000;
+    let fs = UdfFs {
+        root: DirEntry {
+            name: String::new(),
+            is_dir: true,
+            meta_lba: 0,
+            size: 0,
+            entries: vec![file_entry("00001.clpi", 10, 10240)],
+        },
+        volume_id: String::new(),
+        partition_start: PART,
+        meta: MetaMap::contiguous(PART),
+        metadata_sectors: 4,
+        meta_file_lba: None,
+        meta_mirror: None,
+    };
+    let mut reader = MapReader::new();
+    reader.put(
+        PART + 10,
+        build_efe(10240, &[(0, 4096, 500), (0, 6144, 700)]),
+    );
+    let plan = |reader: &mut MapReader, limit: u64| {
+        fs.metadata_sector_ranges_for(reader, &|_| Some(limit))
+            .expect("the plan is built")
+    };
+    assert_eq!(plan(&mut reader, 60), vec![(0, 1004), (1010, 1), (1500, 1)]);
+    assert_eq!(
+        plan(&mut reader, 5000),
+        vec![(0, 1004), (1010, 1), (1500, 2), (1700, 1)]
+    );
+    assert_eq!(
+        plan(&mut reader, WHOLE_FILE),
+        vec![(0, 1004), (1010, 1), (1500, 2), (1700, 3)]
     );
 }
 

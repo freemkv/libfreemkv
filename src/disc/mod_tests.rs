@@ -5977,6 +5977,26 @@ fn scan_prefetches_only_the_files_a_bd_scan_parses() {
     }
 }
 
+// The prefetch loads only a CLPI's header on a BD tree, every other parsed file whole,
+// and nothing the scan does not parse.
+#[test]
+fn scan_prefetch_loads_only_the_clpi_header() {
+    let head = Some(crate::clpi::HEADER_BYTES as u64);
+    let whole = Some(crate::udf::WHOLE_FILE);
+    assert_eq!(scan_prefetch_bytes(true, "/BDMV/CLIPINF/00055.clpi"), head);
+    assert_eq!(scan_prefetch_bytes(true, "/bdmv/clipinf/00055.CLPI"), head);
+    assert_eq!(
+        scan_prefetch_bytes(true, "/BDMV/PLAYLIST/00800.mpls"),
+        whole
+    );
+    assert_eq!(scan_prefetch_bytes(true, "/AACS/MKB_RO.inf"), whole);
+    assert_eq!(scan_prefetch_bytes(true, "/BDMV/BACKUP/index.bdmv"), None);
+    assert_eq!(
+        scan_prefetch_bytes(false, "/BDMV/CLIPINF/00055.clpi"),
+        whole
+    );
+}
+
 #[test]
 fn only_hd_dvd_program_streams_key_aacs_per_pack() {
     assert!(ContentFormat::MpegPs.aacs_per_pack());

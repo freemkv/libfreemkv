@@ -434,23 +434,30 @@ pub fn damage_unit_seed(unit: &mut [u8]) {
 
 /// Bench seam for the live scan's metadata prefetch (`benches/scan.rs`): reads the UDF
 /// filesystem of `src`, bulk-loads the metadata partition and every file a live BD scan
-/// parses, as `Disc::scan` does, then reads each `/BDMV/PLAYLIST` and `/BDMV/CLIPINF` file
-/// back through the buffered reader. Returns `(prefetched ranges, bytes read back)`.
+/// parses, as `Disc::scan` does, then reads back through the buffered reader what the scan
+/// reads: each `/BDMV/PLAYLIST` file whole and each `/BDMV/CLIPINF` file's header.
+/// Returns `(prefetched ranges, bytes read back)`.
 pub fn prefetch_scan_files(src: &mut dyn SectorSource, batch: u16) -> Result<(usize, usize)> {
     let fs = crate::udf::read_filesystem(src)?;
     let mut buffered = crate::udf::BufferedSectorReader::new(src, batch);
     buffered.prefetch(fs.metadata_start(), fs.metadata_sectors())?;
     let bd = fs.find_dir("/BDMV").is_some();
     let ranges =
-        fs.metadata_sector_ranges_for(&mut buffered, &|p| crate::disc::scan_parses(bd, p))?;
+        fs.metadata_sector_ranges_for(&mut buffered, &|p| crate::disc::scan_prefetch_bytes(bd, p))?;
     buffered.prefetch_ranges(&ranges)?;
     let mut bytes = 0;
-    for dir in ["/BDMV/PLAYLIST", "/BDMV/CLIPINF"] {
+    for (dir, limit) in [
+        ("/BDMV/PLAYLIST", None),
+        ("/BDMV/CLIPINF", Some(crate::clpi::HEADER_BYTES)),
+    ] {
         let Some(d) = fs.find_dir(dir) else { continue };
         for e in d.entries.iter().filter(|e| !e.is_dir) {
-            bytes += fs
-                .read_file(&mut buffered, &format!("{dir}/{}", e.name))?
-                .len();
+            let path = format!("{dir}/{}", e.name);
+            bytes += match limit {
+                Some(n) => fs.read_file_prefix(&mut buffered, &path, n)?,
+                None => fs.read_file(&mut buffered, &path)?,
+            }
+            .len();
         }
     }
     Ok((ranges.len(), bytes))

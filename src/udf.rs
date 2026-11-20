@@ -52,6 +52,9 @@ const MAX_PREFETCH_RUN_SECTORS: u32 = 8192;
 // Files larger than this are not cached by `metadata_sector_ranges` (MKB_RO.inf is ~134 MB).
 const MAX_CACHED_FILE_BYTES: u64 = 50_000_000;
 
+// A `metadata_sector_ranges_for` byte limit that prefetches the whole file.
+pub(crate) const WHOLE_FILE: u64 = u64::MAX;
+
 // Smallest Main VDS extent ECMA-167 3/10.2.1 permits an AVDP to record (16
 // sectors). A smaller extent is unusable, so it's ignored in favour of
 // VDS_FALLBACK_START.
@@ -403,16 +406,17 @@ impl UdfFs {
     /// `STREAM` directories (case-insensitive) are not descended, and files over 50 MB are
     /// skipped.
     pub fn metadata_sector_ranges(&self, reader: &mut dyn SectorSource) -> Result<Vec<(u32, u32)>> {
-        self.metadata_sector_ranges_for(reader, &|_| true)
+        self.metadata_sector_ranges_for(reader, &|_| Some(WHOLE_FILE))
     }
 
     /// [`Self::metadata_sector_ranges`] over the files `wanted` accepts, by absolute path
-    /// (e.g. `/BDMV/PLAYLIST/00000.mpls`): a file it refuses gets no range and its File Entry
-    /// is not read. The live scan's prefetch plan.
+    /// (e.g. `/BDMV/PLAYLIST/00000.mpls`): `wanted` returns how many bytes of the file to
+    /// prefetch ([`WHOLE_FILE`] for all of it), or `None` to leave it out, File Entry
+    /// unread. The live scan's prefetch plan.
     pub(crate) fn metadata_sector_ranges_for(
         &self,
         reader: &mut dyn SectorSource,
-        wanted: &dyn Fn(&str) -> bool,
+        wanted: &dyn Fn(&str) -> Option<u64>,
     ) -> Result<Vec<(u32, u32)>> {
         let mut ranges = Vec::new();
 
@@ -527,7 +531,7 @@ impl UdfFs {
         reader: &mut dyn SectorSource,
         entry: &DirEntry,
         path: &mut String,
-        wanted: &dyn Fn(&str) -> bool,
+        wanted: &dyn Fn(&str) -> Option<u64>,
         ranges: &mut Vec<(u32, u32)>,
         seen: &mut HashSet<u32>,
     ) -> Result<()> {
@@ -547,7 +551,7 @@ impl UdfFs {
         reader: &mut dyn SectorSource,
         child: &DirEntry,
         path: &mut String,
-        wanted: &dyn Fn(&str) -> bool,
+        wanted: &dyn Fn(&str) -> Option<u64>,
         ranges: &mut Vec<(u32, u32)>,
         seen: &mut HashSet<u32>,
     ) -> Result<()> {
@@ -559,13 +563,13 @@ impl UdfFs {
             return self.collect_file_ranges(reader, child, path, wanted, ranges, seen);
         }
         // A file the scan never reads is not prefetched (nor its File Entry read).
-        if !wanted(path) {
+        let Some(limit) = wanted(path) else {
             return Ok(());
-        }
+        };
         // Include the ICB sector itself (in metadata partition)
         ranges.push((self.meta_to_abs(child.meta_lba)?, 1));
         // Include file data — skip only truly huge files (MKB_RO.inf = 134MB)
-        if child.size > MAX_CACHED_FILE_BYTES {
+        if child.size.min(limit) > MAX_CACHED_FILE_BYTES {
             return Ok(());
         }
         // Push every extent (a fragmented AACS cert / MPLS / CLPI spans several);
@@ -577,7 +581,14 @@ impl UdfFs {
             Err(Error::Halted) => return Err(Error::Halted),
             Err(_) => {}
             Ok(extents) => {
+                // File bytes still wanted: each extent, cached or not, uses up its length.
+                let mut left = limit;
                 for ext in extents {
+                    if left == 0 {
+                        break;
+                    }
+                    let take = (ext.len as u64).min(left);
+                    left -= take;
                     // An unrecorded extent holds nothing to cache.
                     if !ext.recorded {
                         continue;
@@ -585,7 +596,7 @@ impl UdfFs {
                     let Some(abs_start) = self.partition_start.checked_add(ext.lba) else {
                         continue;
                     };
-                    let sector_count = (ext.len as u64).div_ceil(SECTOR_BYTES_U64) as u32;
+                    let sector_count = take.div_ceil(SECTOR_BYTES_U64) as u32;
                     ranges.push((abs_start, sector_count));
                 }
                 compact_ranges(ranges, self.meta.start())?;

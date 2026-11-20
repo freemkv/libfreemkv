@@ -190,11 +190,12 @@ impl Disc {
                 // A `.clpi` that cannot be read or parsed is NOT a benign miss:
                 // `duration_ticks` already claims the full runtime, so drop the
                 // title instead of silently shipping it missing bytes.
-                let clip_info = match udf_fs
-                    .read_file(reader, &clpi_path)
-                    .and_then(|clpi_data| clpi::parse(&clpi_data))
+                // Only the header is read: the packet count is all the scan uses.
+                let n = match udf_fs
+                    .read_file_prefix(reader, &clpi_path, clpi::HEADER_BYTES)
+                    .and_then(|head| clpi::packet_count(&head))
                 {
-                    Ok(info) => info,
+                    Ok(n) => n,
                     // The operator's Stop, not a disc defect: every remaining command
                     // fails the same way once the drive's flag is set, so classifying
                     // it as unresolvable would truncate the title list at success.
@@ -212,7 +213,6 @@ impl Disc {
                         return Ok(None);
                     }
                 };
-                let n = clip_info.source_packet_count;
                 clip_pkts.insert(play_item.clip_id.clone(), n);
                 n
             };
