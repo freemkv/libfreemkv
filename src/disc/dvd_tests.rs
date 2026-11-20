@@ -2440,7 +2440,7 @@ fn ordinals(titles: &[DiscTitle]) -> Vec<Option<usize>> {
                 roster,
                 title_count: 8,
                 ordinal,
-            } if roster == "dvd-playall-partition-v1:7" => *ordinal,
+            } if &**roster == "dvd-playall-partition-v1:7" => *ordinal,
             _ => None,
         })
         .collect()

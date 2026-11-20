@@ -96,7 +96,7 @@ pub(super) fn annotate(
         );
         return;
     };
-    let roster = format!("{producer}:{wrapper}");
+    let roster: std::sync::Arc<str> = format!("{producer}:{wrapper}").into();
     let title_count = titles.len();
     for (title, ordinal) in titles.iter_mut().zip(ordinals) {
         title.selection_evidence.episodes = EpisodeEvidence::Authored {

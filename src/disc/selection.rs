@@ -16,7 +16,7 @@ pub enum EpisodeEvidence {
     /// and total title count, including nonmembers. Partial or conflicting records
     /// require review. `roster` identifies the producer and authored source/table.
     Authored {
-        roster: String,
+        roster: std::sync::Arc<str>,
         title_count: usize,
         /// Zero-based authored program order; `None` outside the roster. Exact
         /// presentation aliases share one ordinal; distinct programs occupy

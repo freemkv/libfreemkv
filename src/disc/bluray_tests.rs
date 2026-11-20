@@ -2854,7 +2854,7 @@ fn bd_roster(titles: &[DiscTitle]) -> Option<Vec<(u16, Option<usize>)>> {
                 roster,
                 title_count,
                 ordinal,
-            } if roster == "bd-playall-partition-v1:800" && *title_count == titles.len() => {
+            } if &**roster == "bd-playall-partition-v1:800" && *title_count == titles.len() => {
                 Some((t.playlist_id, *ordinal))
             }
             _ => None,
@@ -2879,6 +2879,20 @@ fn scan_bluray_titles_annotates_the_playall_roster() {
     assert_eq!(
         bd_roster(&titles),
         Some(vec![(1, Some(0)), (2, Some(1)), (3, Some(2)), (800, None)])
+    );
+    // One roster string shared by every title, not a copy per title.
+    let rosters: Vec<&std::sync::Arc<str>> = titles
+        .iter()
+        .filter_map(|t| match &t.selection_evidence.episodes {
+            EpisodeEvidence::Authored { roster, .. } => Some(roster),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(rosters.len(), titles.len());
+    assert!(
+        rosters
+            .iter()
+            .all(|r| std::sync::Arc::ptr_eq(r, rosters[0]))
     );
 }
 
