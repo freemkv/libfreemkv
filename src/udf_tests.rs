@@ -1759,6 +1759,59 @@ fn prefetch_ranges_serves_every_sector_of_every_range_from_the_permanent_cache()
 }
 
 #[test]
+fn prefetch_ranges_keeps_runs_contiguous_disjoint_and_sorted() {
+    // Unsorted, overlapping and nested ranges: every sector is served at its own
+    // LBA, the runs end up sorted and disjoint, and gaps between runs miss.
+    let mut inner = CountReader::new();
+    let mut br = BufferedSectorReader::new(&mut inner, 4);
+    br.prefetch_ranges(&[(500, 3), (100, 10), (105, 10), (101, 2), (520, 1)])
+        .unwrap();
+    let starts: Vec<u32> = br.prefetched.iter().map(|r| r.start).collect();
+    assert_eq!(starts, [100, 500, 520]);
+    assert_eq!(br.prefetched[0].sectors(), 15);
+    for lba in (100..115).chain(500..503).chain(520..521) {
+        assert_eq!(
+            br.prefetched_sector(lba),
+            Some(&CountReader::expected(lba)[..])
+        );
+    }
+    for lba in [99u32, 115, 499, 503, 519, 521] {
+        assert!(
+            !br.is_prefetched(lba),
+            "sector {lba} is outside every range"
+        );
+    }
+}
+
+#[test]
+fn prefetch_ranges_keeps_the_sectors_before_a_failed_batch() {
+    // A failed batch ends its range: the sectors already read stay cached, the
+    // rest of that range is left to the sliding window, and later ranges load.
+    struct FailsAt(u32);
+    impl SectorSource for FailsAt {
+        fn read_sectors(&mut self, lba: u32, count: u16, buf: &mut [u8], _: bool) -> Result<usize> {
+            if (lba..lba + count as u32).contains(&self.0) {
+                return Err(Error::UdfBufferTooSmall);
+            }
+            for i in 0..count as u32 {
+                let off = i as usize * 2048;
+                buf[off..off + 2048].copy_from_slice(&CountReader::expected(lba + i));
+            }
+            Ok(count as usize * 2048)
+        }
+    }
+    let mut inner = FailsAt(13);
+    let mut br = BufferedSectorReader::new(&mut inner, 2);
+    br.prefetch_ranges(&[(10, 8), (40, 2)]).unwrap();
+    for lba in [10u32, 11, 40, 41] {
+        assert!(br.is_prefetched(lba), "sector {lba} should be cached");
+    }
+    for lba in 12..18u32 {
+        assert!(!br.is_prefetched(lba), "sector {lba} was past the failure");
+    }
+}
+
+#[test]
 fn metadata_sector_ranges_covers_the_structure_and_each_small_files_extents() {
     // The prefetch plan decides what's bulk-read before scanning: UDF
     // structure, every non-STREAM ICB, RECORDED extents under the size cap,
@@ -1944,17 +1997,21 @@ fn prefetch_ranges_near_u32_max_does_not_overflow() {
     br.prefetch_ranges(&[(0xFFFF_FFF0, 512)]).unwrap();
     // Every key the permanent cache holds must be a real LBA, i.e. inside
     // the declared range — never a wrapped low sector.
-    for &lba in br.prefetched.keys() {
+    for run in &br.prefetched {
         assert!(
-            lba >= 0xFFFF_FFF0,
-            "prefetch_ranges wrapped a near-u32::MAX LBA to {lba}"
+            run.start >= 0xFFFF_FFF0,
+            "prefetch_ranges wrapped a near-u32::MAX LBA to {}",
+            run.start
         );
+    }
+    for lba in 0..600u32 {
+        assert!(!br.is_prefetched(lba), "low sector {lba} was seeded");
     }
     // Clamping must drop only unaddressable sectors — dropping addressable
     // ones too silently defeats the bulk read this function exists for.
     for lba in 0xFFFF_FFF0u32..=0xFFFF_FFFE {
         assert!(
-            br.prefetched.contains_key(&lba),
+            br.is_prefetched(lba),
             "addressable sector {lba} was dropped from the prefetch"
         );
     }

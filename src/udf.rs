@@ -321,9 +321,10 @@ impl UdfFs {
         // capped so a bogus entry.size can't force a GiB-scale reservation.
         let cap_hint = (entry.size as usize)
             .min(limit)
-            .min(MAX_FILE_BYTES as usize);
+            .min(MAX_FILE_BYTES as usize)
+            .div_ceil(SECTOR_BYTES)
+            * SECTOR_BYTES;
         let mut data = Vec::with_capacity(cap_hint);
-        let mut sector = [0u8; SECTOR_BYTES];
         'extents: for ext in extents {
             let (data_lba, data_len) = (ext.lba, ext.len);
             if max_bytes.is_none() {
@@ -370,8 +371,10 @@ impl UdfFs {
                     status: None,
                     sense: None,
                 })?;
-                read_sector(reader, abs, &mut sector)?;
-                data.extend_from_slice(&sector);
+                // Read straight into the file buffer: no per-sector staging copy.
+                let at = data.len();
+                data.resize(at + SECTOR_BYTES, 0);
+                read_sector(reader, abs, &mut data[at..])?;
             }
         }
 
@@ -1924,8 +1927,22 @@ pub(crate) struct BufferedSectorReader<'a, S: SectorSource + ?Sized = dyn Sector
     cache: Vec<u8>,
     cache_sectors: u32,
     batch: u16,
-    /// Pre-fetched sector data from bulk reads (sector ranges for AACS, MPLS, CLPI, etc.)
-    prefetched: std::collections::HashMap<u32, Vec<u8>>,
+    /// Pre-fetched sector runs from bulk reads (AACS, MPLS, CLPI, etc.): one contiguous
+    /// buffer per run, sorted by start LBA and disjoint, so a lookup is a binary search
+    /// and the cache costs no per-sector allocation.
+    prefetched: Vec<PrefetchRun>,
+}
+
+/// One prefetched run: `data` holds whole sectors starting at `start`.
+struct PrefetchRun {
+    start: u32,
+    data: Vec<u8>,
+}
+
+impl PrefetchRun {
+    fn sectors(&self) -> u32 {
+        (self.data.len() / SECTOR_BYTES) as u32
+    }
 }
 
 impl<'a, S: SectorSource + ?Sized> BufferedSectorReader<'a, S> {
@@ -1936,7 +1953,7 @@ impl<'a, S: SectorSource + ?Sized> BufferedSectorReader<'a, S> {
             cache: Vec::new(),
             cache_sectors: 0,
             batch,
-            prefetched: std::collections::HashMap::new(),
+            prefetched: Vec::new(),
         }
     }
 
@@ -1991,53 +2008,102 @@ impl<S: SectorSource + ?Sized> BufferedSectorReader<'_, S> {
         Ok(())
     }
 
-    /// Pre-read multiple sector ranges into the permanent per-sector HashMap cache
-    /// (bulk-loads AACS/MPLS/CLPI/META before scanning), capped at MAX_PREFETCH_SECTORS
-    /// to bound RAM against a crafted UDF. A Stop ends it with `Halted` between (or within)
-    /// ranges; any other failed batch skips the rest of that range.
+    /// Pre-read multiple sector ranges into the permanent prefetch cache (bulk-loads
+    /// AACS/MPLS/CLPI/META before scanning), capped at MAX_PREFETCH_SECTORS to bound RAM
+    /// against a crafted UDF. Each range is read straight into one contiguous run. A Stop
+    /// ends it with `Halted` between (or within) ranges; any other failed batch skips the
+    /// rest of that range.
     pub(crate) fn prefetch_ranges(&mut self, ranges: &[(u32, u32)]) -> crate::error::Result<()> {
         // 2048 bytes/sector → 128 Ki sectors ≈ 256 MiB of permanent cache.
         const MAX_PREFETCH_SECTORS: u64 = 128 * 1024;
-        let mut tmp = vec![0u8; self.batch as usize * SECTOR_BYTES];
         let total: u64 = ranges.iter().map(|&(_, c)| c as u64).sum();
-        let mut cached: u64 = 0;
+        let mut cached: u64 = self.prefetched.iter().map(|r| r.sectors() as u64).sum();
         let mut done: u64 = 0;
         let mut hb = crate::progress::Heartbeat::new("udf_prefetch");
-        for &(start, count) in ranges {
+        let mut result = Ok(());
+        'ranges: for &(start, count) in ranges {
             // Clamp to u32 LBA space: unconstrained Uint32 ADs left `start + count`
             // unbounded, so a range near the top overflowed `start + offset` below
             // (debug panic; release wrap seeded the permanent cache at low LBAs).
             let count = count.min(u32::MAX - start);
+            let room = MAX_PREFETCH_SECTORS
+                .saturating_sub(cached)
+                .min(count as u64);
+            let mut data = Vec::with_capacity(room as usize * SECTOR_BYTES);
             let mut offset = 0u32;
             while offset < count {
+                if cached >= MAX_PREFETCH_SECTORS {
+                    // Cache cap hit: later LBAs are still served by the sliding window.
+                    self.push_run(start, data);
+                    break 'ranges;
+                }
                 hb.tick(done, total);
-                let batch = (count - offset).min(self.batch as u32) as u16;
-                let bytes = batch as usize * SECTOR_BYTES;
-                match self
-                    .inner
-                    .read_sectors(start + offset, batch, &mut tmp[..bytes], true)
+                let batch = (count - offset)
+                    .min(self.batch as u32)
+                    .min((MAX_PREFETCH_SECTORS - cached) as u32) as u16;
+                let at = data.len();
+                data.resize(at + batch as usize * SECTOR_BYTES, 0);
+                if let Err(e) =
+                    self.inner
+                        .read_sectors(start + offset, batch, &mut data[at..], true)
                 {
-                    Ok(_) => {}
-                    Err(crate::error::Error::Halted) => return Err(crate::error::Error::Halted),
-                    Err(_) => break,
-                }
-                for i in 0..batch as u32 {
-                    if cached >= MAX_PREFETCH_SECTORS {
-                        // Cache cap hit: stop seeding the permanent HashMap.
-                        // Remaining LBAs are still served by the sliding-window
-                        // read path below, just without the bulk pre-load.
-                        return Ok(());
+                    data.truncate(at);
+                    if matches!(e, crate::error::Error::Halted) {
+                        self.push_run(start, data);
+                        result = Err(crate::error::Error::Halted);
+                        break 'ranges;
                     }
-                    let s = i as usize * SECTOR_BYTES;
-                    self.prefetched
-                        .insert(start + offset + i, tmp[s..s + SECTOR_BYTES].to_vec());
-                    cached += 1;
+                    break;
                 }
+                cached += batch as u64;
                 offset += batch as u32;
                 done += batch as u64;
             }
+            self.push_run(start, data);
         }
-        Ok(())
+        self.prefetched.sort_unstable_by_key(|r| r.start);
+        self.merge_overlapping_runs();
+        result
+    }
+
+    fn push_run(&mut self, start: u32, mut data: Vec<u8>) {
+        if !data.is_empty() {
+            data.shrink_to_fit();
+            self.prefetched.push(PrefetchRun { start, data });
+        }
+    }
+
+    // Keeps the sorted runs disjoint: an overlapping run adds only its tail past the run
+    // before it. `metadata_sector_ranges_for` already merges, so this is rare.
+    fn merge_overlapping_runs(&mut self) {
+        let runs = std::mem::take(&mut self.prefetched);
+        for run in runs {
+            if let Some(last) = self.prefetched.last_mut() {
+                let last_end = last.start as u64 + last.sectors() as u64;
+                if (run.start as u64) < last_end {
+                    let skip = (last_end - run.start as u64) as usize * SECTOR_BYTES;
+                    if let Some(tail) = run.data.get(skip..) {
+                        last.data.extend_from_slice(tail);
+                    }
+                    continue;
+                }
+            }
+            self.prefetched.push(run);
+        }
+    }
+
+    /// The prefetched bytes of sector `lba`, borrowed from its run.
+    fn prefetched_sector(&self, lba: u32) -> Option<&[u8]> {
+        let idx = self.prefetched.partition_point(|r| r.start <= lba);
+        let run = self.prefetched.get(idx.checked_sub(1)?)?;
+        let off = (lba - run.start) as usize * SECTOR_BYTES;
+        run.data.get(off..off + SECTOR_BYTES)
+    }
+
+    /// Whether sector `lba` is served from the permanent prefetch cache.
+    #[cfg(test)]
+    pub(crate) fn is_prefetched(&self, lba: u32) -> bool {
+        self.prefetched_sector(lba).is_some()
     }
 }
 
@@ -2055,8 +2121,8 @@ impl<S: SectorSource + ?Sized> SectorSource for BufferedSectorReader<'_, S> {
             if buf.len() < SECTOR_BYTES {
                 return Err(crate::error::Error::UdfBufferTooSmall);
             }
-            // Check permanent prefetch cache first (HashMap)
-            if let Some(data) = self.prefetched.get(&lba) {
+            // Check the permanent prefetch cache first.
+            if let Some(data) = self.prefetched_sector(lba) {
                 buf[..SECTOR_BYTES].copy_from_slice(data);
                 return Ok(SECTOR_BYTES);
             }
