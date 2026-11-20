@@ -1679,3 +1679,87 @@ fn every_assembled_descriptor_has_a_valid_tag() {
         "fixture must include a multi-block directory"
     );
 }
+
+// No up-front memset: a buffer full of stale bytes reads back exactly as a zeroed one, so every
+// metadata sector, file tail, in-range gap and past-capacity tail is written by the read.
+#[test]
+fn a_read_writes_every_sector_whatever_the_buffer_held() {
+    let s = Scratch::new("stale");
+    s.file("VIDEO_TS/VIDEO_TS.IFO", &vec![0u8; SECTOR]);
+    s.file("VIDEO_TS/VTS_01_0.IFO", &vts_ifo(SECTOR, 0, 64));
+    s.file("VIDEO_TS/VTS_01_1.VOB", &pattern(9, 3 * SECTOR + 100));
+    let mut img = DirImage::open(s.path()).unwrap();
+    let cap = img.capacity_sectors();
+    let read = |img: &mut DirImage, lba: u32, count: u16, fill: u8| {
+        let mut buf = vec![fill; count as usize * SECTOR];
+        assert_eq!(
+            img.read_sectors(lba, count, &mut buf, false).unwrap(),
+            buf.len()
+        );
+        buf
+    };
+    // The whole image, then a window that runs past capacity.
+    let whole = read(&mut img, 0, cap as u16, 0x00);
+    assert!(read(&mut img, 0, cap as u16, 0xEE) == whole);
+    let tail = read(&mut img, cap - 2, 6, 0xEE);
+    assert!(tail[..2 * SECTOR] == whole[(cap as usize - 2) * SECTOR..]);
+    assert!(
+        tail[2 * SECTOR..].iter().all(|&b| b == 0),
+        "past capacity reads as zeros"
+    );
+    // The VOB's last sector: 100 bytes of the file, then zero padding.
+    let fs = udf::read_filesystem(&mut img).unwrap();
+    let vob = fs
+        .file_start_lba(&mut img, "/VIDEO_TS/VTS_01_1.VOB")
+        .unwrap();
+    let last = read(&mut img, vob + 3, 1, 0xEE);
+    assert_eq!(last[..100], pattern(9, 3 * SECTOR + 100)[3 * SECTOR..]);
+    assert!(
+        last[100..].iter().all(|&b| b == 0),
+        "the file's tail is zero-padded"
+    );
+    // An in-range gap inside the VTS hole.
+    let ifo = fs
+        .file_start_lba(&mut img, "/VIDEO_TS/VTS_01_0.IFO")
+        .unwrap();
+    assert!(read(&mut img, ifo + 10, 2, 0xEE).iter().all(|&b| b == 0));
+}
+
+// A read at the top of the LBA space stops at the wrap and zero-fills what it cannot address.
+#[test]
+fn a_read_that_would_wrap_the_lba_space_zero_fills_its_rest() {
+    let (s, _, _) = bdmv_scratch();
+    let mut img = DirImage::open(s.path()).unwrap();
+    img.total_sectors = u32::MAX;
+    let mut buf = vec![0xEEu8; 4 * SECTOR];
+    assert_eq!(
+        img.read_sectors(u32::MAX - 1, 4, &mut buf, false).unwrap(),
+        buf.len()
+    );
+    assert!(buf.iter().all(|&b| b == 0));
+}
+
+// A stream-sized read of a large file still returns its bytes when it also asks the OS to
+// read ahead the next window.
+#[test]
+fn a_large_read_with_readahead_returns_the_files_bytes() {
+    let s = Scratch::new("readahead");
+    let big = pattern(4, 2 * PREFETCH_MIN_BYTES + 3000);
+    s.file("BDMV/index.bdmv", &pattern(1, 100));
+    s.file("BDMV/PLAYLIST/00000.mpls", &pattern(3, 300));
+    s.file("BDMV/CLIPINF/00000.clpi", &pattern(5, 700));
+    s.file("BDMV/STREAM/00000.m2ts", &big);
+    let mut img = DirImage::open(s.path()).unwrap();
+    let fs = udf::read_filesystem(&mut img).unwrap();
+    let (lba, sectors) = fs
+        .file_extents(&mut img, "/BDMV/STREAM/00000.m2ts")
+        .unwrap()[0];
+    let first = (PREFETCH_MIN_BYTES / SECTOR) as u32 + 1;
+    let mut buf = vec![0xEEu8; sectors as usize * SECTOR];
+    let (head, rest) = buf.split_at_mut(first as usize * SECTOR);
+    img.read_sectors(lba, first as u16, head, false).unwrap();
+    img.read_sectors(lba + first, (sectors - first) as u16, rest, false)
+        .unwrap();
+    assert!(buf[..big.len()] == big[..]);
+    assert!(buf[big.len()..].iter().all(|&b| b == 0));
+}

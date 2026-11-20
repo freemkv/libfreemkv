@@ -11,7 +11,7 @@ mod encode;
 mod layout;
 
 use crate::error::{Error, Result};
-use crate::io::file_sector_source::platform::drop_window;
+use crate::io::file_sector_source::platform::{drop_window, hint_sequential, prefetch};
 use crate::sector::SectorSource;
 use encode::{MetaSectors, SECTOR};
 use std::fs::File;
@@ -22,6 +22,9 @@ use std::path::{Path, PathBuf};
 // thousand files while macOS RLIMIT_NOFILE defaults to 256; reads are
 // overwhelmingly sequential through one file at a time, so a small LRU works.
 const HANDLE_CACHE: usize = 16;
+
+// A read this large is a stream: ask the OS for the next window of the file behind it.
+const PREFETCH_MIN_BYTES: usize = 512 * 1024;
 
 /// One file's bytes at one place in the image.
 #[derive(Debug, Clone)]
@@ -198,6 +201,7 @@ impl DirImage {
                 path: self.files[file].disc_path.clone(),
             });
         }
+        hint_sequential(&f, md.len());
         if self.open.len() >= HANDLE_CACHE {
             self.open.pop();
         }
@@ -205,13 +209,13 @@ impl DirImage {
         Ok(&mut self.open[0].1)
     }
 
-    // Fill `out` (whole sectors) from one data range starting at `lba`. `out`
-    // is pre-zeroed, so a tail sector zero-pads — matching `file_extents`'
-    // div_ceil(2048) (`udf::file_extents`) that every consumer expects.
+    // Fill `out` (whole sectors) from one data range starting at `lba`, zero-padding past the
+    // file's bytes — matching `file_extents`' div_ceil(2048) (`udf::file_extents`).
     fn fill(&mut self, r: &DataRange, lba: u32, out: &mut [u8]) -> Result<()> {
         let within = (lba - r.start_lba) as u64 * SECTOR as u64;
         let want = (r.bytes.saturating_sub(within)).min(out.len() as u64) as usize;
         if want == 0 {
+            out.fill(0);
             return Ok(());
         }
         let at = r.offset + within;
@@ -220,11 +224,17 @@ impl DirImage {
         h.seek(SeekFrom::Start(at)).map_err(Error::from)?;
         let res = h.read_exact(&mut out[..want]);
         if res.is_ok() {
+            out[want..].fill(0);
             // Release the window just read, every time (unlike the ISO source's
             // accumulate-and-drop, which relies on one linear cursor — reads here
             // jump between files, so an accumulated count would leave bytes pinned).
             if let Some((_, fh)) = self.open.iter().find(|(i, _)| *i == file) {
                 drop_window(fh, at, want as u64);
+                let next = at + want as u64;
+                let left = self.files[file].size.saturating_sub(next);
+                if want >= PREFETCH_MIN_BYTES && left > 0 {
+                    prefetch(fh, next, left.min(want as u64));
+                }
             }
         }
         match res {
@@ -267,19 +277,16 @@ impl SectorSource for DirImage {
                 sense: None,
             });
         }
-        // A batch that starts IN range but overshoots the end is fine: this zero-pads
-        // its tail past capacity, which the mux's final batch and the FS scan's
-        // fixed-LBA probes both expect.
-        buf[..need].fill(0);
-        // Walk the request in RUNS, not sector by sector: a mux batch (8192
-        // sectors) almost always lands in one extent, so per-sector seek+read
-        // would cost 8192 syscalls for what is one 16 MiB sequential read.
+        // Walk the request in RUNS (one sequential read per extent, not a seek per sector),
+        // writing each sector once. A batch overshooting the end reads its tail past capacity
+        // as zeros (gaps), which the mux's final batch and the FS scan's probes expect.
         let mut i = 0u32;
         while i < count as u32 {
             // Checked: callers saturate their LBAs, so a crafted IFO can present a
             // request at the top of the address space. Wrapping here would fold
             // `at` to a LOW sector, handing the muxer a different file's bytes.
             let Some(at) = lba.checked_add(i) else {
+                buf[i as usize * SECTOR..need].fill(0);
                 break;
             };
             let off = i as usize * SECTOR;
@@ -299,7 +306,10 @@ impl SectorSource for DirImage {
                 }
                 // A gap between planned extents. Reads as zeros, exactly as an
                 // unrecorded sector of a real image does.
-                None => i += 1,
+                None => {
+                    buf[off..off + SECTOR].fill(0);
+                    i += 1;
+                }
             }
         }
         Ok(need)
