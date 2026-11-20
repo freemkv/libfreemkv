@@ -17,12 +17,15 @@ const MIN_TITLE_SECS: f64 = 30.0;
 // it: one second, about a GOP, where authoring trims an episode at a play-all join.
 const PLAY_ALL_END_SLACK_TICKS: u64 = 45_000;
 
+// A clip's `(start, sectors)` extents, shared by every title naming the clip.
+type Extents = std::sync::Arc<[(u32, u32)]>;
+
 /// Per-scan clip memo: each `.clpi` packet count and each clip's stream extents, keyed by
 /// clip_id, plus the STREAM and STREAM/SSIF directories indexed once by name.
 pub(super) struct ClipMemo<'a> {
     pkts: std::collections::HashMap<String, u32>,
     // (extents, resolved from the .ssif): only clean resolutions are kept.
-    exts: std::collections::HashMap<String, (std::sync::Arc<[(u32, u32)]>, bool)>,
+    exts: std::collections::HashMap<String, (Extents, bool)>,
     stream: udf::FileIndex<'a>,
     ssif: udf::FileIndex<'a>,
     // One shared id per clip: every title naming the clip points at the same string.
@@ -58,7 +61,7 @@ impl<'a> ClipMemo<'a> {
         reader: &mut dyn SectorSource,
         udf_fs: &udf::UdfFs,
         clip_id: &str,
-    ) -> Result<(Option<std::sync::Arc<[(u32, u32)]>>, bool, Option<u16>)> {
+    ) -> Result<(Option<Extents>, bool, Option<u16>)> {
         let candidates = std::iter::once((&self.ssif, "SSIF/", "ssif"))
             .chain(CLIP_STREAM_EXTS.iter().map(|ext| (&self.stream, "", *ext)));
         // ABSENCE is the only benign failure — the fallback exists for it. DiscRead,

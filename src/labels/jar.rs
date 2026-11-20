@@ -489,7 +489,7 @@ pub fn any_jar_has_prefix(reader: &mut dyn SectorSource, udf: &UdfFs, prefix: &s
         reader,
         udf,
         DETECT_IN_MEMORY_JAR_BYTES,
-        &|name| cached.iter().any(|c| *c == name),
+        &|name| cached.contains(&name),
         |name, jar| match jar {
             Some(j) => has_path_prefix(j, prefix).then_some(()),
             None => {
