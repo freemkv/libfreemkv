@@ -1048,6 +1048,7 @@ fn psi_packets(pid: u16, section: &[u8]) -> Vec<Vec<u8>> {
     p0[1..1 + head_len].copy_from_slice(&section[..head_len]);
     pkts.push(bdts_packet(p0, pid, true));
     let mut pos = head_len;
+    let mut cc = 0u8;
     while pos < section.len() {
         let n = 184.min(section.len() - pos);
         let mut p = [0xFFu8; 184];
