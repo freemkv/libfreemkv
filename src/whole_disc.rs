@@ -12,6 +12,10 @@ use crate::sector::{DecryptingSectorSource, SectorSource};
 pub(crate) const UNIT: u64 =
     (crate::aacs::content::ALIGNED_UNIT_LEN / crate::consts::SECTOR_BYTES) as u64;
 
+/// Largest misaligned-edge scratch a [`UnitAligned`] keeps between reads (a live drive's
+/// widest batch plus a unit); a larger one is freed after its read.
+const SCRATCH_KEEP_BYTES: usize = 2 << 20;
+
 /// Units probed per unplayed content file: its first unit, then evenly across it.
 const PROBES: u64 = 32;
 
@@ -252,6 +256,7 @@ pub struct UnitAligned<S> {
     name_patches: Vec<crate::udf::SectorBytePatch>,
     // Under the decrypted-name policy (`prepare_decrypted_names`), applied or not.
     decrypted_names: bool,
+    // Only for a piece whose read widens past the caller's sectors; whole units go in place.
     scratch: Vec<u8>,
     policy: crate::sector::read_stage::ReadPolicy,
     unit: u64,
@@ -412,19 +417,40 @@ impl<S: SectorSource> SectorSource for UnitAligned<S> {
                     .min(a0 + (u16::MAX as u64 / self.unit - 1) * self.unit);
                 let a1 = e.min(a0 + (piece_end - a0).div_ceil(self.unit) * self.unit);
                 let len = (a1 - a0) as usize * crate::consts::SECTOR_BYTES;
-                self.scratch.resize(len, 0);
-                self.inner.set_unit_base(a0 as u32);
-                let got = self.inner.read_sectors_fua(
-                    a0 as u32,
-                    (a1 - a0) as u16,
-                    &mut self.scratch[..len],
-                    recovery,
-                    fua,
-                )?;
-                let skip = (cur - a0) as usize * crate::consts::SECTOR_BYTES;
                 let want = (piece_end - cur) as usize * crate::consts::SECTOR_BYTES;
-                let have = got.saturating_sub(skip).min(want);
-                buf[off..off + have].copy_from_slice(&self.scratch[skip..skip + have]);
+                self.inner.set_unit_base(a0 as u32);
+                let have = if a0 == cur && a1 == piece_end {
+                    // Already whole units: read in place, no copy.
+                    let dst = &mut buf[off..off + len];
+                    let got = self.inner.read_sectors_fua(
+                        a0 as u32,
+                        (a1 - a0) as u16,
+                        dst,
+                        recovery,
+                        fua,
+                    )?;
+                    got.min(want)
+                } else {
+                    self.scratch.resize(len, 0);
+                    let got = self.inner.read_sectors_fua(
+                        a0 as u32,
+                        (a1 - a0) as u16,
+                        &mut self.scratch[..len],
+                        recovery,
+                        fua,
+                    );
+                    let skip = (cur - a0) as usize * crate::consts::SECTOR_BYTES;
+                    let have = got
+                        .as_ref()
+                        .map_or(0, |&g| g.saturating_sub(skip).min(want));
+                    buf[off..off + have].copy_from_slice(&self.scratch[skip..skip + have]);
+                    // Only misaligned edges come here; a large one is not kept for the reader's life.
+                    if self.scratch.capacity() > SCRATCH_KEEP_BYTES {
+                        self.scratch = Vec::new();
+                    }
+                    got?;
+                    have
+                };
                 if have < want {
                     return Ok(off + have);
                 }

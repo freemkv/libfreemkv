@@ -423,3 +423,83 @@ fn push_extent_does_not_overflow_count() {
     push_extent(&mut e, 20, 0);
     assert_eq!(e, vec![(10, 10)]);
 }
+
+// A piece already on the unit grid goes straight into the caller's buffer: same reads,
+// same bytes, and no scratch is ever allocated.
+#[test]
+fn unit_aligned_reads_whole_units_in_place() {
+    let mut r = reader(vec![(100, 30, 100)]);
+    let mut buf = vec![0u8; 12 * 2048];
+    assert_eq!(r.read_sectors(100, 12, &mut buf, false).unwrap(), buf.len());
+    let got: Vec<u8> = buf.chunks(2048).map(|c| c[0]).collect();
+    assert_eq!(got, (100..112).collect::<Vec<u8>>());
+    assert_eq!(r.inner.reads, vec![(100, 12)]);
+    // A read ending at the span's end is whole units too, though not a unit multiple.
+    let mut r = reader(vec![(100, 4, 100)]);
+    let mut buf = vec![0u8; 4 * 2048];
+    assert_eq!(r.read_sectors(100, 4, &mut buf, false).unwrap(), buf.len());
+    assert_eq!(r.inner.reads, vec![(100, 4)]);
+    assert_eq!(r.scratch.capacity(), 0, "no copy for whole units");
+}
+
+// Plain head, then an in-place piece cut short: the byte count spans both pieces.
+#[test]
+fn unit_aligned_in_place_short_read_counts_from_the_piece_offset() {
+    let mut r = reader(vec![(100, 30, 100)]);
+    r.inner.short = Some(2 * 2048);
+    let mut buf = vec![0u8; 5 * 2048];
+    assert_eq!(r.read_sectors(98, 5, &mut buf, false).unwrap(), 4 * 2048);
+    let got: Vec<u8> = buf.chunks(2048).map(|c| c[0]).collect();
+    assert_eq!(got, vec![98, 99, 100, 101, 0]);
+    assert_eq!(r.inner.reads, vec![(98, 2), (100, 3)]);
+}
+
+#[test]
+fn unit_aligned_in_place_read_propagates_inner_errors() {
+    let mut r = reader(vec![(100, 30, 100)]);
+    r.inner.fail = Some(|| Error::Halted);
+    let mut buf = vec![0u8; 3 * 2048];
+    assert!(matches!(
+        r.read_sectors(100, 3, &mut buf, false),
+        Err(Error::Halted)
+    ));
+    assert_eq!(r.inner.reads, vec![(100, 3)]);
+}
+
+// A widened tail (or head) still reads through the scratch, and a big one is let go.
+#[test]
+fn unit_aligned_widened_edges_copy_and_release_a_large_scratch() {
+    let mut r = reader(vec![(100, 30, 100)]);
+    let mut buf = vec![0u8; 4 * 2048];
+    assert_eq!(r.read_sectors(100, 4, &mut buf, false).unwrap(), buf.len());
+    assert_eq!(r.inner.reads, vec![(100, 6)]);
+    let got: Vec<u8> = buf.chunks(2048).map(|c| c[0]).collect();
+    assert_eq!(got, vec![100, 101, 102, 103]);
+    assert!(
+        r.scratch.capacity() >= 6 * 2048,
+        "a small edge scratch is kept"
+    );
+    let mut r = reader(vec![(0, 70_000, 0)]);
+    let mut big = vec![0u8; 2000 * 2048];
+    assert_eq!(r.read_sectors(1, 2000, &mut big, false).unwrap(), big.len());
+    assert!(
+        big.chunks(2048)
+            .enumerate()
+            .all(|(i, c)| c[0] == (1 + i) as u8)
+    );
+    assert_eq!(r.scratch.capacity(), 0, "a large edge scratch is freed");
+}
+
+// A failing widened read still frees a large scratch and copies nothing.
+#[test]
+fn unit_aligned_widened_read_error_releases_the_scratch() {
+    let mut r = reader(vec![(0, 70_000, 0)]);
+    r.inner.fail = Some(|| Error::Halted);
+    let mut big = vec![7u8; 2000 * 2048];
+    assert!(matches!(
+        r.read_sectors(1, 2000, &mut big, false),
+        Err(Error::Halted)
+    ));
+    assert!(big.iter().all(|&b| b == 7));
+    assert_eq!(r.scratch.capacity(), 0);
+}
