@@ -648,7 +648,7 @@ fn resolve_one_unit(
         None => None,
         Some(l) => Some(resolve_forensic(sampler, l, seed, run, ev.container)?),
     };
-    build(&mut inner, &ps, layout, forensic, run, clip);
+    build(&mut inner, ps, layout, forensic, run, clip);
     Ok(Some(inner))
 }
 
@@ -692,7 +692,7 @@ fn resolve_per_unit(
         tracing::info!(target: "freemkv::keys", pieces = ps.len(), "content and forensic segments in the clear: no key source asked");
         let mut inner = aacs_inner(run);
         inner.no_stream_files = ev.no_stream_files;
-        build(&mut inner, &ps, None, None, run, Vec::new());
+        build(&mut inner, ps, None, None, run, Vec::new());
         return Ok(Some(inner));
     }
     let opened = |run: &Run, p: &Probed| -> Option<usize> {
@@ -850,7 +850,7 @@ fn resolve_per_unit(
         None => None,
         Some(l) => Some(resolve_forensic(sampler, l, seed, run, ev.container)?),
     };
-    build(&mut inner, &ps, layout, forensic, run, clip);
+    build(&mut inner, ps, layout, forensic, run, clip);
     Ok(Some(inner))
 }
 
@@ -889,7 +889,7 @@ fn decide(
             .collect();
         let mut inner = aacs_inner(run);
         inner.no_stream_files = ev.no_stream_files;
-        build(&mut inner, &ps, None, None, run, Vec::new());
+        build(&mut inner, ps, None, None, run, Vec::new());
         return Ok(inner);
     }
     if ev.container.aacs_per_pack() {
@@ -1227,7 +1227,7 @@ fn resolve_bd(
         None => None,
         Some(l) => Some(resolve_forensic(sampler, l, seed, run, format)?),
     };
-    build(&mut inner, &ps, layout, forensic, run, clip);
+    build(&mut inner, ps, layout, forensic, run, clip);
     Ok(inner)
 }
 
@@ -1366,7 +1366,7 @@ fn resolve_forensic(
 // Step 14: maps from Keyed pieces (and the forensic ranges); arrival pieces for the rest.
 fn build(
     inner: &mut Inner,
-    ps: &[Probed],
+    ps: Vec<Probed>,
     layout: Option<&super::fmts::Layout>,
     forensic: Option<Forensic>,
     run: &Run,
@@ -1426,7 +1426,8 @@ fn build(
                 }
                 inner.arrival.push(ArrivalPiece {
                     id: p.id(),
-                    spans: p.piece.spans.clone(),
+                    // Moved, not cloned: `ps` is consumed and `inner.spans` copied above.
+                    spans: p.piece.spans,
                     candidate: match p.verdict {
                         Verdict::Lazy(c) => c,
                         _ => None,

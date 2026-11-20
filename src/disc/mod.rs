@@ -2771,6 +2771,14 @@ impl Disc {
             elapsed_ms = scan_with_t0.elapsed().as_millis() as u64,
             "end"
         );
+        // The model lives as long as the session: drop the growth slack of push-built Vecs.
+        titles.shrink_to_fit();
+        for t in &mut titles {
+            t.extents.shrink_to_fit();
+            t.clips.shrink_to_fit();
+            t.streams.shrink_to_fit();
+            t.chapters.shrink_to_fit();
+        }
         let disc = Disc {
             volume_id: udf_fs.volume_id.clone(),
             meta_title,

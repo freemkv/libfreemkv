@@ -422,3 +422,34 @@ fn a_playlist_hint_is_empty_only_without_id_and_filename() {
     assert!(!id.is_empty());
     assert!(!name.is_empty());
 }
+
+// The allocation-free comparisons answer as the lowercasing forms they replaced: language
+// equality across /B and /T codes and case, and codec-hint substring checks.
+#[test]
+fn allocation_free_label_compares_match_the_lowercasing_forms() {
+    let lowered = |a: &str, b: &str| a.eq_ignore_ascii_case(b) || to_iso639_t(a) == to_iso639_t(b);
+    let codes = [
+        "ger", "DEU", "Ger", "fre", "fra", "eng", "ENG", "", "x", "zho", "CHI", "gér",
+    ];
+    for a in codes {
+        for b in codes {
+            assert_eq!(same_language(a, b), lowered(a, b), "{a:?} vs {b:?}");
+        }
+    }
+    for hint in [
+        "Dolby TrueHD Atmos",
+        "DTS:X",
+        "dts-hd MASTER AUDIO",
+        "Écoute dd+",
+        "",
+        "pcm",
+    ] {
+        for needle in ["atmos", "dts:x", "master audio", "dd+", "pcm", "truehd"] {
+            assert_eq!(
+                AsciiFolded(hint).contains(needle),
+                hint.to_ascii_lowercase().contains(needle),
+                "{hint:?} / {needle:?}"
+            );
+        }
+    }
+}

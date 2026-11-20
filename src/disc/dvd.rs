@@ -477,6 +477,7 @@ fn subpicture_label(code_extension: u8) -> (bool, LabelQualifier) {
 // debug. The disc is told apart by its VIDEO_TS.IFO.
 fn warn_multi_pgc_titles(vmg: &[u8], info: &ifo::DvdInfo) {
     use std::hash::{Hash, Hasher};
+    const MAX_WARNED_DISCS: usize = 256;
     static WARNED: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
     let split: Vec<String> = info
         .title_sets
@@ -500,6 +501,10 @@ fn warn_multi_pgc_titles(vmg: &[u8], info: &ifo::DvdInfo) {
         let mut warned = WARNED.lock().unwrap_or_else(|e| e.into_inner());
         let first = !warned.contains(&key);
         if first {
+            // Bounded for a long-running daemon: the oldest disc is forgotten first.
+            if warned.len() >= MAX_WARNED_DISCS {
+                warned.remove(0);
+            }
             warned.push(key);
         }
         first

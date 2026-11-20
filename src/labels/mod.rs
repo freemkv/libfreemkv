@@ -423,36 +423,48 @@ fn languages_compatible(a: &str, b: &str) -> bool {
 
 // ISO 639-2/B -> /T for the twenty languages that differ. MPLS keeps the raw /B code while
 // vendor labels go through vocab::lang (/T).
-fn to_iso639_t(code: &str) -> String {
-    let c = code.to_ascii_lowercase();
-    let t = match c.as_str() {
-        "alb" => "sqi",
-        "arm" => "hye",
-        "baq" => "eus",
-        "bur" => "mya",
-        "chi" => "zho",
-        "cze" => "ces",
-        "dut" => "nld",
-        "fre" => "fra",
-        "geo" => "kat",
-        "ger" => "deu",
-        "gre" => "ell",
-        "ice" => "isl",
-        "mac" => "mkd",
-        "mao" => "mri",
-        "may" => "msa",
-        "per" => "fas",
-        "rum" => "ron",
-        "slo" => "slk",
-        "tib" => "bod",
-        "wel" => "cym",
-        _ => return c,
-    };
-    t.to_string()
+const ISO639_B_TO_T: [(&str, &str); 20] = [
+    ("alb", "sqi"),
+    ("arm", "hye"),
+    ("baq", "eus"),
+    ("bur", "mya"),
+    ("chi", "zho"),
+    ("cze", "ces"),
+    ("dut", "nld"),
+    ("fre", "fra"),
+    ("geo", "kat"),
+    ("ger", "deu"),
+    ("gre", "ell"),
+    ("ice", "isl"),
+    ("mac", "mkd"),
+    ("mao", "mri"),
+    ("may", "msa"),
+    ("per", "fas"),
+    ("rum", "ron"),
+    ("slo", "slk"),
+    ("tib", "bod"),
+    ("wel", "cym"),
+];
+
+// The /T code for a /B `code` (ASCII-case-insensitive), or `None` when the two agree.
+fn iso639_b_to_t(code: &str) -> Option<&'static str> {
+    ISO639_B_TO_T
+        .iter()
+        .find(|(b, _)| b.eq_ignore_ascii_case(code))
+        .map(|&(_, t)| t)
 }
 
+#[cfg(test)]
+fn to_iso639_t(code: &str) -> String {
+    iso639_b_to_t(code).map_or_else(|| code.to_ascii_lowercase(), str::to_string)
+}
+
+// Equal after /B -> /T, ASCII-case-insensitively; allocation-free (runs per slot per title).
 fn same_language(a: &str, b: &str) -> bool {
-    a.eq_ignore_ascii_case(b) || to_iso639_t(a) == to_iso639_t(b)
+    a.eq_ignore_ascii_case(b)
+        || iso639_b_to_t(a)
+            .unwrap_or(a)
+            .eq_ignore_ascii_case(iso639_b_to_t(b).unwrap_or(b))
 }
 
 /// Stricter form of [`languages_compatible`]: both sides actually state a
@@ -484,16 +496,15 @@ fn vendor_extent(labels: &[StreamLabel], stream_type: StreamLabelType) -> usize 
 
 /// The (PID, language) of each stream of `stream_type` in the title, in
 /// STN order — i.e. exactly the sequence `apply_labels` numbers against.
-fn slots_of(title: &DiscTitle, stream_type: StreamLabelType) -> Vec<(u16, &str)> {
+fn slots_of(title: &DiscTitle, stream_type: StreamLabelType) -> impl Iterator<Item = (u16, &str)> {
     title
         .streams
         .iter()
-        .filter_map(|s| match (s, stream_type) {
+        .filter_map(move |s| match (s, stream_type) {
             (Stream::Audio(a), StreamLabelType::Audio) => Some((a.pid, a.language.as_str())),
             (Stream::Subtitle(s), StreamLabelType::Subtitle) => Some((s.pid, s.language.as_str())),
             _ => None,
         })
-        .collect()
 }
 
 // Find the title the label list is actually describing, for one stream type: the title whose
@@ -508,7 +519,7 @@ fn find_anchor(
     // the longest table, then title order (which is duration-descending).
     let mut best: Option<(usize, usize, usize)> = None;
     for (idx, title) in titles.iter().enumerate() {
-        let n = slots_of(title, stream_type).len();
+        let n = slots_of(title, stream_type).count();
         if n < MIN_ANCHOR_STREAMS || n < extent {
             continue;
         }
@@ -531,7 +542,7 @@ fn anchor_score(
     stream_type: StreamLabelType,
 ) -> Option<usize> {
     let mut confirmed = 0usize;
-    for (i, (_, lang)) in slots_of(title, stream_type).iter().enumerate() {
+    for (i, (_, lang)) in slots_of(title, stream_type).enumerate() {
         let Some(l) = label_at(labels, stream_type, (i + 1) as u16) else {
             continue; // slot the vendor list never named
         };
@@ -561,7 +572,7 @@ pub(crate) fn apply_labels(labels: &[StreamLabel], titles: &mut [DiscTitle]) {
         };
         anchors[type_tag(stream_type) as usize] = Some(anchor);
         let title = &titles[anchor];
-        for (i, (pid, _)) in slots_of(title, stream_type).iter().enumerate() {
+        for (i, (pid, _)) in slots_of(title, stream_type).enumerate() {
             let Some(pos) = labels.iter().position(|l| {
                 l.stream_id.is_none()
                     && l.stream_type == stream_type
@@ -573,30 +584,31 @@ pub(crate) fn apply_labels(labels: &[StreamLabel], titles: &mut [DiscTitle]) {
             // `play_items[0]`'s STN table, the only clip these PIDs were seen in.
             // A later clip could reuse the PID for a different stream otherwise.
             if let Some(clip) = title.clips.first() {
-                pid_map.insert((clip.clip_id.as_str(), *pid), pos);
+                pid_map.insert((clip.clip_id.as_str(), pid), pos);
             }
         }
         tracing::info!(
             stream_type = ?stream_type,
             playlist = ?titles[anchor].playlist,
-            slots = slots_of(&titles[anchor], stream_type).len(),
+            slots = slots_of(&titles[anchor], stream_type).count(),
             "label list anchored to a title by its stream-language sequence",
         );
     }
     // The map borrows the titles it was built from; copy it out so the
-    // binding pass can take `&mut`.
-    let pid_map: HashMap<(String, u16), usize> = pid_map
-        .into_iter()
-        .map(|((c, p), v)| ((c.to_string(), p), v))
-        .collect();
+    // binding pass can take `&mut`, grouped by clip so each title looks up its own.
+    let mut pids_by_clip: HashMap<String, HashMap<u16, usize>> = HashMap::new();
+    for ((c, p), v) in pid_map {
+        pids_by_clip.entry(c.to_string()).or_default().insert(p, v);
+    }
+    let no_pids = HashMap::new();
 
     // Labels that name their own stream, indexed by that name. The id was read
     // from the same STN / ProgramInfo table `disc::bluray` built the stream
     // from, so equality here is the same elementary stream by construction.
-    let by_id: HashMap<&StreamId, usize> = labels
+    let by_id: HashMap<(&str, u16), usize> = labels
         .iter()
         .enumerate()
-        .filter_map(|(i, l)| l.stream_id.as_ref().map(|id| (id, i)))
+        .filter_map(|(i, l)| l.stream_id.as_ref().map(|id| ((&*id.clip_id, id.pid), i)))
         .fold(HashMap::new(), |mut m, (id, i)| {
             m.entry(id).or_insert(i);
             m
@@ -605,22 +617,15 @@ pub(crate) fn apply_labels(labels: &[StreamLabel], titles: &mut [DiscTitle]) {
     for (title_idx, title) in titles.iter_mut().enumerate() {
         let mut audio_idx: u16 = 0;
         let mut sub_idx: u16 = 0;
+        let DiscTitle { clips, streams, .. } = title;
         // The clip whose STN table this title's stream list was built from —
         // `disc::bluray` takes the streams from the first play item — so it is
         // the clip half of every id that can match a stream of this title.
-        let clip0 = title
-            .clips
-            .first()
-            .map(|c| c.clip_id.clone())
-            .unwrap_or_default();
+        let clip0: &str = clips.first().map_or("", |c| &*c.clip_id);
 
         // Anchor PID facts for this title: only those recorded against clip0, the
         // clip its stream table came from (a later clip may reuse a PID).
-        let known_pids: HashMap<u16, usize> = pid_map
-            .iter()
-            .filter(|((clip, _), _)| *clip == clip0)
-            .map(|((_, pid), pos)| (*pid, *pos))
-            .collect();
+        let known_pids = pids_by_clip.get(clip0).unwrap_or(&no_pids);
 
         // Resolve one stream to (label, authoritative). Authoritative means the
         // label is known to belong to THIS stream rather than guessed onto it
@@ -636,11 +641,7 @@ pub(crate) fn apply_labels(labels: &[StreamLabel], titles: &mut [DiscTitle]) {
             {
                 return Some((&labels[pos], true));
             }
-            let id = StreamId {
-                clip_id: clip0.clone(),
-                pid,
-            };
-            if let Some(pos) = by_id.get(&id).copied()
+            if let Some(pos) = by_id.get(&(clip0, pid)).copied()
                 && labels[pos].stream_type == stream_type
             {
                 return Some((&labels[pos], true));
@@ -650,7 +651,7 @@ pub(crate) fn apply_labels(labels: &[StreamLabel], titles: &mut [DiscTitle]) {
                 .map(|l| (l, false))
         };
 
-        for stream in &mut title.streams {
+        for stream in streams.iter_mut() {
             match stream {
                 // A dependent extension track holds no vendor slot and keeps its marker label.
                 Stream::Audio(a) if a.is_mp2_extension() => {}
@@ -811,11 +812,23 @@ fn generate_video_label(
     parts.join(" ")
 }
 
+// A string searched ASCII-case-insensitively for lowercase needles, without a lowercased copy.
+struct AsciiFolded<'a>(&'a str);
+
+impl AsciiFolded<'_> {
+    fn contains(&self, needle: &str) -> bool {
+        self.0
+            .as_bytes()
+            .windows(needle.len())
+            .any(|w| w.eq_ignore_ascii_case(needle.as_bytes()))
+    }
+}
+
 // Does codec_hint name a codec consistent with the stream's actual codec (matched by family,
 // e.g. Atmos on TrueHD)? Rejects shuffled-label mis-binds.
 fn codec_hint_consistent(hint: &str, codec: &crate::disc::Codec) -> bool {
     use crate::disc::Codec;
-    let h = hint.to_ascii_lowercase();
+    let h = AsciiFolded(hint);
 
     let says_truehd = h.contains("truehd") || h.contains("true hd");
     let says_ddp = h.contains("ac-3+")
@@ -869,7 +882,7 @@ fn codec_hint_consistent(hint: &str, codec: &crate::disc::Codec) -> bool {
 /// (Atmos / DTS:X)? Such hints are kept verbatim; plain codec/channel hints are
 /// normalized to the stream's own descriptor for uniform styling across tracks.
 fn codec_hint_adds_detail(hint: &str) -> bool {
-    let h = hint.to_ascii_lowercase();
+    let h = AsciiFolded(hint);
     h.contains("atmos") || h.contains("dts:x") || h.contains("dts-x") || h.contains("dtsx")
 }
 
