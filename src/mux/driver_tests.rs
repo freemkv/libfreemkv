@@ -1887,11 +1887,51 @@ fn write_progress_fed_during_header_drain() {
     )
     .expect("K-frame stream muxes cleanly");
     assert!(out.completed);
-    assert_eq!(
-        events.writes.load(Ordering::SeqCst),
-        K as u64,
-        "each of the K buffered header frames must feed BytesWritten on drain"
+    // Rate-limited to 4 Hz: the first drained frame reports at once, a suppressed
+    // increase is reported when the pump ends.
+    let writes = events.writes.load(Ordering::SeqCst);
+    assert!(
+        (1..=K as u64).contains(&writes),
+        "the buffered header frames must feed BytesWritten on drain ({writes})"
     );
+}
+
+// `BytesWritten` is rate-limited: a fast pump of many frames reports a handful of
+// times, not once per frame.
+#[test]
+fn write_progress_is_rate_limited() {
+    const N: usize = 500;
+    struct Count {
+        writes: AtomicU64,
+        last: AtomicU64,
+    }
+    impl crate::event::Events for Count {
+        fn event(&self, e: &Event<'_>) {
+            if let Event::BytesWritten { bytes, .. } = e {
+                self.writes.fetch_add(1, Ordering::SeqCst);
+                self.last.store(*bytes, Ordering::SeqCst);
+            }
+        }
+    }
+    let events = Arc::new(Count {
+        writes: AtomicU64::new(0),
+        last: AtomicU64::new(0),
+    });
+    let out = drive_mux(
+        Box::new(FakeStream::new(1).with_frames(N)),
+        "null://",
+        &crate::ctx::Ctx::new(Halt::new()).with_events(events.clone()),
+        None,
+        None,
+    )
+    .expect("muxes cleanly");
+    assert!(out.completed);
+    let writes = events.writes.load(Ordering::SeqCst);
+    assert!(
+        (1..N as u64 / 4).contains(&writes),
+        "{writes} BytesWritten for {N} frames"
+    );
+    assert!(events.last.load(Ordering::SeqCst) <= out.bytes_written);
 }
 
 // ── Regression C: Session key selection special-cases DVD ───────────────

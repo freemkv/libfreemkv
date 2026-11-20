@@ -480,6 +480,44 @@ impl FlushForwarder<'_> {
     }
 }
 
+// `BytesWritten` for the frame pump: at most one per `FLUSH_PROGRESS_EVERY`, the first
+// at once, and a last one for a suppressed increase when the pump ends.
+struct WriteProgress<'a> {
+    ctx: &'a Ctx,
+    bytes: &'a AtomicU64,
+    total: u64,
+    last_call: Option<std::time::Instant>,
+    owed: bool,
+}
+
+impl WriteProgress<'_> {
+    // A frame went to the sink.
+    fn tick(&mut self) {
+        let now = std::time::Instant::now();
+        match self.last_call {
+            Some(t) if now.duration_since(t) < FLUSH_PROGRESS_EVERY => self.owed = true,
+            _ => {
+                self.last_call = Some(now);
+                self.emit();
+            }
+        }
+    }
+
+    fn last_word(&mut self) {
+        if self.owed {
+            self.emit();
+        }
+    }
+
+    fn emit(&mut self) {
+        self.owed = false;
+        self.ctx.emit(Event::BytesWritten {
+            bytes: self.bytes.load(Ordering::Relaxed),
+            total: self.total,
+        });
+    }
+}
+
 // Whether a finished mux counts as COMPLETED: interrupted, finalize_failed, or halt_cancelled
 // each force `false`. Pure fn so this mapping is unit-tested directly.
 fn mux_run_completed(interrupted: bool, finalize_failed: bool, halt_cancelled: bool) -> bool {
@@ -726,6 +764,13 @@ fn drive_mux(
     // A send refused with no halt and a healthy consumer ran out its deadline.
     let mut send_timed_out = false;
 
+    let mut progress = WriteProgress {
+        ctx,
+        bytes: &bytes,
+        total: total_bytes,
+        last_call: None,
+        owed: false,
+    };
     // Buffered header frames first, in order.
     for frame in buffered {
         if pipe.send_with_halt(frame, halt, deadline).is_err() {
@@ -736,10 +781,7 @@ fn drive_mux(
         // Feed write-side progress during the drain exactly as the steady-state
         // loop below does — the watchdog is fed only from `BytesWritten`,
         // and no `stream.read()` runs here to do it for us.
-        ctx.emit(Event::BytesWritten {
-            bytes: bytes.load(Ordering::Relaxed),
-            total: total_bytes,
-        });
+        progress.tick();
     }
 
     // Then the remainder of the stream.
@@ -760,10 +802,7 @@ fn drive_mux(
                         send_timed_out = !halt.is_cancelled() && !pipe.consumer_failed();
                         break;
                     }
-                    ctx.emit(Event::BytesWritten {
-                        bytes: bytes.load(Ordering::Relaxed),
-                        total: total_bytes,
-                    });
+                    progress.tick();
                 }
                 Ok(None) => break,
                 // A halt landing mid-read is a clean operator stop, not a read
@@ -803,6 +842,8 @@ fn drive_mux(
             }
         }
     }
+
+    progress.last_word();
 
     if !late_aac.is_empty() {
         collect_late_configs(&*stream, &mut late_aac, &late_configs);
