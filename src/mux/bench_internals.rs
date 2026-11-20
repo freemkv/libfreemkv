@@ -128,7 +128,7 @@ impl<W: Write + Seek> MkvWriter<W> {
             color_space: ColorSpace::Bt709,
             display_aspect: None,
             secondary: false,
-            label: String::new(),
+            label: Default::default(),
             measured_cicp: None,
         });
         let audio = Stream::Audio(AudioStream {
@@ -139,7 +139,7 @@ impl<W: Write + Seek> MkvWriter<W> {
             sample_rate: SampleRate::S48,
             secondary: false,
             purpose: LabelPurpose::Normal,
-            label: String::new(),
+            label: Default::default(),
         });
         let mut tracks: Vec<MkvTrack> = [video, audio]
             .iter()
