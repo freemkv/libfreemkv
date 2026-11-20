@@ -63,6 +63,9 @@ test-util = ["rip"]
 # the `keys::public_api_cannot_decrypt_aacs` guard pins its absence by default).
 # Needs the `rip` crypto tree (`aes`).
 keyproof = ["rip"]
+# `bench-internals`: `libfreemkv::mux::__bench`, doc-hidden wrappers that let the
+# criterion benches drive the crate-private demuxer, parsers and MKV muxer. Not API.
+bench-internals = ["rip"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"], optional = true }
@@ -123,7 +126,9 @@ libc = "0.2"
 tempfile = "3"
 # The crate's own `test_util` for its integration tests (`tests/crypto_tests.rs` decrypts
 # through `test_util::decrypt_unit`; the unit decrypt is crate-private, KU §2.2).
-libfreemkv = { path = ".", features = ["test-util"] }
+libfreemkv = { path = ".", features = ["test-util", "bench-internals"] }
+# Mux micro-benches (`benches/mux_*.rs`); no plotting or rayon.
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 
 # Permutation model checker for the `scsi::fd_handoff` atomics — the fd
 # hand-off between a Linux recovery thread and `SgIoTransport::drop`. A normal
@@ -157,6 +162,18 @@ harness = false
 
 [[bench]]
 name = "iso_read_path"
+harness = false
+
+[[bench]]
+name = "mux_ts_demux"
+harness = false
+
+[[bench]]
+name = "mux_mkv_write"
+harness = false
+
+[[bench]]
+name = "mux_audio_framers"
 harness = false
 
 # freemkv-unlock is off crates.io: resolve it from its GIT TAG. Consumers carry

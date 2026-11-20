@@ -10,6 +10,7 @@ use super::hevc::{
     append_length_prefixed_as_annex_b_sized, avcc_to_annex_b, hvcc_to_annex_b, nal_length_size,
 };
 use crate::disc::Codec;
+use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::io::{self, Write};
 
@@ -388,6 +389,28 @@ impl<W: Write> TsMuxer<W> {
         keyframe: bool,
         data: &[u8],
     ) -> io::Result<()> {
+        self.write_frame_data(track, pts_ns, keyframe, Cow::Borrowed(data))
+    }
+
+    /// [`write_frame`](Self::write_frame) for a frame the caller gives up: a frame the
+    /// start-up hold keeps is moved into it instead of copied. Same output.
+    pub(crate) fn write_frame_owned(
+        &mut self,
+        track: usize,
+        pts_ns: i64,
+        keyframe: bool,
+        data: Vec<u8>,
+    ) -> io::Result<()> {
+        self.write_frame_data(track, pts_ns, keyframe, Cow::Owned(data))
+    }
+
+    fn write_frame_data(
+        &mut self,
+        track: usize,
+        pts_ns: i64,
+        keyframe: bool,
+        data: Cow<'_, [u8]>,
+    ) -> io::Result<()> {
         if track >= self.pids.len() {
             return Err(crate::error::Error::MuxTrackRange {
                 track,
@@ -419,13 +442,13 @@ impl<W: Write> TsMuxer<W> {
         // The deriver sees exactly the PTS the header carries (design §2.3 rule 3);
         // dropped frames never reach it (rule 2).
         if is_video {
-            self.push_dts(track, pts_90k as i64, data);
+            self.push_dts(track, pts_90k as i64, &data);
         }
 
         if self.hold.is_empty() && !self.dts_pending() {
-            return self.emit(track, pts_90k, keyframe, data);
+            return self.emit(track, pts_90k, keyframe, &data);
         }
-        self.hold_push(track, pts_90k, keyframe, data);
+        self.hold_push(track, pts_90k, keyframe, data.into_owned());
         if self.dts_pending() && self.hold_over_cap() {
             for d in self.dts.iter_mut().flatten() {
                 d.release_cap();
@@ -460,7 +483,7 @@ impl<W: Write> TsMuxer<W> {
         self.dts.iter().flatten().any(DtsDeriver::pending)
     }
 
-    fn hold_push(&mut self, track: usize, pts_90k: u64, keyframe: bool, data: &[u8]) {
+    fn hold_push(&mut self, track: usize, pts_90k: u64, keyframe: bool, data: Vec<u8>) {
         self.hold_bytes += data.len();
         let (lo, hi) = self.hold_span.unwrap_or((pts_90k, pts_90k));
         self.hold_span = Some((lo.min(pts_90k), hi.max(pts_90k)));
@@ -468,7 +491,7 @@ impl<W: Write> TsMuxer<W> {
             track,
             pts_90k,
             keyframe,
-            data: data.to_vec(),
+            data,
         });
     }
 
@@ -654,50 +677,36 @@ impl<W: Write> TsMuxer<W> {
                 0x10 | cc // payload only
             };
 
-            self.writer.write_all(&tp_extra)?;
-            self.writer.write_all(&ts_header)?;
-
+            // The whole packet is built on the stack and written with one call.
+            let mut pkt = [0xFFu8; 192];
+            pkt[..4].copy_from_slice(&tp_extra);
+            pkt[4..8].copy_from_slice(&ts_header);
             if af_bytes > 0 {
-                static STUFF_FF: [u8; 184] = [0xFF; 184];
-                if want_rai {
-                    // RAI AF: length byte + flags(0x40) + (af_bytes - 2) stuffing.
-                    let af_len_field = (af_bytes - 1) as u8;
-                    self.writer.write_all(&[af_len_field])?;
-                    self.writer.write_all(&[0x40u8])?;
-                    let stuff = af_bytes - 2;
-                    if stuff > 0 {
-                        self.writer.write_all(&STUFF_FF[..stuff])?;
-                    }
-                } else {
-                    // Stuffing-only AF.
-                    // af_bytes == 1: length=0, no flags.
-                    // af_bytes >= 2: length = af_bytes-1, flags=0, rest 0xFF.
-                    if af_bytes == 1 {
-                        self.writer.write_all(&[0u8])?;
-                    } else {
-                        self.writer.write_all(&[(af_bytes - 1) as u8])?;
-                        self.writer.write_all(&[0u8])?;
-                        if af_bytes > 2 {
-                            self.writer.write_all(&STUFF_FF[..af_bytes - 2])?;
-                        }
-                    }
+                // RAI AF: length byte, flags 0x40, (af_bytes - 2) bytes of 0xFF stuffing.
+                // Stuffing-only AF: af_bytes == 1 is a lone length 0; else flags 0 + 0xFF.
+                pkt[8] = (af_bytes - 1) as u8;
+                if af_bytes >= 2 {
+                    pkt[9] = if want_rai { 0x40 } else { 0x00 };
                 }
             }
+            let mut at = 8 + af_bytes;
 
-            // Write the payload span [offset, offset+payload_len), which may
-            // straddle the header/es_data boundary — emit each side in one
-            // write_all rather than copying the whole frame again.
+            // The payload span [offset, offset+payload_len) may straddle the
+            // header/es_data boundary: each side is copied in turn.
             let end = offset + payload_len;
             let hdr_len = pes_header.len();
             if offset < hdr_len {
-                let hdr_end = end.min(hdr_len);
-                self.writer.write_all(&pes_header[offset..hdr_end])?;
+                let hdr = &pes_header[offset..end.min(hdr_len)];
+                pkt[at..at + hdr.len()].copy_from_slice(hdr);
+                at += hdr.len();
             }
             if end > hdr_len {
-                let es_start = offset.max(hdr_len) - hdr_len;
-                let es_end = end - hdr_len;
-                self.writer.write_all(&es_data[es_start..es_end])?;
+                let es = &es_data[offset.max(hdr_len) - hdr_len..end - hdr_len];
+                pkt[at..at + es.len()].copy_from_slice(es);
+                at += es.len();
             }
+            debug_assert_eq!(at, pkt.len());
+            self.writer.write_all(&pkt)?;
 
             offset += payload_len;
             first = false;

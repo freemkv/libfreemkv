@@ -465,8 +465,7 @@ impl PsDemuxer {
 
     /// Feed raw MPEG-2 PS bytes, returning any completely parsed PES packets.
     pub fn feed(&mut self, data: &[u8]) -> Vec<PsPacket> {
-        self.buffer.extend_from_slice(data);
-        self.extract_packets(false)
+        self.feed_inner(data)
     }
 
     /// Like [`feed`](Self::feed) but records the absolute source byte offset of
@@ -481,8 +480,7 @@ impl PsDemuxer {
             self.buffer_base = base_offset.saturating_sub(self.buffer.len() as u64);
             self.has_base = true;
         }
-        self.buffer.extend_from_slice(data);
-        self.extract_packets(false)
+        self.feed_inner(data)
     }
 
     /// Flush remaining buffered data, returning any final PES packets.
@@ -490,27 +488,68 @@ impl PsDemuxer {
         // At EOF, an unbounded (length 0) PES with no trailing start code is a
         // complete-but-unterminated final packet — emit it rather than dropping the last
         // frame's tail. Length-bounded PES short of its declared size is still discarded.
-        let packets = self.extract_packets(true);
+        let mut packets = Vec::new();
+        self.extract_buffered(true, &mut packets);
         self.buffer.clear();
         // The buffer the cursor indexes into is gone.
         self.pending_scan = None;
         packets
     }
 
-    // Scan the buffer for complete start-code-delimited units and parse them.
-    // When `flushing`, a trailing unbounded PES with no following start code
-    // is emitted using the rest of the buffer as its payload (EOF terminates it).
-    fn extract_packets(&mut self, flushing: bool) -> Vec<PsPacket> {
+    // Parse `data` (the bytes after `buffer`). Units carried in `buffer` are completed by
+    // appending `data` a step at a time; once nothing carried is left, the rest of `data`
+    // is parsed where it lies and only its unconsumed tail is kept. Same units as one buffer.
+    fn feed_inner(&mut self, data: &[u8]) -> Vec<PsPacket> {
         let mut packets = Vec::with_capacity(4);
+        let mut rest = data;
+        while !self.buffer.is_empty() && !rest.is_empty() {
+            // An unbounded PES awaiting its end takes the whole feed, as before, so the
+            // buffer cap that truncates a runaway one sees exactly the same bytes.
+            let take = match self.pending_scan {
+                Some(_) => rest.len(),
+                None => rest.len().min(CARRY_STEP),
+            };
+            self.buffer.extend_from_slice(&rest[..take]);
+            self.extract_buffered(false, &mut packets);
+            let left = self.buffer.len();
+            if left <= take {
+                // Whatever is left came from `data` alone: parse it in place below.
+                rest = &rest[take - left..];
+                self.buffer.clear();
+                break;
+            }
+            rest = &rest[take..];
+        }
+        if !rest.is_empty() {
+            let pos = self.extract_from(rest, false, &mut packets);
+            self.buffer.extend_from_slice(&rest[pos..]);
+            self.settle(pos);
+        }
+        packets
+    }
+
+    // `extract_from` over `buffer`, dropping what it consumed.
+    fn extract_buffered(&mut self, flushing: bool, packets: &mut Vec<PsPacket>) {
+        let buf = std::mem::take(&mut self.buffer);
+        let pos = self.extract_from(&buf, flushing, packets);
+        self.buffer = buf;
+        self.buffer.drain(..pos);
+        self.settle(pos);
+    }
+
+    // Scan `buf` (the logical buffer: `buffer_base` and `pending_scan` refer to it) for
+    // complete start-code-delimited units and parse them; returns the bytes consumed. When
+    // `flushing`, a trailing unbounded PES runs to the end of `buf` (EOF terminates it).
+    fn extract_from(&mut self, buf: &[u8], flushing: bool, packets: &mut Vec<PsPacket>) -> usize {
         let mut pos = 0;
 
-        while let Some(sc) = find_start_code(&self.buffer, pos) {
-            if sc + 3 >= self.buffer.len() {
+        while let Some(sc) = find_start_code(buf, pos) {
+            if sc + 3 >= buf.len() {
                 // Not enough bytes to read the start code ID.
                 break;
             }
 
-            let code = self.buffer[sc + 3];
+            let code = buf[sc + 3];
 
             match code {
                 PROGRAM_END_ID => {
@@ -518,25 +557,25 @@ impl PsDemuxer {
                     pos = sc + 4;
                 }
                 PACK_HEADER_ID => {
-                    if sc + 5 > self.buffer.len() {
+                    if sc + 5 > buf.len() {
                         break; // wait for the marker byte
                     }
                     // The byte after 0x000001BA picks the layout per pack (design §4 step 1):
                     // '01' is an H.222.0 pack (MS-2), '0010' an 11172-1 pack of 12 bytes with
                     // no stuffing field; anything else is a lost sync, resynced below.
-                    let marker = self.buffer[sc + 4];
+                    let marker = buf[sc + 4];
                     let pack_len = if marker >> 6 == 0b01 {
-                        if sc + 14 > self.buffer.len() {
+                        if sc + 14 > buf.len() {
                             break; // wait for more data
                         }
-                        14 + (self.buffer[sc + 13] & 0x07) as usize
+                        14 + (buf[sc + 13] & 0x07) as usize
                     } else if marker >> 4 == 0b0010 {
                         12
                     } else {
                         pos = sc + 4;
                         continue;
                     };
-                    if sc + pack_len > self.buffer.len() {
+                    if sc + pack_len > buf.len() {
                         break;
                     }
                     self.mpeg1 = pack_len == 12;
@@ -544,38 +583,36 @@ impl PsDemuxer {
                 }
                 PROGRAM_STREAM_MAP_ID => {
                     // The map is length-prefixed (MS-8); kept once, never parsed as packets.
-                    if sc + 6 > self.buffer.len() {
+                    if sc + 6 > buf.len() {
                         break;
                     }
-                    let len = ((self.buffer[sc + 4] as usize) << 8) | self.buffer[sc + 5] as usize;
-                    if sc + 6 + len > self.buffer.len() {
+                    let len = ((buf[sc + 4] as usize) << 8) | buf[sc + 5] as usize;
+                    if sc + 6 + len > buf.len() {
                         break;
                     }
                     if self.psm.is_none() {
-                        self.psm = Some(self.buffer[sc..sc + 6 + len].to_vec());
+                        self.psm = Some(buf[sc..sc + 6 + len].to_vec());
                     }
                     pos = sc + 6 + len;
                 }
                 SYSTEM_HEADER_ID => {
                     // System header: 00 00 01 BB [length:2] ...
-                    if sc + 6 > self.buffer.len() {
+                    if sc + 6 > buf.len() {
                         break;
                     }
-                    let header_len =
-                        ((self.buffer[sc + 4] as usize) << 8) | self.buffer[sc + 5] as usize;
+                    let header_len = ((buf[sc + 4] as usize) << 8) | buf[sc + 5] as usize;
                     let total = 6 + header_len;
-                    if sc + total > self.buffer.len() {
+                    if sc + total > buf.len() {
                         break;
                     }
                     pos = sc + total;
                 }
                 id if is_pes_stream_id(id) => {
                     // PES packet: 00 00 01 [stream_id] [length:2] ...
-                    if sc + 6 > self.buffer.len() {
+                    if sc + 6 > buf.len() {
                         break;
                     }
-                    let pes_packet_len =
-                        ((self.buffer[sc + 4] as usize) << 8) | self.buffer[sc + 5] as usize;
+                    let pes_packet_len = ((buf[sc + 4] as usize) << 8) | buf[sc + 5] as usize;
 
                     // Length 0 means unbounded (video): the packet runs to the next PS-LAYER
                     // boundary (pack / system header / program end / next PES), NOT the next
@@ -588,7 +625,7 @@ impl PsDemuxer {
                             Some((pes_at, searched_to)) if pes_at == sc => searched_to,
                             _ => sc + 4,
                         };
-                        let (found, searched_to) = find_ps_boundary(&self.buffer, from);
+                        let (found, searched_to) = find_ps_boundary(buf, from);
                         #[cfg(test)]
                         {
                             self.boundary_bytes_scanned += searched_to.saturating_sub(from) as u64;
@@ -602,20 +639,20 @@ impl PsDemuxer {
                             // payload — emit it.
                             None if flushing => {
                                 self.pending_scan = None;
-                                self.buffer.len()
+                                buf.len()
                             }
                             None => {
                                 // No boundary buffered yet — normally wait for more data, but
                                 // a corrupt unbounded PES could stream endless non-boundary
                                 // bytes; cap the buffer to stop unbounded alloc, then flush.
-                                if self.buffer.len() - sc > MAX_PS_BUFFER {
+                                if buf.len() - sc > MAX_PS_BUFFER {
                                     tracing::warn!(
                                         target: "mux",
                                         stream_id = id,
                                         "ps: unbounded PES passed the buffer cap; emitted truncated"
                                     );
                                     self.pending_scan = None;
-                                    self.buffer.len()
+                                    buf.len()
                                 } else {
                                     self.pending_scan = Some((sc, searched_to));
                                     break; // wait for more data
@@ -624,21 +661,20 @@ impl PsDemuxer {
                         }
                     } else {
                         let e = sc + 6 + pes_packet_len;
-                        if e > self.buffer.len() {
+                        if e > buf.len() {
                             break; // wait for more data
                         }
                         e
                     };
 
                     let parsed = if self.mpeg1 {
-                        parse_mpeg1_packet(&self.buffer[sc..end])
+                        parse_mpeg1_packet(&buf[sc..end])
                     } else {
-                        parse_pes_packet(&self.buffer[sc..end])
+                        parse_pes_packet(&buf[sc..end])
                     };
                     if let Some(mut pkt) = parsed {
                         if self.has_base {
-                            pkt.source =
-                                Some(crate::pes::SourcePos::at_byte(self.buffer_base + sc as u64));
+                            pkt.source = Some(crate::pes::SourcePos::at_byte(buf_base + sc as u64));
                         }
                         packets.push(pkt);
                     }
@@ -651,8 +687,12 @@ impl PsDemuxer {
             }
         }
 
+        pos
+    }
+
+    // `pos` bytes of the logical buffer were consumed and `buffer` now holds the rest.
+    fn settle(&mut self, pos: usize) {
         if pos > 0 {
-            self.buffer.drain(..pos);
             // Advance the absolute base past the drained bytes so subsequent
             // units stamp from the correct offset.
             if self.has_base {
@@ -681,10 +721,12 @@ impl PsDemuxer {
             // rather than leave a stale offset behind this drain.
             self.pending_scan = None;
         }
-
-        packets
     }
 }
+
+/// Bytes of a feed copied into the carry buffer per step while completing a unit that
+/// straddles the previous feed; once the carried bytes are consumed the rest is parsed in place.
+const CARRY_STEP: usize = 64 * 1024;
 
 /// Bytes retained when the buffer holds no start code: a `00 00 01` prefix can
 /// straddle a feed boundary by at most its first two bytes.

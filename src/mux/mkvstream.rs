@@ -278,6 +278,7 @@ fn read_float_bounded(r: &mut impl Read, size: u64) -> io::Result<f64> {
 }
 
 use crate::disc::*;
+use std::borrow::Cow;
 use std::io::{self, Read};
 
 struct ReadState {
@@ -481,7 +482,7 @@ impl MvcMerge {
     // dependent produces no frame of its own (folds into `BlockAdditional`).
     fn ingest(
         &mut self,
-        frame: &crate::pes::PesFrame,
+        mut frame: crate::pes::PesFrame,
     ) -> Vec<(crate::pes::PesFrame, Option<Vec<u8>>)> {
         let mut out = Vec::new();
         if frame.track == self.dep_stream_idx {
@@ -494,7 +495,7 @@ impl MvcMerge {
                 .iter_mut()
                 .find(|pb| pb.frame.pts == frame.pts && pb.additional.is_none())
             {
-                pb.additional = Some(frame.data.clone());
+                pb.additional = Some(frame.data);
             } else {
                 // Bound the orphan map BEFORE inserting: drop a badly-drifted buffer
                 // but keep THIS just-arrived dependent, whose base frame commonly
@@ -506,29 +507,19 @@ impl MvcMerge {
                 // A duplicate-PTS dependent (e.g. a stale repeat after a stream
                 // discontinuity) displaces the prior one — count it as an orphan
                 // rather than losing it silently.
-                if self
-                    .dep_by_pts
-                    .insert(frame.pts, frame.data.clone())
-                    .is_some()
-                {
+                if self.dep_by_pts.insert(frame.pts, frame.data).is_some() {
                     self.orphan_deps += 1;
                 }
             }
         } else if frame.track == self.base_stream_idx {
             let additional = self.dep_by_pts.remove(&frame.pts);
-            let mut remapped = frame.clone();
-            remapped.track = self.base_track_idx;
-            self.pending_base.push_back(PendingBase {
-                frame: remapped,
-                additional,
-            });
-        } else {
+            frame.track = self.base_track_idx;
+            self.pending_base
+                .push_back(PendingBase { frame, additional });
+        } else if let Some(Some(t)) = self.stream_to_track.get(frame.track) {
             // Audio / subtitle / other video: remap the track index and forward.
-            let mut remapped = frame.clone();
-            if let Some(Some(t)) = self.stream_to_track.get(frame.track) {
-                remapped.track = *t;
-                out.push((remapped, None));
-            }
+            frame.track = *t;
+            out.push((frame, None));
         }
         self.drain_ready(&mut out);
         out
@@ -841,6 +832,40 @@ impl MkvStream {
         Ok(())
     }
 
+    // `PesSink::write` / `write_owned`: an owned frame is moved through the MVC merge and
+    // the pre-activation buffer; a borrowed one is cloned only where it must be kept.
+    fn write_frame(&mut self, frame: Cow<'_, crate::pes::PesFrame>) -> io::Result<()> {
+        if matches!(self.mode, Mode::Read(_)) {
+            return Err(crate::error::Error::StreamReadOnly.into());
+        }
+        if self.excluded.drop_frame(frame.track) {
+            return Ok(());
+        }
+        // Non-3D fast path: emit the frame directly, no clone, no buffering.
+        let Some(mvc) = self.mvc.as_mut() else {
+            return match self.remap.as_ref().map(|r| r.get(frame.track).copied()) {
+                // Left out at create (already warned): nothing to write.
+                Some(Some(None)) => Ok(()),
+                Some(Some(Some(t))) => self.emit(t, frame, None),
+                _ => self.emit(frame.track, frame, None),
+            };
+        };
+        // 3D, but not a base/dependent video frame: remap and emit without a clone.
+        if let Some(mapped) = mvc.passthrough_track(frame.track) {
+            return match mapped {
+                Some(t) => self.emit(t, frame, None),
+                None => Ok(()),
+            };
+        }
+        // Blu-ray 3D: fold the dependent view into the base as BlockAdditional (paired
+        // by PTS) and yield 0+ owned frames, so the `self.mvc` borrow ends before `emit`.
+        let emits = mvc.ingest(frame.into_owned());
+        for (f, additional) in emits {
+            self.emit(f.track, Cow::Owned(f), additional.map(Cow::Owned))?;
+        }
+        Ok(())
+    }
+
     // A frame write that failed mid-cluster leaves the file torn: later writes and
     // finish() must error. A track-range reject writes nothing, so it is not fatal.
     fn fail_on_write_error(&mut self, r: io::Result<()>) -> io::Result<()> {
@@ -852,19 +877,19 @@ impl MkvStream {
         r
     }
 
-    // Emit one frame on muxer track `track` (overrides `frame.track`) with an optional
-    // MVC dependent-view `BlockAdditional`: the first video frame triggers muxer
-    // construction (its coding sets FieldOrder); earlier frames buffer.
+    // Emit one frame on muxer track `track` (overrides `frame.track`) with an optional MVC
+    // `BlockAdditional`: the first video frame builds the muxer (its coding sets FieldOrder);
+    // earlier frames buffer, an owned frame moved in rather than cloned.
     fn emit(
         &mut self,
         track: usize,
-        frame: &crate::pes::PesFrame,
-        additional: Option<&[u8]>,
+        frame: Cow<'_, crate::pes::PesFrame>,
+        additional: Option<Cow<'_, [u8]>>,
     ) -> io::Result<()> {
         match &mut self.mode {
             Mode::Read(_) => return Err(crate::error::Error::StreamReadOnly.into()),
             Mode::Write(WriteMode::Active(m)) => {
-                let r = emit_to_muxer(m, track, frame, additional);
+                let r = emit_to_muxer(m, track, &frame, additional.as_deref());
                 return self.fail_on_write_error(r);
             }
             Mode::Write(WriteMode::Building | WriteMode::Failed) => return Err(muxer_unusable()),
@@ -895,30 +920,31 @@ impl MkvStream {
                 let in_ns = (self.disc_title.clips.first())
                     .filter(|c| c.marks_on_pes_clock)
                     .map(|c| c.in_time as i64 * 1_000_000_000 / 45_000);
+                let coding = frame.coding;
                 if let Mode::Write(WriteMode::Pending(p)) = &mut self.mode {
                     p.set_origin(frame.pts, in_ns);
-                    let mut f = frame.clone();
+                    let mut f = frame.into_owned();
                     f.track = track;
-                    p.buffered.insert(0, (f, additional.map(<[u8]>::to_vec)));
+                    p.buffered.insert(0, (f, additional.map(Cow::into_owned)));
                 }
-                return self.activate(frame.coding, true);
+                return self.activate(coding, true);
             }
             // Pass the trigger frame's coding only when it IS the video frame; a
             // cap-triggered build never saw the video frame, so nothing measured
             // is passed (apply_coding_to_track then logs + leaves UNDETERMINED).
             self.activate(if use_coding { frame.coding } else { None }, use_coding)?;
             if let Mode::Write(WriteMode::Active(m)) = &mut self.mode {
-                let r = emit_to_muxer(m, track, frame, additional);
+                let r = emit_to_muxer(m, track, &frame, additional.as_deref());
                 return self.fail_on_write_error(r);
             }
             Ok(())
         } else {
             if let Mode::Write(WriteMode::Pending(p)) = &mut self.mode {
-                let add = additional.map(|a| a.to_vec());
+                let add = additional.map(Cow::into_owned);
                 p.buffered_bytes = p
                     .buffered_bytes
                     .saturating_add(frame.data.len() + add.as_ref().map_or(0, |a| a.len()));
-                let mut f = frame.clone();
+                let mut f = frame.into_owned();
                 f.track = track;
                 p.buffered.push((f, add));
             }
@@ -1438,36 +1464,11 @@ impl crate::pes::PesSource for MkvStream {
 
 impl crate::pes::PesSink for MkvStream {
     fn write(&mut self, frame: &crate::pes::PesFrame) -> io::Result<()> {
-        if matches!(self.mode, Mode::Read(_)) {
-            return Err(crate::error::Error::StreamReadOnly.into());
-        }
-        if self.excluded.drop_frame(frame.track) {
-            return Ok(());
-        }
-        // Non-3D fast path: emit the frame directly, no clone, no buffering.
-        let Some(mvc) = self.mvc.as_mut() else {
-            return match self.remap.as_ref().map(|r| r.get(frame.track).copied()) {
-                // Left out at create (already warned): nothing to write.
-                Some(Some(None)) => Ok(()),
-                Some(Some(Some(t))) => self.emit(t, frame, None),
-                _ => self.emit(frame.track, frame, None),
-            };
-        };
-        // 3D, but not a base/dependent video frame: remap and emit without a clone.
-        if let Some(mapped) = mvc.passthrough_track(frame.track) {
-            return match mapped {
-                Some(t) => self.emit(t, frame, None),
-                None => Ok(()),
-            };
-        }
-        // Blu-ray 3D: fold the dependent view into the base as BlockAdditional
-        // (paired by PTS) and yield 0+ frames; `ingest` returns owned pairs so the
-        // `self.mvc` borrow is released before `emit`.
-        let emits = mvc.ingest(frame);
-        for (f, additional) in emits {
-            self.emit(f.track, &f, additional.as_deref())?;
-        }
-        Ok(())
+        self.write_frame(Cow::Borrowed(frame))
+    }
+
+    fn write_owned(&mut self, frame: crate::pes::PesFrame) -> io::Result<()> {
+        self.write_frame(Cow::Owned(frame))
     }
 
     fn finish(&mut self) -> io::Result<()> {
@@ -1483,7 +1484,7 @@ impl crate::pes::PesSink for MkvStream {
                 );
             }
             for (f, additional) in tail {
-                self.emit(f.track, &f, additional.as_deref())?;
+                self.emit(f.track, Cow::Owned(f), additional.map(Cow::Owned))?;
             }
         }
         // A title that produced no frames (or only buffered ones) is still

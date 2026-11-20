@@ -116,6 +116,18 @@ pub trait CodecParser: Send {
     /// Some (TrueHD): multiple access units per PES.
     fn parse(&mut self, pes: &PesPacket) -> Vec<Frame>;
 
+    /// [`parse`](Self::parse) for a PES the caller gives up, appending its frames to `out`
+    /// (a list the caller reuses). Parsers whose frame is the PES payload override it to
+    /// move the payload rather than copy it. Same frames as `parse`.
+    fn parse_into(&mut self, pes: PesPacket, out: &mut Vec<Frame>) {
+        out.extend(self.parse(&pes));
+    }
+
+    /// [`flush`](Self::flush), appending to `out`.
+    fn flush_into(&mut self, out: &mut Vec<Frame>) {
+        out.extend(self.flush());
+    }
+
     /// Drain any access unit still buffered after the last PES.
     ///
     /// Parsers that buffer across PES boundaries to assemble a complete
@@ -136,6 +148,13 @@ pub trait CodecParser: Send {
     fn config_changes(&self) -> u64 {
         0
     }
+}
+
+/// `parse` for a parser whose real work is its owned `parse_into`: on a copy of `pes`.
+pub(crate) fn parse_cloned(parser: &mut impl CodecParser, pes: &PesPacket) -> Vec<Frame> {
+    let mut out = Vec::new();
+    parser.parse_into(pes.clone(), &mut out);
+    out
 }
 
 /// Passthrough parser — treats each PES as one frame, no parsing.
@@ -162,19 +181,23 @@ impl PassthroughParser {
 
 impl CodecParser for PassthroughParser {
     fn parse(&mut self, pes: &PesPacket) -> Vec<Frame> {
+        parse_cloned(self, pes)
+    }
+
+    fn parse_into(&mut self, pes: PesPacket, out: &mut Vec<Frame>) {
         let pts_ns = pes.pts.or(pes.dts).map(pts_to_ns).unwrap_or(0);
         // Passthrough emits exactly one frame per PES with no cross-PES buffering,
         // so the PES's discontinuity maps directly onto this frame. (Buffering
         // parsers must instead defer the flag to the next emitted frame.)
-        vec![Frame {
+        out.push(Frame {
             coding: None,
-            source: pesbuf::PesFacts::of(pes).source,
+            source: pesbuf::PesFacts::of(&pes).source,
             pts_ns,
             keyframe: self.keyframe,
             discontinuity: pes.discontinuity,
-            data: pes.data.clone(),
+            data: pes.data,
             duration_ns: None,
-        }]
+        });
     }
 
     fn codec_private(&self) -> Option<Vec<u8>> {

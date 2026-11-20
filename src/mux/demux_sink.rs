@@ -756,7 +756,15 @@ impl DemuxSink {
             let _ = sidecar; // sidecar path is owned by the VobSub writer
             tracks.push(Some(TrackOut {
                 path,
-                w: BufWriter::new(file),
+                // Multi-GB video ES files get 1 MiB writes; audio and subtitles 64 KiB.
+                w: BufWriter::with_capacity(
+                    if kind == TrackKind::Video {
+                        1 << 20
+                    } else {
+                        64 << 10
+                    },
+                    file,
+                ),
                 kind,
                 writer,
                 first_pts_ns: None,

@@ -40,3 +40,44 @@ fn crc16_mlp_residue_property_holds() {
     framed.push((c & 0xFF) as u8);
     assert_eq!(crc16_mlp(&framed), 0);
 }
+
+// The bit-at-a-time register update the tables replace, kept as the reference.
+fn bitwise(poly: u16, data: &[u8]) -> u16 {
+    let mut crc: u16 = 0;
+    for &b in data {
+        crc ^= (b as u16) << 8;
+        for _ in 0..8 {
+            crc = if crc & 0x8000 != 0 {
+                (crc << 1) ^ poly
+            } else {
+                crc << 1
+            };
+        }
+    }
+    crc
+}
+
+// The table-driven CRCs equal the bitwise definition on every length up to 300 bytes
+// of varied data, and on every single byte value.
+#[test]
+fn table_crcs_match_the_bitwise_definition() {
+    let data: Vec<u8> = (0..300u32)
+        .map(|i| (i * 167 + 13) as u8 ^ (i >> 3) as u8)
+        .collect();
+    for n in 0..=data.len() {
+        assert_eq!(
+            crc16_ansi(&data[..n]),
+            bitwise(0x8005, &data[..n]),
+            "ansi {n}"
+        );
+        assert_eq!(
+            crc16_mlp(&data[..n]),
+            bitwise(0x002D, &data[..n]),
+            "mlp {n}"
+        );
+    }
+    for b in 0..=255u8 {
+        assert_eq!(crc16_ansi(&[b, !b]), bitwise(0x8005, &[b, !b]));
+        assert_eq!(crc16_mlp(&[b]), bitwise(0x002D, &[b]));
+    }
+}

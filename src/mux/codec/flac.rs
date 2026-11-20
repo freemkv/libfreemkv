@@ -79,8 +79,12 @@ impl FlacParser {
 
 impl CodecParser for FlacParser {
     fn parse(&mut self, pes: &PesPacket) -> Vec<Frame> {
+        super::parse_cloned(self, pes)
+    }
+
+    fn parse_into(&mut self, pes: PesPacket, out: &mut Vec<Frame>) {
         if pes.data.is_empty() {
-            return Vec::new();
+            return;
         }
         let pts_ns = pes
             .pts
@@ -101,19 +105,19 @@ impl CodecParser for FlacParser {
             };
             let dur = flac_frame_duration_ns(&pes.data).unwrap_or(0);
             self.tally.record_drop(pts_ns, dur, pes.data.len(), reason);
-            return Vec::new();
+            return;
         }
 
         self.tally.record_kept();
-        vec![Frame {
+        out.push(Frame {
             discontinuity: pes.discontinuity,
             coding: None,
-            source: super::pesbuf::PesFacts::of(pes).source,
+            source: super::pesbuf::PesFacts::of(&pes).source,
             pts_ns,
             keyframe: true,
-            data: pes.data.clone(),
+            data: pes.data,
             duration_ns: None,
-        }]
+        });
     }
 
     fn flush(&mut self) -> Vec<Frame> {

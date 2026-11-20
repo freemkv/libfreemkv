@@ -82,15 +82,23 @@ const MAX_BUFFERED_BYTES: usize = 16 * 1024 * 1024;
 /// that carried it.
 pub(crate) struct PesBuf {
     buf: Vec<u8>,
-    /// `(offset of this PES's first byte within `buf`, its facts)`, ascending.
+    /// Read cursor: `buf[..head]` is consumed. `drain` advances it instead of moving the
+    /// rest of the buffer per access unit; the dead prefix is compacted away in bulk.
+    head: usize,
+    /// `(offset of this PES's first byte from the front, its facts)`, ascending.
     /// Offsets are relative to the current front and are rebased on `drain`.
     marks: std::collections::VecDeque<(usize, PesFacts)>,
 }
+
+/// Consumed bytes `PesBuf` lets build up before one compacting move, once they are also
+/// at least half the buffer: each live byte then moves O(1) times, not once per AU.
+const COMPACT_AFTER: usize = 64 * 1024;
 
 impl PesBuf {
     pub(crate) fn with_capacity(n: usize) -> Self {
         Self {
             buf: Vec::with_capacity(n),
+            head: 0,
             marks: std::collections::VecDeque::new(),
         }
     }
@@ -102,7 +110,7 @@ impl PesBuf {
         if pes.data.is_empty() {
             return;
         }
-        self.marks.push_back((self.buf.len(), PesFacts::of(pes)));
+        self.marks.push_back((self.len(), PesFacts::of(pes)));
         self.buf.extend_from_slice(&pes.data);
         self.enforce_cap();
     }
@@ -114,7 +122,7 @@ impl PesBuf {
         if data.is_empty() {
             return;
         }
-        self.marks.push_back((self.buf.len(), facts));
+        self.marks.push_back((self.len(), facts));
         self.buf.extend_from_slice(data);
         self.enforce_cap();
     }
@@ -123,8 +131,8 @@ impl PesBuf {
     /// overflows it. `drain` rebases the marks, so the surviving bytes keep
     /// correct attribution and the mark count stays bounded with the bytes.
     fn enforce_cap(&mut self) {
-        if self.buf.len() > MAX_BUFFERED_BYTES {
-            let overflow = self.buf.len() - MAX_BUFFERED_BYTES;
+        if self.len() > MAX_BUFFERED_BYTES {
+            let overflow = self.len() - MAX_BUFFERED_BYTES;
             self.drain(overflow);
         }
     }
@@ -151,25 +159,32 @@ impl PesBuf {
     }
 
     pub(crate) fn as_slice(&self) -> &[u8] {
-        &self.buf
+        &self.buf[self.head..]
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.buf.len()
+        self.buf.len() - self.head
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.buf.is_empty()
+        self.len() == 0
     }
 
     // Consume `n` bytes from the front, rebasing marks onto the new front. The mark covering
     // the new byte at offset 0 is retained even though its packet started earlier.
     pub(crate) fn drain(&mut self, n: usize) {
-        let n = n.min(self.buf.len());
+        let n = n.min(self.len());
         if n == 0 {
             return;
         }
-        self.buf.drain(..n);
+        self.head += n;
+        if self.head == self.buf.len() {
+            self.buf.clear();
+            self.head = 0;
+        } else if self.head >= COMPACT_AFTER && self.head * 2 >= self.buf.len() {
+            self.buf.drain(..self.head);
+            self.head = 0;
+        }
         let covering = self.facts_at(n);
         self.marks.retain(|&(at, _)| at > n);
         for m in &mut self.marks {
@@ -186,6 +201,7 @@ impl PesBuf {
     #[cfg(test)]
     pub(crate) fn seed(&mut self, data: &[u8]) {
         self.buf.clear();
+        self.head = 0;
         self.marks.clear();
         self.buf.extend_from_slice(data);
     }
@@ -206,7 +222,7 @@ impl PesBuf {
     /// for exercising mark bookkeeping directly.
     #[cfg(test)]
     pub(crate) fn mark_here(&mut self, facts: PesFacts) {
-        self.marks.push_back((self.buf.len(), facts));
+        self.marks.push_back((self.len(), facts));
     }
 
     // The marks, for a scanner resolving facts at several offsets while the
@@ -218,6 +234,7 @@ impl PesBuf {
 
     pub(crate) fn clear(&mut self) {
         self.buf.clear();
+        self.head = 0;
         self.marks.clear();
     }
 }

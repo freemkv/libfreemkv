@@ -480,6 +480,44 @@ impl FlushForwarder<'_> {
     }
 }
 
+// `BytesWritten` for the frame pump: at most one per `FLUSH_PROGRESS_EVERY`, the first
+// at once, and a last one for a suppressed increase when the pump ends.
+struct WriteProgress<'a> {
+    ctx: &'a Ctx,
+    bytes: &'a AtomicU64,
+    total: u64,
+    last_call: Option<std::time::Instant>,
+    owed: bool,
+}
+
+impl WriteProgress<'_> {
+    // A frame went to the sink.
+    fn tick(&mut self) {
+        let now = std::time::Instant::now();
+        match self.last_call {
+            Some(t) if now.duration_since(t) < FLUSH_PROGRESS_EVERY => self.owed = true,
+            _ => {
+                self.last_call = Some(now);
+                self.emit();
+            }
+        }
+    }
+
+    fn last_word(&mut self) {
+        if self.owed {
+            self.emit();
+        }
+    }
+
+    fn emit(&mut self) {
+        self.owed = false;
+        self.ctx.emit(Event::BytesWritten {
+            bytes: self.bytes.load(Ordering::Relaxed),
+            total: self.total,
+        });
+    }
+}
+
 // Whether a finished mux counts as COMPLETED: interrupted, finalize_failed, or halt_cancelled
 // each force `false`. Pure fn so this mapping is unit-tested directly.
 fn mux_run_completed(interrupted: bool, finalize_failed: bool, halt_cancelled: bool) -> bool {
@@ -726,6 +764,13 @@ fn drive_mux(
     // A send refused with no halt and a healthy consumer ran out its deadline.
     let mut send_timed_out = false;
 
+    let mut progress = WriteProgress {
+        ctx,
+        bytes: &bytes,
+        total: total_bytes,
+        last_call: None,
+        owed: false,
+    };
     // Buffered header frames first, in order.
     for frame in buffered {
         if pipe.send_with_halt(frame, halt, deadline).is_err() {
@@ -736,10 +781,7 @@ fn drive_mux(
         // Feed write-side progress during the drain exactly as the steady-state
         // loop below does — the watchdog is fed only from `BytesWritten`,
         // and no `stream.read()` runs here to do it for us.
-        ctx.emit(Event::BytesWritten {
-            bytes: bytes.load(Ordering::Relaxed),
-            total: total_bytes,
-        });
+        progress.tick();
     }
 
     // Then the remainder of the stream.
@@ -760,10 +802,7 @@ fn drive_mux(
                         send_timed_out = !halt.is_cancelled() && !pipe.consumer_failed();
                         break;
                     }
-                    ctx.emit(Event::BytesWritten {
-                        bytes: bytes.load(Ordering::Relaxed),
-                        total: total_bytes,
-                    });
+                    progress.tick();
                 }
                 Ok(None) => break,
                 // A halt landing mid-read is a clean operator stop, not a read
@@ -803,6 +842,8 @@ fn drive_mux(
             }
         }
     }
+
+    progress.last_word();
 
     if !late_aac.is_empty() {
         collect_late_configs(&*stream, &mut late_aac, &late_configs);
@@ -872,11 +913,20 @@ fn drive_mux(
     })
 }
 
-// Late `(track, codec_private)` pairs from the reader, drained by the sink.
-type LateConfigs = Arc<std::sync::Mutex<Vec<(usize, Vec<u8>)>>>;
+// Late `(track, codec_private)` pairs from the reader, drained by the sink. `queued` lets
+// the sink skip the lock on every frame that finds nothing queued, which is almost all.
+#[derive(Default)]
+struct LateQueue {
+    queued: AtomicBool,
+    configs: std::sync::Mutex<Vec<(usize, Vec<u8>)>>,
+}
 
-fn lock_late(q: &LateConfigs) -> std::sync::MutexGuard<'_, Vec<(usize, Vec<u8>)>> {
-    q.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+type LateConfigs = Arc<LateQueue>;
+
+fn lock_late(q: &LateQueue) -> std::sync::MutexGuard<'_, Vec<(usize, Vec<u8>)>> {
+    q.configs
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 // Move tracks whose codec_private has now resolved from `pending` to the queue.
@@ -884,6 +934,7 @@ fn collect_late_configs(stream: &dyn PesSource, pending: &mut Vec<usize>, out: &
     pending.retain(|&track| match stream.codec_private(track) {
         Some(cp) => {
             lock_late(out).push((track, cp));
+            out.queued.store(true, Ordering::Release);
             false
         }
         None => true,
@@ -925,7 +976,7 @@ fn complete_truehd(
                 continue;
             }
             buf.extend_from_slice(&f.data);
-            let has_sync = f.data.windows(4).any(|w| w == [0xF8, 0x72, 0x6F, 0xBA]);
+            let has_sync = memchr::memmem::find(&f.data, &[0xF8, 0x72, 0x6F, 0xBA]).is_some();
             if let (true, Track::Audio(a)) = (has_sync, &mut streams[f.track])
                 && crate::disc::correct_truehd_stream(a, buf)
             {
@@ -1011,6 +1062,9 @@ impl WriteSink {
     }
 
     fn apply_late_configs(&mut self) -> Result<(), Error> {
+        if !self.late_configs.queued.swap(false, Ordering::Acquire) {
+            return Ok(());
+        }
         let late = std::mem::take(&mut *lock_late(&self.late_configs));
         for (track, cp) in late {
             if !self
@@ -1031,7 +1085,7 @@ impl Sink<PesFrame> for WriteSink {
 
     fn apply(&mut self, frame: PesFrame) -> Result<Flow, Error> {
         self.apply_late_configs()?;
-        self.output.write(&frame).map_err(Error::from)?;
+        self.output.write_owned(frame).map_err(Error::from)?;
         self.bytes
             .store(self.output.bytes_written(), Ordering::Relaxed);
         Ok(Flow::Continue)

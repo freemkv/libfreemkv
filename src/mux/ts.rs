@@ -18,7 +18,7 @@ const SYNC_BYTE: u8 = 0x47;
 const NULL_PID: u16 = 0x1FFF;
 
 /// A reassembled PES packet with timestamp info.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PesPacket {
     /// MPEG-TS PID this packet belongs to.
     pub pid: u16,
@@ -52,6 +52,8 @@ struct PesAssembler {
     /// declares.
     cap: usize,
     buffer: Vec<u8>,
+    /// Decaying peak of this PID's completed PES sizes, for the next buffer's capacity.
+    peak_len: usize,
     pts: Option<i64>,
     dts: Option<i64>,
     active: bool,
@@ -77,7 +79,7 @@ struct PesAssembler {
     /// PUSI bit and payload of that packet: a same-CC packet is a duplicate (h222 2.4.3.3)
     /// only if it repeats them; otherwise it is new data after a gap (e.g. a clip join).
     last_pusi: bool,
-    last_payload: Vec<u8>,
+    last_payload: LastPayload,
     /// Absolute source byte offset of the in-progress PES's first byte (the
     /// PUSI packet that began it), or `None` when no source base is threaded.
     /// Stamped at PES start, emitted on the completed packet — provenance is
@@ -95,6 +97,10 @@ struct PesAssembler {
 // video PES grows via Vec doubling, hitting allocator slab caches instead of
 // the 64-page first-touch faults the old with_capacity(256 KiB) caused per PES.
 const PES_BUFFER_INIT_CAP: usize = 16 * 1024;
+// Floor and ceiling of the per-PID size hint (`PesAssembler::next_capacity`). A PES past
+// the ceiling (a large UHD I-frame) still grows by doubling from it.
+const PES_BUFFER_MIN_CAP: usize = 1024;
+const PES_BUFFER_HINT_MAX: usize = 8 * 1024 * 1024;
 
 // Hard cap on a single PID's PES buffer: an HEVC/UHD AU is ~1-3 MiB, so 64 MiB
 // is a wide margin. Guards against a corrupt/crafted stream that never sends a
@@ -113,6 +119,7 @@ impl PesAssembler {
             pid,
             cap,
             buffer: Vec::with_capacity(PES_BUFFER_INIT_CAP),
+            peak_len: 0,
             pts: None,
             dts: None,
             active: false,
@@ -120,7 +127,7 @@ impl PesAssembler {
             head: Vec::new(),
             last_cc: None,
             last_pusi: false,
-            last_payload: Vec::new(),
+            last_payload: LastPayload::None,
             pes_source: None,
             pending_discontinuity: false,
         }
@@ -138,11 +145,12 @@ impl PesAssembler {
         let completed = if self.active && !self.buffer.is_empty() {
             let discontinuity = self.pending_discontinuity;
             self.pending_discontinuity = false;
+            let next = Vec::with_capacity(self.next_capacity(self.buffer.len()));
             Some(PesPacket {
                 pid: self.pid,
                 pts: self.pts,
                 dts: self.dts,
-                data: std::mem::replace(&mut self.buffer, Vec::with_capacity(PES_BUFFER_INIT_CAP)),
+                data: std::mem::replace(&mut self.buffer, next),
                 source: self.pes_source,
                 discontinuity,
             })
@@ -155,6 +163,17 @@ impl PesAssembler {
         self.active = true;
         self.pes_source = source;
         completed
+    }
+
+    // Capacity for this PID's next PES: 5/4 of a slowly decaying peak of its recent PES
+    // sizes, so a video AU fits its first allocation (no doubling copies) while an audio
+    // or subtitle PID allocates near its own size. Bounded by the PID's cap.
+    fn next_capacity(&mut self, len: usize) -> usize {
+        self.peak_len = len.max(self.peak_len - self.peak_len / 8);
+        let limit = self.cap.min(PES_BUFFER_HINT_MAX);
+        (self.peak_len + self.peak_len / 4)
+            .max(PES_BUFFER_MIN_CAP)
+            .min(limit)
     }
 
     // Append payload data. If the buffer would exceed this PID's `cap` (its share of
@@ -232,6 +251,43 @@ impl PesAssembler {
             })
         } else {
             None
+        }
+    }
+}
+
+/// The previous payload-bearing packet's payload on one PID, kept for duplicate detection.
+/// While its feed buffer is live it is only a reference into that buffer (no per-packet
+/// copy); `TsDemuxer::own_last_payloads` copies it out once, when the feed call ends.
+#[derive(Clone, Copy)]
+enum LastPayload {
+    None,
+    /// `len` bytes at `off` in the current feed buffer.
+    InFeed {
+        off: usize,
+        len: u8,
+    },
+    /// Copied out of a feed that has ended, or from the stack-built boundary packet.
+    Owned {
+        buf: [u8; 184],
+        len: u8,
+    },
+}
+
+impl LastPayload {
+    fn owned(payload: &[u8]) -> Self {
+        let mut buf = [0u8; 184];
+        buf[..payload.len()].copy_from_slice(payload);
+        Self::Owned {
+            buf,
+            len: payload.len() as u8,
+        }
+    }
+
+    fn matches(&self, feed: &[u8], payload: &[u8]) -> bool {
+        match *self {
+            Self::None => false,
+            Self::InFeed { off, len } => feed[off..off + len as usize] == *payload,
+            Self::Owned { ref buf, len } => buf[..len as usize] == *payload,
         }
     }
 }
@@ -349,7 +405,7 @@ impl TsDemuxer {
             let src = self.has_base.then(|| {
                 crate::pes::SourcePos::at_byte(self.feed_base.saturating_sub(rem_len as u64))
             });
-            self.process_packet(&boundary, src, &mut completed);
+            self.process_packet(&boundary, None, data, src, &mut completed);
             offset = need;
         }
 
@@ -363,9 +419,10 @@ impl TsDemuxer {
             }
             let packet = &data[offset..offset + BD_SOURCE_PACKET_BYTES];
             let src = self.pkt_source(offset);
+            self.process_packet(packet, Some(offset), data, src, &mut completed);
             offset += BD_SOURCE_PACKET_BYTES;
-            self.process_packet(packet, src, &mut completed);
         }
+        self.own_last_payloads(data);
         // Advance the running base past every byte consumed this feed so the
         // next batch stamps from the correct absolute offset.
         if self.has_base {
@@ -384,6 +441,16 @@ impl TsDemuxer {
         }
 
         completed
+    }
+
+    // `data` is about to be released: copy each PID's last payload out of it (at most one
+    // 184-byte copy per tracked PID per feed, instead of one per packet).
+    fn own_last_payloads(&mut self, data: &[u8]) {
+        for asm in &mut self.assemblers {
+            if let LastPayload::InFeed { off, len } = asm.last_payload {
+                asm.last_payload = LastPayload::owned(&data[off..off + len as usize]);
+            }
+        }
     }
 
     // Next packet start after the unsynced `offset`: the next grid slot if it has a sync byte,
@@ -411,11 +478,13 @@ impl TsDemuxer {
     }
 
     // Demux a single 192-byte BD-TS packet (4-byte TP_extra_header + 188-byte
-    // TS). Routes payload bytes into the per-PID `PesAssembler`; completed PES
-    // packets are pushed onto `completed` so the caller's alloc amortises.
+    // TS). Routes payload bytes into the per-PID `PesAssembler`; completed PES packets go
+    // to `completed`. `at` is the packet's offset in `feed`, `None` for the boundary packet.
     fn process_packet(
         &mut self,
         packet: &[u8],
+        at: Option<usize>,
+        feed: &[u8],
         source: Option<crate::pes::SourcePos>,
         completed: &mut Vec<PesPacket>,
     ) {
@@ -499,14 +568,19 @@ impl TsDemuxer {
         // A duplicate repeats the previous packet (same CC and payload; the adaptation field,
         // e.g. PCR, may differ): nothing new. A same-CC packet with other data is a gap.
         let same_cc = asm.last_cc == Some(cc) && !discontinuity_flag;
-        if same_cc && asm.last_pusi == pusi && asm.last_payload == payload {
+        if same_cc && asm.last_pusi == pusi && asm.last_payload.matches(feed, payload) {
             return;
         }
         let cc_gap = same_cc || cc_is_gap(asm.last_cc, cc);
         asm.last_cc = Some(cc);
         asm.last_pusi = pusi;
-        asm.last_payload.clear();
-        asm.last_payload.extend_from_slice(payload);
+        asm.last_payload = match at {
+            Some(off) => LastPayload::InFeed {
+                off: off + 4 + payload_start,
+                len: payload.len() as u8,
+            },
+            None => LastPayload::owned(payload),
+        };
         // A gap means packets for this PID were lost. Sticky flag rides to the first
         // post-gap PES so the codec consumer drops forward to the next keyframe (B1).
         let gap = discontinuity_flag || cc_gap;

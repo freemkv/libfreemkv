@@ -576,6 +576,83 @@ struct SeekPositionFixup {
     value_offset: u64, // absolute file offset of the 8-byte SeekPosition value
 }
 
+/// Per-track state keyed by muxer track index: one slot per track instead of a hashed
+/// map, since the frame path consults several on every frame. Iterates in track order.
+struct TrackMap<V> {
+    slots: Vec<Option<(usize, V)>>,
+    len: usize,
+}
+
+impl<V> TrackMap<V> {
+    fn new() -> Self {
+        Self {
+            slots: Vec::new(),
+            len: 0,
+        }
+    }
+
+    fn get(&self, track: &usize) -> Option<&V> {
+        self.slots.get(*track)?.as_ref().map(|(_, v)| v)
+    }
+
+    fn get_mut(&mut self, track: &usize) -> Option<&mut V> {
+        self.slots.get_mut(*track)?.as_mut().map(|(_, v)| v)
+    }
+
+    fn insert(&mut self, track: usize, value: V) -> Option<V> {
+        if self.slots.len() <= track {
+            self.slots.resize_with(track + 1, || None);
+        }
+        let old = self.slots[track].replace((track, value)).map(|(_, v)| v);
+        self.len += usize::from(old.is_none());
+        old
+    }
+
+    fn remove(&mut self, track: &usize) -> Option<V> {
+        let old = self.slots.get_mut(*track)?.take().map(|(_, v)| v);
+        self.len -= usize::from(old.is_some());
+        old
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn values(&self) -> impl Iterator<Item = &V> {
+        self.slots.iter().filter_map(|s| s.as_ref().map(|(_, v)| v))
+    }
+
+    fn iter_mut(&mut self) -> impl Iterator<Item = (&usize, &mut V)> {
+        self.slots
+            .iter_mut()
+            .filter_map(|s| s.as_mut().map(|(k, v)| (&*k, v)))
+    }
+}
+
+/// A `Write` over the muxer's writer that advances the muxer's logical position.
+struct Tally<'a, W> {
+    w: &'a mut W,
+    pos: &'a mut u64,
+}
+
+impl<W: Write> Write for Tally<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.w.write(buf)?;
+        *self.pos += n as u64;
+        Ok(n)
+    }
+
+    fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        self.w.write_all(buf)?;
+        *self.pos += buf.len() as u64;
+        Ok(())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.w.flush()
+    }
+}
+
 /// MKV muxer. Call write_frame() for each frame, then finish() at the end.
 pub struct MkvMuxer<W: Write + Seek> {
     writer: W,
@@ -583,6 +660,13 @@ pub struct MkvMuxer<W: Write + Seek> {
     cluster_open: bool,
     cluster_pos: u64,
     cluster_size_pos: u64,
+    /// Offset of the next byte written, kept by the frame path (every write goes through
+    /// `Tally`) so it never asks the writer: on a `BufWriter<File>` that is a flush and
+    /// an lseek. Patches seek back here.
+    pos: u64,
+    /// `(size field offset, body size)` of every closed Cluster, written by `finish()`.
+    /// Until then a Cluster carries the EBML unknown size, so a cut-short file still parses.
+    cluster_sizes: Vec<(u64, u64)>,
     cluster_ts_ticks: i64,
     /// Reusable scratch buffer for assembling ONE BlockGroup before it is written with a single
     /// `write_all`; building it in memory means its size is known before it reaches the file,
@@ -594,7 +678,7 @@ pub struct MkvMuxer<W: Write + Seek> {
     /// PER TRACK, to enforce strictly-monotonic per-track timestamps —
     /// players and decoders reject non-monotonic DTS, and some audio PES PTS land on
     /// the same tick (or tick back one from rounding).
-    last_pts_ticks: std::collections::HashMap<usize, i64>,
+    last_pts_ticks: TrackMap<i64>,
     /// Per-track-index flag: true if the track is video. The strictly-monotonic
     /// block-timestamp nudge must be skipped for EVERY video track, not just
     /// track 0 — a title can carry a second video track (e.g. a Dolby Vision
@@ -639,7 +723,7 @@ pub struct MkvMuxer<W: Write + Seek> {
     origin_lead_ticks: i64,
     /// Per VobSub track: file offset of an open-ended block's 3-byte
     /// BlockDuration value, and that block's timestamp in ticks.
-    vobsub_open_end: std::collections::HashMap<usize, (u64, i64)>,
+    vobsub_open_end: TrackMap<(u64, i64)>,
     seek_fixups: Vec<SeekPositionFixup>,
     /// Absolute file offset of the CUES SeekHead entry (a fixed 21-byte Seek
     /// element). When `finish()` writes no Cues element (zero cue points), this
@@ -681,7 +765,7 @@ pub struct MkvMuxer<W: Write + Seek> {
     /// and `mc_header`). Each entry records the file offset of the 1-byte Channels value
     /// (to patch in place) and the IFO-claimed count (to warn on disagreement);
     /// `corrected` flips once patched so we only act on the first frame.
-    channel_fixups: std::collections::HashMap<usize, ChannelFixup>,
+    channel_fixups: TrackMap<ChannelFixup>,
     /// Deferred PGS forced-subtitle detection. A PGS subtitle track reserves a
     /// 1-byte `FlagForced` value up-front; as its display sets are written, the
     /// track is judged forced iff it displayed at least one subtitle and EVERY
@@ -690,7 +774,7 @@ pub struct MkvMuxer<W: Write + Seek> {
     /// so forced subs are flagged even on discs without vendor label metadata.
     /// A vendor forced flag is cleared only under the cross-track guard in
     /// `finish()` (see `super::codec::pgs::demotable`).
-    pgs_forced_fixups: std::collections::HashMap<usize, PgsForcedFixup>,
+    pgs_forced_fixups: TrackMap<PgsForcedFixup>,
     /// Deferred `FlagInterlaced` correction. A video track's scan type is written
     /// up-front from the FIRST coded picture, but MPEG-2 `progressive_frame` is a
     /// PER-picture flag (§6.3.10): the first picture (a progressive leader/logo on
@@ -699,7 +783,7 @@ pub struct MkvMuxer<W: Write + Seek> {
     /// offset and the `FieldOrder` element's span, then counts progressive vs
     /// interlaced pictures across the WHOLE track; at `finish()` the byte is
     /// rewritten to the MAJORITY scan (and a now-wrong FieldOrder Void'd).
-    flag_interlaced_fixups: std::collections::HashMap<usize, FlagInterlacedFixup>,
+    flag_interlaced_fixups: TrackMap<FlagInterlacedFixup>,
     /// `--log-level 3` opening-frame capture: the first ~100 coded frames per
     /// track are written (raw) to a `<output>.opening.bin` side file with a
     /// per-frame summary logged, so an opening-GOP / menu / mid-GOP-open issue is
@@ -708,9 +792,9 @@ pub struct MkvMuxer<W: Write + Seek> {
     opening_capture: Option<crate::diag::OpeningCapture>,
     /// Per track: file offset of a Void reserved for a CodecPrivate that was not
     /// known at header time (AAC), filled by [`Self::set_codec_private`].
-    codec_private_reserves: std::collections::HashMap<usize, u64>,
+    codec_private_reserves: TrackMap<u64>,
     /// Per MPEG-2 video track: the DefaultDuration measured from the kept frames.
-    frame_rate_fixups: std::collections::HashMap<usize, FrameRateFixup>,
+    frame_rate_fixups: TrackMap<FrameRateFixup>,
 }
 
 // Deferred DefaultDuration correction for an MPEG-2 video track: the header holds the
@@ -1082,16 +1166,11 @@ impl<W: Write + Seek> MkvMuxer<W> {
         let tracks_offset = tracks_start - segment_start;
         let tracks_pos = ebml::start_master(&mut writer, ebml::TRACKS)?;
         let mut track_uids: Vec<u64> = Vec::with_capacity(tracks.len());
-        let mut channel_fixups: std::collections::HashMap<usize, ChannelFixup> =
-            std::collections::HashMap::new();
-        let mut pgs_forced_fixups: std::collections::HashMap<usize, PgsForcedFixup> =
-            std::collections::HashMap::new();
-        let mut codec_private_reserves: std::collections::HashMap<usize, u64> =
-            std::collections::HashMap::new();
-        let mut flag_interlaced_fixups: std::collections::HashMap<usize, FlagInterlacedFixup> =
-            std::collections::HashMap::new();
-        let mut frame_rate_fixups: std::collections::HashMap<usize, FrameRateFixup> =
-            std::collections::HashMap::new();
+        let mut channel_fixups: TrackMap<ChannelFixup> = TrackMap::new();
+        let mut pgs_forced_fixups: TrackMap<PgsForcedFixup> = TrackMap::new();
+        let mut codec_private_reserves: TrackMap<u64> = TrackMap::new();
+        let mut flag_interlaced_fixups: TrackMap<FlagInterlacedFixup> = TrackMap::new();
+        let mut frame_rate_fixups: TrackMap<FrameRateFixup> = TrackMap::new();
         // Per track: whether it emitted a conforming `mvcC` BlockAdditionMapping.
         // Filled below from the SAME built record that drives the CodecPrivate
         // mvcC extension, so the three MVC signals never diverge.
@@ -1403,16 +1482,19 @@ impl<W: Write + Seek> MkvMuxer<W> {
             ebml::end_master(&mut writer, chapters_pos)?;
         }
 
+        let pos = writer.stream_position()?;
         Ok(Self {
             writer,
             segment_start,
             cluster_open: false,
             cluster_pos: 0,
             cluster_size_pos: 0,
+            pos,
+            cluster_sizes: Vec::new(),
             block_group_buf: Vec::new(),
             cluster_ts_ticks: 0,
             base_pts_ticks: None,
-            last_pts_ticks: std::collections::HashMap::new(),
+            last_pts_ticks: TrackMap::new(),
             track_is_video: tracks
                 .iter()
                 .map(|t| t.track_type == ebml::TRACK_TYPE_VIDEO)
@@ -1434,7 +1516,7 @@ impl<W: Write + Seek> MkvMuxer<W> {
             frame_count: 0,
             dropped_pre_cluster: 0,
             origin_lead_ticks: 0,
-            vobsub_open_end: std::collections::HashMap::new(),
+            vobsub_open_end: TrackMap::new(),
             seek_fixups,
             cues_seek_entry_pos,
             info_offset,
@@ -1478,21 +1560,27 @@ impl<W: Write + Seek> MkvMuxer<W> {
         if rest >= 2 {
             el.extend_from_slice(&ebml::void_element(rest)?);
         }
-        let here = self.writer.stream_position()?;
         self.writer.seek(std::io::SeekFrom::Start(pos))?;
         self.writer.write_all(&el)?;
-        self.writer.seek(std::io::SeekFrom::Start(here))?;
+        self.writer.seek(std::io::SeekFrom::Start(self.pos))?;
         self.codec_private_reserves.remove(&track);
         Ok(true)
     }
 
     // Overwrite a 3-byte big-endian value at `pos`, then return to the end.
     fn patch_u24(&mut self, pos: u64, val: u64) -> io::Result<()> {
-        let end = self.writer.stream_position()?;
         self.writer.seek(io::SeekFrom::Start(pos))?;
         self.writer.write_all(&val.to_be_bytes()[5..])?;
-        self.writer.seek(io::SeekFrom::Start(end))?;
+        self.writer.seek(io::SeekFrom::Start(self.pos))?;
         Ok(())
+    }
+
+    // The frame path's writer: counts what it writes into `pos`.
+    fn out(&mut self) -> Tally<'_, W> {
+        Tally {
+            w: &mut self.writer,
+            pos: &mut self.pos,
+        }
     }
 
     /// Put the timeline origin `lead_ns` before the first video keyframe (the
@@ -1827,11 +1915,11 @@ impl<W: Write + Seek> MkvMuxer<W> {
                     .unwrap_or(0),
             )
         };
-        if discard_padding_ns != 0 {
-            let mut buf = std::mem::take(&mut self.block_group_buf);
-            buf.clear();
-            let result = Self::build_block_group(
-                &mut buf,
+        // A BlockGroup carries DiscardPadding, BlockDuration (PGS, AC-3, every MPEG-2
+        // picture) or an MVC dependent view (a non-key base frame also gets its
+        // ReferenceBlock, so a player never seeks to a P/B frame); else a SimpleBlock.
+        if discard_padding_ns != 0 || block_additional.is_some() || duration_ticks.is_some() {
+            self.write_block_group(
                 track_idx + 1,
                 relative_ts,
                 data,
@@ -1839,41 +1927,14 @@ impl<W: Write + Seek> MkvMuxer<W> {
                 duration_ticks,
                 block_additional,
                 discard_padding_ns,
-            )
-            .and_then(|()| self.writer.write_all(&buf));
-            self.block_group_buf = buf;
-            result?;
+            )?;
         } else {
-            match block_additional {
-                // MVC: base view Block + dependent-view BlockAdditional, always a BlockGroup;
-                // non-keyframe base frames get a ReferenceBlock so a player never treats
-                // a P/B frame as a seek point.
-                Some(additional) => {
-                    self.write_block_group_mvc(
-                        track_idx + 1,
-                        relative_ts,
-                        data,
-                        additional,
-                        reference,
-                        duration_ticks,
-                    )?;
-                }
-                None => match duration_ticks {
-                    // BlockDuration present (PGS subtitles, AC-3 audio, and EVERY
-                    // MPEG-2 video frame) → BlockGroup.
-                    Some(dt) => {
-                        self.write_block_group(track_idx + 1, relative_ts, data, reference, dt)?;
-                    }
-                    None => {
-                        self.write_simple_block(track_idx + 1, relative_ts, keyframe, data)?;
-                    }
-                },
-            }
+            self.write_simple_block(track_idx + 1, relative_ts, keyframe, data)?;
         }
         // BlockDuration is the group's last element: its 3 value bytes end the write.
         if vobsub_open {
-            let end = self.writer.stream_position()?;
-            self.vobsub_open_end.insert(track_idx, (end - 3, pts_ticks));
+            self.vobsub_open_end
+                .insert(track_idx, (self.pos - 3, pts_ticks));
         }
         // Recorded per track (not a single global slot) so a later non-keyframe
         // references a keyframe on its OWN track — a shared slot produced cross-track
@@ -1928,12 +1989,26 @@ impl<W: Write + Seek> MkvMuxer<W> {
         if patches.is_empty() {
             return Ok(());
         }
-        let here = self.writer.stream_position()?;
         for (off, bytes) in patches {
             self.writer.seek(std::io::SeekFrom::Start(*off))?;
             self.writer.write_all(bytes)?;
         }
-        self.writer.seek(std::io::SeekFrom::Start(here))?;
+        self.writer.seek(std::io::SeekFrom::Start(self.pos))?;
+        Ok(())
+    }
+
+    // Write each closed Cluster's size over its unknown-size placeholder, in file order:
+    // the fixed 8-byte VINT a per-cluster `ebml::end_master` back-patch would have written.
+    fn patch_cluster_sizes(&mut self) -> io::Result<()> {
+        if self.cluster_sizes.is_empty() {
+            return Ok(());
+        }
+        for &(at, size) in &self.cluster_sizes {
+            self.writer.seek(std::io::SeekFrom::Start(at))?;
+            self.writer.write_all(&ebml::fixed_width_vint8(size))?;
+        }
+        self.writer.seek(std::io::SeekFrom::Start(self.pos))?;
+        self.cluster_sizes.clear();
         Ok(())
     }
 
@@ -1973,10 +2048,9 @@ impl<W: Write + Seek> MkvMuxer<W> {
                 "audio track {track}: IFO claimed {claimed} channels but the stored bitstream carries {actual}; trusting the bitstream",
             );
         }
-        let here = self.writer.stream_position()?;
         self.writer.seek(std::io::SeekFrom::Start(offset))?;
         self.writer.write_all(&[actual])?;
-        self.writer.seek(std::io::SeekFrom::Start(here))?;
+        self.writer.seek(std::io::SeekFrom::Start(self.pos))?;
         Ok(())
     }
 
@@ -2048,6 +2122,7 @@ impl<W: Write + Seek> MkvMuxer<W> {
         }
         // Close final cluster
         self.end_cluster()?;
+        self.patch_cluster_sizes()?;
 
         // Correct FlagForced for PGS tracks from what the mux saw (in-place rewrite).
         // PROMOTE (0->1) a track whose displays all carry `forced_on_flag`. DEMOTE
@@ -2307,17 +2382,24 @@ impl<W: Write + Seek> MkvMuxer<W> {
         if self.cluster_open {
             self.end_cluster()?;
         }
-        self.cluster_pos = self.writer.stream_position()?;
-        self.cluster_size_pos = ebml::start_master(&mut self.writer, ebml::CLUSTER)?;
-        ebml::write_uint(&mut self.writer, ebml::CLUSTER_TIMESTAMP, ts_ticks as u64)?;
+        self.cluster_pos = self.pos;
+        ebml::write_id(&mut self.out(), ebml::CLUSTER)?;
+        self.cluster_size_pos = self.pos;
+        ebml::write_unknown_size(&mut self.out())?;
+        ebml::write_uint(&mut self.out(), ebml::CLUSTER_TIMESTAMP, ts_ticks as u64)?;
         self.cluster_ts_ticks = ts_ticks;
         self.cluster_open = true;
         Ok(())
     }
 
+    // Record the closed Cluster's size for `finish()`; no seek back now.
     fn end_cluster(&mut self) -> io::Result<()> {
         if self.cluster_open {
-            ebml::end_master(&mut self.writer, self.cluster_size_pos)?;
+            let size = self.pos - self.cluster_size_pos - 8;
+            if size >= 0x0100_0000_0000_0000 {
+                return Err(crate::error::Error::MkvUnencodable.into());
+            }
+            self.cluster_sizes.push((self.cluster_size_pos, size));
             self.cluster_open = false;
         }
         Ok(())
@@ -2337,51 +2419,25 @@ impl<W: Write + Seek> MkvMuxer<W> {
         let flags: u8 = if keyframe { 0x80 } else { 0x00 };
 
         let block_size = track_vint.len() + 2 + 1 + data.len(); // vint + ts(2) + flags(1) + data
-        ebml::write_id(&mut self.writer, ebml::SIMPLE_BLOCK)?;
-        ebml::write_size(&mut self.writer, block_size as u64)?;
-        self.writer.write_all(track_vint)?;
-        self.writer.write_all(&relative_ts.to_be_bytes())?;
-        self.writer.write_all(&[flags])?;
-        self.writer.write_all(data)?;
-
-        Ok(())
+        // The header (at most 1 + 8 + 3 + 2 + 1 bytes) goes out in one write, not five.
+        let mut head = io::Cursor::new([0u8; 16]);
+        ebml::write_id(&mut head, ebml::SIMPLE_BLOCK)?;
+        ebml::write_size(&mut head, block_size as u64)?;
+        head.write_all(track_vint)?;
+        head.write_all(&relative_ts.to_be_bytes())?;
+        head.write_all(&[flags])?;
+        let head_len = head.position() as usize;
+        let mut out = self.out();
+        out.write_all(&head.get_ref()[..head_len])?;
+        out.write_all(data)
     }
 
-    // Write a BlockGroup (Block + BlockDuration, plus ReferenceBlock when not a keyframe). Not
-    // subtitle-only: every MPEG-2 I/P/B frame arrives here.
+    // Write a BlockGroup with no seek and no payload copy: its small head and trailer are
+    // built in the reused scratch buffer, the frame and MVC dependent AU are written
+    // straight from their slices in between: the same bytes as one contiguous write.
+    #[allow(clippy::too_many_arguments)]
     fn write_block_group(
         &mut self,
-        track_num: usize,
-        relative_ts: i16,
-        data: &[u8],
-        reference: Option<i64>,
-        duration_ticks: u64,
-    ) -> io::Result<()> {
-        let mut buf = std::mem::take(&mut self.block_group_buf);
-        buf.clear();
-        let res = Self::build_block_group(
-            &mut buf,
-            track_num,
-            relative_ts,
-            data,
-            reference,
-            Some(duration_ticks),
-            None,
-            0,
-        )
-        .and_then(|()| self.writer.write_all(&buf));
-        // Hand the (now grown) scratch buffer back so the next frame reuses the
-        // allocation, on the error path too.
-        self.block_group_buf = buf;
-        res
-    }
-
-    // Assemble a complete BlockGroup into `buf` (one write_all at the call
-    // site, no seek). `additional` = Some(dependent AU) for MVC, appending
-    // BlockAdditions > BlockMore { BlockAddID=2, BlockAdditional }.
-    #[allow(clippy::too_many_arguments)]
-    fn build_block_group(
-        buf: &mut Vec<u8>,
         track_num: usize,
         relative_ts: i16,
         data: &[u8],
@@ -2390,13 +2446,54 @@ impl<W: Write + Seek> MkvMuxer<W> {
         additional: Option<&[u8]>,
         discard_padding_ns: i64,
     ) -> io::Result<()> {
+        let mut buf = std::mem::take(&mut self.block_group_buf);
+        buf.clear();
+        let res = Self::build_block_group(
+            &mut buf,
+            track_num,
+            relative_ts,
+            data.len(),
+            reference,
+            duration_ticks,
+            additional.map(<[u8]>::len),
+            discard_padding_ns,
+        )
+        .and_then(|head| {
+            let mut out = self.out();
+            out.write_all(&buf[..head])?;
+            out.write_all(data)?;
+            out.write_all(&buf[head..])?;
+            match additional {
+                Some(a) => out.write_all(a),
+                None => Ok(()),
+            }
+        });
+        // Hand the scratch buffer back so the next frame reuses it, on error too.
+        self.block_group_buf = buf;
+        res
+    }
+
+    // Assemble a BlockGroup into `buf` minus its two payloads: the frame (`data_len`
+    // bytes) goes at the returned split, the MVC dependent AU (`additional_len`, as
+    // BlockAdditions > BlockMore { BlockAddID=2, BlockAdditional }) after the buffer.
+    #[allow(clippy::too_many_arguments)]
+    fn build_block_group(
+        buf: &mut Vec<u8>,
+        track_num: usize,
+        relative_ts: i16,
+        data_len: usize,
+        reference: Option<i64>,
+        duration_ticks: Option<u64>,
+        additional_len: Option<usize>,
+        discard_padding_ns: i64,
+    ) -> io::Result<usize> {
         let (tv, tv_len) = track_vint(track_num);
         let track_vint = &tv[..tv_len];
         // The 0x80 Keyframe flag is SimpleBlock-only; inside a BlockGroup Block
         // it is reserved and MUST be 0 — keyframe-ness is signalled by the
         // presence/absence of ReferenceBlock.
         let flags: u8 = 0x00;
-        let block_size = track_vint.len() + 2 + 1 + data.len();
+        let block_size = track_vint.len() + 2 + 1 + data_len;
 
         let bg_pos = ebml::start_master_buf(buf, ebml::BLOCK_GROUP)?;
         ebml::write_id(buf, ebml::BLOCK)?;
@@ -2404,7 +2501,7 @@ impl<W: Write + Seek> MkvMuxer<W> {
         buf.extend_from_slice(track_vint);
         buf.extend_from_slice(&relative_ts.to_be_bytes());
         buf.push(flags);
-        buf.extend_from_slice(data);
+        let head = buf.len();
         if discard_padding_ns != 0 {
             ebml::write_int(buf, ebml::DISCARD_PADDING, discard_padding_ns)?;
         }
@@ -2414,44 +2511,18 @@ impl<W: Write + Seek> MkvMuxer<W> {
         if let Some(ref_off) = reference {
             ebml::write_int(buf, ebml::REFERENCE_BLOCK, ref_off)?;
         }
-        if let Some(additional) = additional {
+        let outside = additional_len.unwrap_or(0) as u64;
+        if let Some(len) = additional_len {
             let adds_pos = ebml::start_master_buf(buf, ebml::BLOCK_ADDITIONS)?;
             let more_pos = ebml::start_master_buf(buf, ebml::BLOCK_MORE)?;
             ebml::write_uint(buf, ebml::BLOCK_ADD_ID, BLOCK_ADD_ID_VALUE_MVC)?;
-            ebml::write_binary(buf, ebml::BLOCK_ADDITIONAL, additional)?;
-            ebml::end_master_buf(buf, more_pos)?;
-            ebml::end_master_buf(buf, adds_pos)?;
+            ebml::write_id(buf, ebml::BLOCK_ADDITIONAL)?;
+            ebml::write_size(buf, len as u64)?;
+            ebml::end_master_buf_with(buf, more_pos, outside)?;
+            ebml::end_master_buf_with(buf, adds_pos, outside)?;
         }
-        ebml::end_master_buf(buf, bg_pos)?;
-        Ok(())
-    }
-
-    // Write a BlockGroup: base view Block + MVC dependent AU as a BlockAdditional
-    // (BlockAddID=2) per the track's mvcC mapping.
-    fn write_block_group_mvc(
-        &mut self,
-        track_num: usize,
-        relative_ts: i16,
-        data: &[u8],
-        additional: &[u8],
-        reference: Option<i64>,
-        duration_ticks: Option<u64>,
-    ) -> io::Result<()> {
-        let mut buf = std::mem::take(&mut self.block_group_buf);
-        buf.clear();
-        let res = Self::build_block_group(
-            &mut buf,
-            track_num,
-            relative_ts,
-            data,
-            reference,
-            duration_ticks,
-            Some(additional),
-            0,
-        )
-        .and_then(|()| self.writer.write_all(&buf));
-        self.block_group_buf = buf;
-        res
+        ebml::end_master_buf_with(buf, bg_pos, data_len as u64 + outside)?;
+        Ok(head)
     }
 }
 

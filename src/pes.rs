@@ -295,6 +295,13 @@ pub trait PesSink: Send {
     /// Write a frame.
     fn write(&mut self, frame: &PesFrame) -> std::io::Result<()>;
 
+    /// Write a frame the caller no longer needs. Same output as [`write`](Self::write);
+    /// sinks that keep or transform frame data override it to move the payload instead
+    /// of copying it. Default: `write(&frame)`.
+    fn write_owned(&mut self, frame: PesFrame) -> std::io::Result<()> {
+        self.write(&frame)
+    }
+
     /// Finalize: flush buffered frames, write any container index (MKV `Cues`), close the
     /// underlying file/socket.
     fn finish(&mut self) -> std::io::Result<()>;
@@ -366,6 +373,13 @@ impl crate::pes::PesSink for CountingStream {
         // failed write doesn't permanently inflate bytes_written().
         self.inner.write(frame)?;
         self.written += frame.data.len() as u64;
+        Ok(())
+    }
+
+    fn write_owned(&mut self, frame: PesFrame) -> std::io::Result<()> {
+        let len = frame.data.len() as u64;
+        self.inner.write_owned(frame)?;
+        self.written += len;
         Ok(())
     }
 

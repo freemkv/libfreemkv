@@ -275,6 +275,44 @@ impl M2tsStream {
 
 impl crate::pes::PesSink for M2tsStream {
     fn write(&mut self, frame: &crate::pes::PesFrame) -> io::Result<()> {
+        self.write_frame(frame, None)
+    }
+
+    fn write_owned(&mut self, mut frame: crate::pes::PesFrame) -> io::Result<()> {
+        let data = std::mem::take(&mut frame.data);
+        self.write_frame(&frame, Some(data))
+    }
+
+    fn finish(&mut self) -> io::Result<()> {
+        self.finish_inner()
+    }
+
+    // The source title: its PIDs, not the BD-range PIDs the file and FMKV header carry.
+    fn info(&self) -> &crate::disc::DiscTitle {
+        &self.disc_title
+    }
+
+    fn undelivered_streams(&self) -> Vec<usize> {
+        // LPCM/AAC BD-TS can't carry (known from create), and MPEG-2 extension tracks whose
+        // packets arrived.
+        let mut out: Vec<usize> = (0..self.route.len())
+            .filter(|&i| self.route[i].is_none() && !self.excluded.contains(i))
+            .chain(self.excluded.seen())
+            .collect();
+        out.sort_unstable();
+        out
+    }
+}
+
+impl M2tsStream {
+    // One frame; `owned` is its payload when the caller gave it up (then `frame.data` is
+    // empty and unread), so a frame the muxer's start-up hold keeps is moved, not copied.
+    fn write_frame(
+        &mut self,
+        frame: &crate::pes::PesFrame,
+        owned: Option<Vec<u8>>,
+    ) -> io::Result<()> {
+        let data: &[u8] = owned.as_deref().unwrap_or(&frame.data);
         if self.excluded.drop_frame(frame.track) {
             return Ok(());
         }
@@ -307,36 +345,41 @@ impl crate::pes::PesSink for M2tsStream {
             Some(None) => Ok(()),
             // Parser output is plain PCM (16 or 24-bit); BD-TS needs the BD LPCM framing back.
             Some(Some((track, Repack::Lpcm(header)))) => {
-                for (offset_ns, payload) in super::codec::lpcm::bd_payloads(&frame.data, header) {
-                    self.muxer.write_frame(
+                for (offset_ns, payload) in super::codec::lpcm::bd_payloads(data, header) {
+                    self.muxer.write_frame_owned(
                         track,
                         pts.saturating_add(offset_ns),
                         frame.keyframe,
-                        &payload,
+                        payload,
                     )?;
                 }
                 Ok(())
             }
             Some(Some((track, Repack::Adts(header)))) => {
                 let blocks = super::codec::adts::raw_data_blocks(header, frame.duration_ns);
-                let Some(adts) = super::codec::adts::adts_frame(header, &frame.data, blocks) else {
-                    tracing::warn!(target: "mux", track, len = frame.data.len(), "AAC access unit too long for ADTS; dropped");
+                let Some(adts) = super::codec::adts::adts_frame(header, data, blocks) else {
+                    tracing::warn!(target: "mux", track, len = data.len(), "AAC access unit too long for ADTS; dropped");
                     return Ok(());
                 };
-                self.muxer.write_frame(track, pts, frame.keyframe, &adts)
-            }
-            Some(Some((track, Repack::Verbatim))) => {
                 self.muxer
-                    .write_frame(track, pts, frame.keyframe, &frame.data)
+                    .write_frame_owned(track, pts, frame.keyframe, adts)
             }
+            Some(Some((track, Repack::Verbatim))) => match owned {
+                Some(data) => self
+                    .muxer
+                    .write_frame_owned(track, pts, frame.keyframe, data),
+                None => self
+                    .muxer
+                    .write_frame(track, pts, frame.keyframe, &frame.data),
+            },
             // Out of range: let the muxer report its usual error.
             None => self
                 .muxer
-                .write_frame(frame.track, frame.pts, frame.keyframe, &frame.data),
+                .write_frame(frame.track, frame.pts, frame.keyframe, data),
         }
     }
 
-    fn finish(&mut self) -> io::Result<()> {
+    fn finish_inner(&mut self) -> io::Result<()> {
         // As the other sinks: a seam plan that dropped everything, or most of the title,
         // is a failed mux, not a short file.
         let seam_dropped = self.timeline.dropped_total();
@@ -358,22 +401,6 @@ impl crate::pes::PesSink for M2tsStream {
             );
         }
         self.muxer.finish()
-    }
-
-    // The source title: its PIDs, not the BD-range PIDs the file and FMKV header carry.
-    fn info(&self) -> &crate::disc::DiscTitle {
-        &self.disc_title
-    }
-
-    fn undelivered_streams(&self) -> Vec<usize> {
-        // LPCM/AAC BD-TS can't carry (known from create), and MPEG-2 extension tracks whose
-        // packets arrived.
-        let mut out: Vec<usize> = (0..self.route.len())
-            .filter(|&i| self.route[i].is_none() && !self.excluded.contains(i))
-            .chain(self.excluded.seen())
-            .collect();
-        out.sort_unstable();
-        out
     }
 }
 

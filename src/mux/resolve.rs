@@ -18,10 +18,12 @@ use std::path::{Path, PathBuf};
 /// I/O buffer size for file streams.
 pub(crate) const IO_BUF_SIZE: usize = 4 * 1024 * 1024;
 
-/// File-backed ISO mux read size. Empirically optimal for the CLI: 16 MiB;
-/// 32 MiB regressed from cache pressure and longer per-batch latency.
+/// File-backed ISO mux read size: 3 MiB, a whole number of 6144-byte AACS units.
+/// The pipeline holds several batches at once (prefetch pool, demux channel), so
+/// 16 MiB batches pinned about 64 MiB per mux; a sequential file read gets OS
+/// readahead and gains nothing from the larger batch.
 /// Image remux uses the same reader pipeline and should use this value too.
-pub const ISO_MUX_BATCH_SECTORS: u16 = 8192;
+pub const ISO_MUX_BATCH_SECTORS: u16 = 1536;
 
 /// Parsed stream URL.
 #[derive(Debug, Clone)]
