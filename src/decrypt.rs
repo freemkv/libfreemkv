@@ -4,8 +4,8 @@
 //!
 //! AACS aligned units decrypt independently, so buffers of at least `PARALLEL_MIN_UNITS`
 //! units parallelize across a rayon pool; smaller buffers use the serial path. Thread count
-//! resolves from [`set_decrypt_threads`], else `FREEMKV_THREADS`, else all cores (capped at
-//! [`MAX_THREADS`]).
+//! resolves from [`set_decrypt_threads`], else `FREEMKV_THREADS`, else all cores (at most
+//! `DEFAULT_MAX_THREADS`; explicit settings up to [`MAX_THREADS`]).
 
 use crate::aacs;
 use crate::css;
@@ -13,9 +13,16 @@ use rayon::prelude::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
-/// Minimum units in a buffer before we pay the pool-dispatch cost of
-/// fanning out. Below this, serial is faster.
-const PARALLEL_MIN_UNITS: usize = 8;
+/// Minimum units in a buffer (768 KiB) before it fans out to the pool: below this one core
+/// finishes sooner than waking and joining the workers (a live drive's 60-510 sector reads).
+const PARALLEL_MIN_UNITS: usize = 128;
+
+/// Fewest units one pool task takes, so a fanned-out buffer splits into a few large tasks.
+const PARALLEL_TASK_UNITS: usize = 32;
+
+/// Default decrypt pool size cap: eight AES-NI cores decrypt well over 10 GB/s, so more
+/// threads only sit parked for the life of the process.
+const DEFAULT_MAX_THREADS: usize = 8;
 
 /// Hard upper bound on configurable thread count. Anything larger is
 /// almost certainly a misconfiguration; rayon would happily allocate
@@ -105,7 +112,7 @@ fn pool_or_build(
 /// Current effective decrypt thread count. Resolution order:
 /// 1. Most recent [`set_decrypt_threads`] value (if > 0)
 /// 2. `FREEMKV_THREADS` env var (if set and > 0)
-/// 3. Default: all available cores, capped at [`MAX_THREADS`].
+/// 3. Default: all available cores, capped at 8 (explicit settings go up to [`MAX_THREADS`]).
 pub fn decrypt_threads() -> usize {
     let explicit = DECRYPT_THREADS.load(Ordering::Relaxed);
     if explicit > 0 {
@@ -118,16 +125,34 @@ pub fn decrypt_threads() -> usize {
     *DEFAULT_THREADS.get_or_init(|| {
         let env = std::env::var("FREEMKV_THREADS")
             .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(0);
-        if env > 0 {
-            return env.min(MAX_THREADS);
-        }
+            .and_then(|v| v.parse::<usize>().ok());
         let cores = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(2);
-        cores.clamp(1, MAX_THREADS)
+        default_threads(env, cores)
     })
+}
+
+// The unset-setting thread count: `FREEMKV_THREADS` when positive (up to `MAX_THREADS`), else
+// the cores, at most `DEFAULT_MAX_THREADS`.
+fn default_threads(env: Option<usize>, cores: usize) -> usize {
+    match env {
+        Some(n) if n > 0 => n.min(MAX_THREADS),
+        _ => cores.clamp(1, DEFAULT_MAX_THREADS),
+    }
+}
+
+/// The decrypt pool for a buffer of `units` independent units (AACS units, CSS sectors),
+/// or `None` to decrypt it serially: one thread, a small buffer, or no pool to be had.
+pub(crate) fn pool_for(units: usize) -> Option<Arc<rayon::ThreadPool>> {
+    fans_out(units, decrypt_threads())
+        .then(decrypt_pool)
+        .flatten()
+}
+
+// Whether `units` on `threads` threads is worth the pool's wake and join.
+fn fans_out(units: usize, threads: usize) -> bool {
+    threads > 1 && units >= PARALLEL_MIN_UNITS
 }
 
 /// Resolved decryption state from disc scanning.
@@ -585,23 +610,16 @@ fn apply_aacs_map(
         aacs::content::clear_copy_permission_indicator(chunk, format);
     };
 
-    let nthreads = decrypt_threads();
-    let nunits = buf.len() / unit_len;
-    if nthreads <= 1 || nunits < PARALLEL_MIN_UNITS {
-        for (i, chunk) in buf.chunks_mut(unit_len).enumerate() {
-            decrypt_one(i, chunk);
-        }
-    } else {
-        match decrypt_pool() {
-            Some(pool) => pool.install(|| {
-                buf.par_chunks_mut(unit_len)
-                    .enumerate()
-                    .for_each(|(i, chunk)| decrypt_one(i, chunk));
-            }),
-            None => {
-                for (i, chunk) in buf.chunks_mut(unit_len).enumerate() {
-                    decrypt_one(i, chunk);
-                }
+    match pool_for(buf.len() / unit_len) {
+        Some(pool) => pool.install(|| {
+            buf.par_chunks_mut(unit_len)
+                .enumerate()
+                .with_min_len(PARALLEL_TASK_UNITS)
+                .for_each(|(i, chunk)| decrypt_one(i, chunk));
+        }),
+        None => {
+            for (i, chunk) in buf.chunks_mut(unit_len).enumerate() {
+                decrypt_one(i, chunk);
             }
         }
     }
@@ -714,12 +732,13 @@ pub(crate) fn decrypt_hddvd_packs(
             decrypt_pack(pack, kt, &cpi);
         }
     };
-    let pool = (decrypt_threads() > 1 && jobs.len() >= PARALLEL_MIN_UNITS * 3)
-        .then(decrypt_pool)
-        .flatten();
-    match pool {
+    // Three packs make one AACS unit's worth of work.
+    match pool_for(jobs.len() / 3) {
         Some(pool) => pool.install(|| {
-            buf.par_chunks_exact_mut(PACK_LEN).enumerate().for_each(run);
+            buf.par_chunks_exact_mut(PACK_LEN)
+                .enumerate()
+                .with_min_len(PARALLEL_TASK_UNITS * 3)
+                .for_each(run);
         }),
         None => buf
             .as_chunks_mut::<PACK_LEN>()

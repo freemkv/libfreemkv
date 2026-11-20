@@ -1672,3 +1672,78 @@ fn key_map_later_starting_range_wins_an_overlap_and_keeps_its_anchor() {
     assert_eq!(m.entry_for(80), Some((0, Phase::Even, 0)));
     assert_eq!(m.entry_for(50), Some((1, Phase::Odd, 40)));
 }
+
+// A live drive's reads (60-510 sectors, 20-170 units) stay below the fan-out threshold
+// only at its small end; an image batch always fans out; one thread never does.
+#[test]
+fn small_buffers_and_one_thread_decrypt_serially() {
+    assert!(!fans_out(20, 8), "a 60-sector read stays on its thread");
+    assert!(!fans_out(PARALLEL_MIN_UNITS - 1, 8));
+    assert!(fans_out(PARALLEL_MIN_UNITS, 2));
+    assert!(fans_out(2730, 8), "an 8190-sector batch fans out");
+    assert!(!fans_out(2730, 1), "one thread is serial");
+    assert!(!fans_out(0, 0));
+}
+
+// Unset, the pool is at most eight threads, whatever the cores; FREEMKV_THREADS still asks
+// for more, up to MAX_THREADS; a zero or missing setting means unset.
+#[test]
+fn default_thread_count_is_capped_at_eight() {
+    assert_eq!(default_threads(None, 64), DEFAULT_MAX_THREADS);
+    assert_eq!(default_threads(None, 4), 4);
+    assert_eq!(default_threads(None, 0), 1);
+    assert_eq!(default_threads(Some(0), 3), 3);
+    assert_eq!(default_threads(Some(16), 4), 16);
+    assert_eq!(default_threads(Some(1000), 4), MAX_THREADS);
+}
+
+// The same mapped decrypt below and above the fan-out threshold, serial and pooled, is
+// byte for byte the same: each pool task keeps its units' indices.
+#[test]
+fn mapped_decrypt_matches_across_the_fan_out_threshold() {
+    use crate::disc::ContentFormat;
+    let key = [0x79u8; 16];
+    let ul = aacs::content::ALIGNED_UNIT_LEN;
+    let keys = DecryptKeys::Aacs {
+        unit_keys: vec![(0, key)],
+        format: ContentFormat::BdTs,
+    };
+    let map = AacsKeyMap::from_ranges(vec![(0, u32::MAX, 0)]);
+    for n in [
+        PARALLEL_MIN_UNITS - 1,
+        PARALLEL_MIN_UNITS,
+        PARALLEL_MIN_UNITS + PARALLEL_TASK_UNITS + 1,
+    ] {
+        let mut plain = Vec::with_capacity(n * ul);
+        let mut buf = Vec::with_capacity(n * ul);
+        for i in 0..n {
+            let mut c = clear_ts_unit();
+            c[0] |= 0xC0;
+            c[1] = i as u8;
+            c[300] = (i >> 8) as u8;
+            plain.extend_from_slice(&aacs::content::cpi_cleared(c.clone()));
+            aacs_encrypt_unit_for_test(&mut c, &key);
+            buf.extend_from_slice(&c);
+        }
+        let mut serial = buf.clone();
+        for (i, u) in serial.chunks_mut(ul).enumerate() {
+            decrypt_sectors_mapped(u, &keys, (i * 3) as u32, &map).expect("unit");
+        }
+        decrypt_sectors_mapped(&mut buf, &keys, 0, &map).expect("buffer");
+        assert!(buf == plain && serial == plain, "{n} units");
+    }
+}
+
+// An HD DVD read big enough to fan out decrypts every pack as the serial path does.
+#[test]
+fn hddvd_packs_decrypt_the_same_on_the_pool() {
+    let kt = [0x62; 16];
+    let n = PARALLEL_MIN_UNITS * 3 + 7;
+    let (plain, mut buf) = hd_buf(n, 0, &kt);
+    let map = AacsKeyMap::from_ranges(vec![(0, n as u32, 0)]);
+    set_decrypt_threads(4);
+    let r = decrypt_hddvd_packs(&mut buf, &hd_keys(&[(2, kt)]), 0, &map, None, None);
+    set_decrypt_threads(0);
+    assert_eq!(r.unwrap().blanked, 0);
+    assert!(buf == plain, "every pack decrypted on the pool");
+}
