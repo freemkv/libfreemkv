@@ -118,6 +118,42 @@ fn duplicate_packets_are_ignored() {
     assert!(!out[0].discontinuity);
 }
 
+// The previous payload is referenced in the feed buffer, copied out at feed end, or built
+// from the boundary packet: duplicates are caught in one feed, across feeds and at a split.
+#[test]
+fn duplicate_packets_are_ignored_within_across_and_at_feed_boundaries() {
+    let pid = 0x1011;
+    let start = ts_payload_packet(pid, true, 0, &pes_start(&[b'A'; 175]));
+    let cont = ts_payload_packet(pid, false, 1, &[b'B'; 184]);
+    let mut stream = Vec::new();
+    for p in [&start, &start, &cont, &cont] {
+        stream.extend_from_slice(p);
+    }
+    let mut want = vec![b'A'; 175];
+    want.extend_from_slice(&[b'B'; 184]);
+    for split in [0, 1, 100, 192, 200, 384, 500, 576, 700, stream.len()] {
+        let mut demux = TsDemuxer::new(&[pid]);
+        let mut out = demux.feed(&stream[..split]);
+        out.extend(demux.feed(&stream[split..]));
+        out.extend(demux.flush());
+        assert_eq!(out.len(), 1, "split {split}");
+        assert_eq!(out[0].data, want, "split {split}");
+        assert!(!out[0].discontinuity, "split {split}");
+    }
+    // A same-CC packet with different data after a split is still a gap, not a duplicate.
+    let other = ts_payload_packet(pid, false, 1, &[b'C'; 184]);
+    let mut demux = TsDemuxer::new(&[pid]);
+    let mut first = start;
+    first.extend_from_slice(&cont);
+    let mut second = other;
+    second.extend(ts_payload_packet(pid, true, 2, &pes_start(b"DDDD")));
+    let mut out = demux.feed(&first);
+    out.extend(demux.feed(&second));
+    out.extend(demux.flush());
+    assert_eq!(out.len(), 1, "A+B is dropped at the gap: {out:?}");
+    assert!(out[0].data.starts_with(b"DDDD") && out[0].discontinuity);
+}
+
 // h222 lets a PES header span packets: a PUSI payload too short for the fixed header or
 // its PTS/DTS is completed by the continuation, and the timestamps are kept.
 #[test]
