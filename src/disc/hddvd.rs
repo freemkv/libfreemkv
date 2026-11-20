@@ -289,7 +289,7 @@ fn probe_evo_streams(
             // scan time, so this is a default (a 2.0 track is over-stated as
             // 5.1 in the header — the compressed audio itself is unaffected).
             channels: AudioChannels::Surround51,
-            language: String::new(),
+            language: Default::default(),
             sample_rate: SampleRate::S48,
             secondary: false,
             purpose: crate::disc::LabelPurpose::Normal,

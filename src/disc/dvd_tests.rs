@@ -296,7 +296,7 @@ fn scan_audio(vts: Vec<u8>) -> (Vec<(u16, String)>, Vec<String>) {
         .streams
         .iter()
         .filter_map(|s| match s {
-            Stream::Audio(a) => Some((a.pid, a.language.clone())),
+            Stream::Audio(a) => Some((a.pid, a.language.to_string())),
             _ => None,
         })
         .collect();
@@ -491,7 +491,7 @@ fn scanned_audio(vts: Vec<u8>) -> Vec<(u16, String, bool)> {
         .streams
         .iter()
         .filter_map(|s| match s {
-            Stream::Audio(a) => Some((a.pid, a.language.clone(), a.is_mp2_extension())),
+            Stream::Audio(a) => Some((a.pid, a.language.to_string(), a.is_mp2_extension())),
             _ => None,
         })
         .collect()
@@ -586,7 +586,7 @@ fn scan_subs(vts: Vec<u8>) -> Vec<(u16, String)> {
     t[0].streams
         .iter()
         .filter_map(|s| match s {
-            Stream::Subtitle(s) => Some((s.pid, s.language.clone())),
+            Stream::Subtitle(s) => Some((s.pid, s.language.to_string())),
             _ => None,
         })
         .collect()

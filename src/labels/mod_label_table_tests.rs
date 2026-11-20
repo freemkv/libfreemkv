@@ -180,7 +180,7 @@ fn ordinal_binding_needs_a_stated_subtitle_language() {
         streams: vec![Stream::Subtitle(SubtitleStream {
             pid: 0x12A0,
             codec: Codec::Pgs,
-            language: String::new(),
+            language: Default::default(),
             forced: false,
             qualifier: LabelQualifier::None,
             codec_data: None,

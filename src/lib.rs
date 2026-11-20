@@ -206,7 +206,7 @@ pub use dirimage::DirImage;
 pub use disc::{
     AacsState, AudioChannels, AudioStream, BusRoute, Clip, ClipId, Codec, ColorSpace,
     ContentFormat, Disc, DiscFormat, DiscId, DiscTitle, DriveCredentials, Extent, ExtractOptions,
-    ExtractResult, FileResult, FrameRate, HdrFormat, LabelPurpose, LabelQualifier, LayerMap,
+    ExtractResult, FileResult, FrameRate, HdrFormat, LabelPurpose, LabelQualifier, Lang, LayerMap,
     ProtectionLabel, Resolution, SampleRate, ScanOptions, Stream, SubtitleStream, TrackPath,
     VideoStream, imgburn_dvd_descriptor,
 };

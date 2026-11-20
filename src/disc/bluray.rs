@@ -436,7 +436,7 @@ impl Disc {
                             Some(Stream::Subtitle(SubtitleStream {
                                 pid: s.pid,
                                 codec,
-                                language: s.language.clone(),
+                                language: s.language.as_str().into(),
                                 forced: false,
                                 qualifier: crate::disc::LabelQualifier::None,
                                 codec_data: None,
@@ -446,7 +446,7 @@ impl Disc {
                                 pid: s.pid,
                                 codec,
                                 channels: playlist_channels(s.audio_format, codec),
-                                language: s.language.clone(),
+                                language: s.language.as_str().into(),
                                 sample_rate: SampleRate::from_audio_rate(s.audio_rate),
                                 secondary: s.stream_type == 5,
                                 purpose: crate::disc::LabelPurpose::Normal,
@@ -459,7 +459,7 @@ impl Disc {
                     3 => Some(Stream::Subtitle(SubtitleStream {
                         pid: s.pid,
                         codec,
-                        language: s.language.clone(),
+                        language: s.language.as_str().into(),
                         forced: false,
                         qualifier: crate::disc::LabelQualifier::None,
                         codec_data: None,

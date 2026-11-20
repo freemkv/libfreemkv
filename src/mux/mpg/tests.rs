@@ -1315,8 +1315,8 @@ fn an_mpg_file_reads_back_through_the_ps_pipeline() {
         .iter()
         .map(|s| match s {
             DiscStream::Video(v) => (v.pid, v.codec, String::new()),
-            DiscStream::Audio(a) => (a.pid, a.codec, a.language.clone()),
-            DiscStream::Subtitle(t) => (t.pid, t.codec, t.language.clone()),
+            DiscStream::Audio(a) => (a.pid, a.codec, a.language.to_string()),
+            DiscStream::Subtitle(t) => (t.pid, t.codec, t.language.to_string()),
         })
         .collect();
     assert_eq!(

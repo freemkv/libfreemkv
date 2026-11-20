@@ -66,7 +66,7 @@ fn audio_stream(codec: Codec, lang: &str) -> DiscStream {
         pid: 0x1100,
         codec,
         channels: AudioChannels::Stereo,
-        language: lang.to_string(),
+        language: lang.into(),
         sample_rate: SampleRate::S48,
         secondary: false,
         purpose: LabelPurpose::Normal,
@@ -78,7 +78,7 @@ fn subtitle_stream(codec: Codec, lang: &str) -> DiscStream {
     DiscStream::Subtitle(crate::disc::SubtitleStream {
         pid: 0x1200,
         codec,
-        language: lang.to_string(),
+        language: lang.into(),
         forced: false,
         qualifier: crate::disc::LabelQualifier::None,
         codec_data: None,

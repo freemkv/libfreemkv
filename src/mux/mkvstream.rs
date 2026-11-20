@@ -2545,7 +2545,7 @@ fn parse_track(r: &mut impl Read, size: u64) -> io::Result<ParsedTrack> {
             pid: ts_pid,
             codec,
             channels: chs,
-            language: lang,
+            language: lang.as_str().into(),
             sample_rate: srs,
             secondary: false,
             purpose: crate::disc::LabelPurpose::Normal,
@@ -2554,7 +2554,7 @@ fn parse_track(r: &mut impl Read, size: u64) -> io::Result<ParsedTrack> {
         17 => Some(crate::disc::Stream::Subtitle(SubtitleStream {
             pid: ts_pid,
             codec,
-            language: lang,
+            language: lang.as_str().into(),
             forced,
             qualifier: crate::disc::LabelQualifier::None,
             codec_data: None,

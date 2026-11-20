@@ -6272,3 +6272,36 @@ fn a_complete_feature_has_a_chapter_table_spanning_half_its_runtime() {
         &[0.0, 0.0]
     )));
 }
+
+// A stream language is held inline and reads, prints and compares as the String it replaced;
+// the lossy decode of 3 invalid bytes (9 bytes) fits, and an oversized value is cut on a char.
+#[test]
+fn lang_reads_prints_and_compares_like_a_string() {
+    let eng = Lang::from("eng");
+    assert_eq!(eng, "eng");
+    assert_eq!(eng.as_str(), "eng");
+    assert_eq!(format!("{eng:?}"), format!("{:?}", "eng"));
+    assert_eq!(eng.to_string(), "eng");
+    assert!(Lang::default().is_empty());
+    assert_eq!(Lang::default(), "");
+    let lossy = String::from_utf8_lossy(&[0xFF, 0xFE, 0xFD]).to_string();
+    assert_eq!(Lang::from(lossy.as_str()), lossy);
+    let long = "é".repeat(10);
+    let cut = Lang::from(long.as_str());
+    assert_eq!(cut.as_str(), "é".repeat(7));
+    assert!(Lang::from("deu") < Lang::from("eng"));
+    assert_eq!(Lang::from("fra"), Lang::from(String::from("fra")));
+}
+
+// A clip id reads, prints and compares as the String it replaced, and clones share it.
+#[test]
+fn clip_id_reads_prints_and_compares_like_a_string() {
+    let id = ClipId::from("00001");
+    assert_eq!(id, "00001");
+    assert_eq!(id, String::from("00001"));
+    assert_eq!(format!("{id:?}"), format!("{:?}", "00001"));
+    assert_eq!(format!("{id}"), "00001");
+    let copy = id.clone();
+    assert!(std::ptr::eq(id.as_str(), copy.as_str()));
+    assert!(ClipId::default().is_empty());
+}

@@ -277,7 +277,7 @@ fn audio(
         pid,
         codec,
         channels,
-        language,
+        language: language.into(),
         sample_rate: rate,
         secondary: false,
         purpose: LabelPurpose::Normal,
@@ -479,7 +479,7 @@ pub(crate) fn scan(head: &[u8]) -> Option<Scan> {
                     0x20..=0x3F => Stream::Subtitle(SubtitleStream {
                         pid: u16::from(sub),
                         codec: Codec::DvdSub,
-                        language: lang,
+                        language: lang.into(),
                         forced: info.is_some_and(|i| i.forced),
                         qualifier: LabelQualifier::None,
                         codec_data: map

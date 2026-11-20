@@ -194,7 +194,7 @@ impl M2tsMeta {
                     pid: a.pid,
                     codec: a.codec.id().into(),
                     channels: a.channels.to_string(),
-                    language: a.language.clone(),
+                    language: a.language.to_string(),
                     sample_rate: a.sample_rate.to_string(),
                     label: a.label.clone(),
                     secondary: a.secondary,
@@ -204,7 +204,7 @@ impl M2tsMeta {
                 Stream::Subtitle(s) => MetaStream::Subtitle {
                     pid: s.pid,
                     codec: s.codec.id().into(),
-                    language: s.language.clone(),
+                    language: s.language.to_string(),
                     forced: s.forced,
                     codec_private: codec_private_b64(i),
                     qualifier: qualifier_id(s.qualifier).into(),
@@ -339,7 +339,7 @@ impl M2tsMeta {
                     channels: channels
                         .parse()
                         .unwrap_or(crate::disc::AudioChannels::Unknown),
-                    language: language.clone(),
+                    language: language.into(),
                     sample_rate: sample_rate
                         .parse()
                         .unwrap_or(crate::disc::SampleRate::Unknown),
@@ -357,7 +357,7 @@ impl M2tsMeta {
                 } => Stream::Subtitle(SubtitleStream {
                     pid: *pid,
                     codec: codec.parse().unwrap_or(crate::disc::Codec::Unknown(0)),
-                    language: language.clone(),
+                    language: language.into(),
                     forced: *forced,
                     qualifier: qualifier_from_id(qualifier),
                     codec_data: decode_codec_private(codec_private).map(Into::into),

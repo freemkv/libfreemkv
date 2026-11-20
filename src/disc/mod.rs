@@ -335,6 +335,139 @@ impl serde::Serialize for ClipId {
     }
 }
 
+const LANG_CAPACITY: usize = 15;
+
+/// A stream's language code (ISO 639-2, e.g. "eng"), held inline with no heap allocation.
+/// Up to [`Lang::CAPACITY`] bytes: a 3-byte code, or its lossy decode, always fits; a longer
+/// value is cut at a char boundary. Reads as a `str` and compares with string types.
+#[derive(Clone, Default, PartialEq, Eq, Hash)]
+pub struct Lang {
+    len: u8,
+    bytes: [u8; LANG_CAPACITY],
+}
+
+impl Lang {
+    /// Bytes a `Lang` holds.
+    pub const CAPACITY: usize = LANG_CAPACITY;
+
+    /// The code as a string slice.
+    pub fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.bytes[..self.len as usize]).unwrap_or_default()
+    }
+}
+
+impl From<&str> for Lang {
+    fn from(s: &str) -> Self {
+        let mut len = s.len().min(Self::CAPACITY);
+        while !s.is_char_boundary(len) {
+            len -= 1;
+        }
+        let mut bytes = [0u8; Self::CAPACITY];
+        bytes[..len].copy_from_slice(&s.as_bytes()[..len]);
+        Lang {
+            len: len as u8,
+            bytes,
+        }
+    }
+}
+
+impl From<String> for Lang {
+    fn from(s: String) -> Self {
+        Lang::from(s.as_str())
+    }
+}
+
+impl From<&String> for Lang {
+    fn from(s: &String) -> Self {
+        Lang::from(s.as_str())
+    }
+}
+
+impl From<Lang> for String {
+    fn from(l: Lang) -> Self {
+        l.as_str().to_string()
+    }
+}
+
+impl std::ops::Deref for Lang {
+    type Target = str;
+    fn deref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl AsRef<str> for Lang {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl PartialOrd for Lang {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Lang {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.as_str().cmp(other.as_str())
+    }
+}
+
+impl std::fmt::Debug for Lang {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(self.as_str(), f)
+    }
+}
+
+impl std::fmt::Display for Lang {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl PartialEq<str> for Lang {
+    fn eq(&self, other: &str) -> bool {
+        self.as_str() == other
+    }
+}
+
+impl PartialEq<&str> for Lang {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
+}
+
+impl PartialEq<String> for Lang {
+    fn eq(&self, other: &String) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+
+impl PartialEq<Lang> for str {
+    fn eq(&self, other: &Lang) -> bool {
+        self == other.as_str()
+    }
+}
+
+impl PartialEq<Lang> for &str {
+    fn eq(&self, other: &Lang) -> bool {
+        *self == other.as_str()
+    }
+}
+
+impl PartialEq<Lang> for String {
+    fn eq(&self, other: &Lang) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+
+impl serde::Serialize for Lang {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        s.serialize_str(self.as_str())
+    }
+}
+
 /// A clip reference within a title.
 #[derive(Debug, Clone)]
 pub struct Clip {
@@ -507,7 +640,7 @@ pub struct AudioStream {
     /// Channel layout
     pub channels: AudioChannels,
     /// ISO 639-2 language code (e.g. "eng", "fra")
-    pub language: String,
+    pub language: Lang,
     /// Sample rate
     pub sample_rate: SampleRate,
     /// Whether this is a secondary stream (commentary)
@@ -542,7 +675,7 @@ pub struct SubtitleStream {
     /// Codec (PGS)
     pub codec: Codec,
     /// ISO 639-2 language code (e.g. "eng", "fra")
-    pub language: String,
+    pub language: Lang,
     /// Whether this is a forced subtitle
     pub forced: bool,
     /// Subtitle qualifier (SDH / descriptive service / forced / none).

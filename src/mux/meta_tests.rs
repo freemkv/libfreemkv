@@ -191,7 +191,7 @@ fn a_header_with_more_than_256_streams_is_refused() {
                 .push(Stream::Subtitle(crate::disc::SubtitleStream {
                     pid: pid as u16,
                     codec: Codec::Pgs,
-                    language: String::new(),
+                    language: Default::default(),
                     forced: false,
                     qualifier: crate::disc::LabelQualifier::None,
                     codec_data: None,
