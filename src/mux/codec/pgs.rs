@@ -319,8 +319,13 @@ impl PgsParser {
 
 impl CodecParser for PgsParser {
     fn parse(&mut self, pes: &PesPacket) -> Vec<Frame> {
+        super::parse_cloned(self, pes)
+    }
+
+    // A PCS opening a display set, or a lone segment, is moved into the set or frame.
+    fn parse_into(&mut self, mut pes: PesPacket, out: &mut Vec<Frame>) {
         if pes.data.is_empty() {
-            return Vec::new();
+            return;
         }
         // Keep PTS as Option: collapsing a missing PTS to 0 gives a wrong start
         // and an absurd duration (full disc runtime). Well-formed BD PCS packets
@@ -334,7 +339,8 @@ impl CodecParser for PgsParser {
         // any pending set with a fallback and drop the header to resync on next PCS.
         if is_pcs && pes.data.len() <= PCS_NUM_OBJECTS_OFFSET {
             self.skip_to_pcs = true;
-            return self.emit_pending(None).into_iter().collect();
+            out.extend(self.emit_pending(None));
+            return;
         }
 
         let pcs_num_objects = if is_pcs {
@@ -343,7 +349,6 @@ impl CodecParser for PgsParser {
             None
         };
 
-        let mut out = Vec::new();
         match pcs_num_objects {
             // Every PCS starts a new set, including empty compositions. Keep
             // the clear's following WDS/END with it, rather than emitting orphan
@@ -365,7 +370,10 @@ impl CodecParser for PgsParser {
                     out.extend(self.emit_pending(Some(start)));
                     // The set's facts are THIS packet's — the one that opened
                     // it. `start` is that packet's PTS by construction.
-                    self.pending = Some((super::pesbuf::PesFacts::of(pes), pes.data.clone()));
+                    self.pending = Some((
+                        super::pesbuf::PesFacts::of(&pes),
+                        std::mem::take(&mut pes.data),
+                    ));
                 }
                 // A PCS with no PTS has an unknown start time. Don't
                 // store it with a 0 sentinel (wrong start, absurd duration).
@@ -394,7 +402,7 @@ impl CodecParser for PgsParser {
                     self.skip_to_pcs = true;
                 }
                 if self.skip_to_pcs {
-                    return out;
+                    return;
                 }
                 if let Some((_, ref mut buf)) = self.pending {
                     // Bound accumulation: a well-formed display set is small.
@@ -413,10 +421,10 @@ impl CodecParser for PgsParser {
                         // Emitted straight from THIS packet, so its facts are
                         // this packet's -- the same rule as a pending set,
                         // which takes the facts of the packet that opened it.
-                        source: super::pesbuf::PesFacts::of(pes).source,
+                        source: super::pesbuf::PesFacts::of(&pes).source,
                         pts_ns,
                         keyframe: true,
-                        data: pes.data.clone(),
+                        data: std::mem::take(&mut pes.data),
                         duration_ns: Some(DEFAULT_PGS_DURATION_NS),
                     });
                 }
@@ -431,7 +439,6 @@ impl CodecParser for PgsParser {
         if let Some(pts) = self.complete_clear_pts() {
             out.extend(self.emit_pending(Some(pts)));
         }
-        out
     }
 
     fn flush(&mut self) -> Vec<Frame> {

@@ -72,11 +72,14 @@ impl DvdSubParser {
 
 impl CodecParser for DvdSubParser {
     fn parse(&mut self, pes: &PesPacket) -> Vec<Frame> {
-        if pes.data.is_empty() {
-            return Vec::new();
-        }
+        super::parse_cloned(self, pes)
+    }
 
-        let mut out = Vec::new();
+    // The SPU's first PES is moved into the open unit (or emitted as a lone frame).
+    fn parse_into(&mut self, mut pes: PesPacket, out: &mut Vec<Frame>) {
+        if pes.data.is_empty() {
+            return;
+        }
 
         // PTS present == start of a new SPU (continuations carry none); a PTS
         // while `pending` is still open (lost continuation/corrupt SPU_size)
@@ -97,12 +100,12 @@ impl CodecParser for DvdSubParser {
                     if let Some(frame) = self.take_if_complete(false) {
                         out.push(frame);
                     }
-                    return out;
+                    return;
                 }
                 // Orphan continuation (no pending, no PTS): a fresh SPU at
                 // pts 0 would put a garbage bitmap at 00:00:00. PGS drops
                 // the same case, so drop here too (L054).
-                return out;
+                return;
             }
             Some(pts) => {
                 if let Some(frame) = self.take_if_complete(true) {
@@ -126,13 +129,13 @@ impl CodecParser for DvdSubParser {
                 out.push(Frame {
                     discontinuity: false,
                     coding: None,
-                    source: super::pesbuf::PesFacts::of(pes).source,
+                    source: super::pesbuf::PesFacts::of(&pes).source,
                     pts_ns,
                     keyframe: true,
-                    data: pes.data.clone(),
+                    data: std::mem::take(&mut pes.data),
                     duration_ns: None,
                 });
-                return out;
+                return;
             }
             d
         } else {
@@ -140,24 +143,24 @@ impl CodecParser for DvdSubParser {
             out.push(Frame {
                 discontinuity: false,
                 coding: None,
-                source: super::pesbuf::PesFacts::of(pes).source,
+                source: super::pesbuf::PesFacts::of(&pes).source,
                 pts_ns,
                 keyframe: true,
-                data: pes.data.clone(),
+                data: std::mem::take(&mut pes.data),
                 duration_ns: None,
             });
-            return out;
+            return;
         };
 
-        let mut buf = pes.data.clone();
+        let facts = super::pesbuf::PesFacts::of(&pes);
+        let mut buf = pes.data;
         if buf.len() > MAX_SPU_BYTES {
             buf.truncate(MAX_SPU_BYTES);
         }
-        self.pending = Some((super::pesbuf::PesFacts::of(pes), declared, buf));
+        self.pending = Some((facts, declared, buf));
         if let Some(frame) = self.take_if_complete(false) {
             out.push(frame);
         }
-        out
     }
 
     fn flush(&mut self) -> Vec<Frame> {

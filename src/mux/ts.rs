@@ -18,7 +18,7 @@ const SYNC_BYTE: u8 = 0x47;
 const NULL_PID: u16 = 0x1FFF;
 
 /// A reassembled PES packet with timestamp info.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PesPacket {
     /// MPEG-TS PID this packet belongs to.
     pub pid: u16,

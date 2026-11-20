@@ -64,14 +64,15 @@ impl Parser {
             discontinuity: false,
         };
         self.out.clear();
-        self.out.extend(self.inner.parse(&pes));
+        self.inner.parse_into(pes, &mut self.out);
         (self.out.len(), self.out.iter().map(|f| f.data.len()).sum())
     }
 
     /// Drain the parser at end of stream; same counts as [`Self::parse`].
     pub fn flush(&mut self) -> (usize, usize) {
-        let out = self.inner.flush();
-        (out.len(), out.iter().map(|f| f.data.len()).sum())
+        self.out.clear();
+        self.inner.flush_into(&mut self.out);
+        (self.out.len(), self.out.iter().map(|f| f.data.len()).sum())
     }
 }
 

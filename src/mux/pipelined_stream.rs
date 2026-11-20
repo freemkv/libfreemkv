@@ -34,6 +34,8 @@ pub struct PipelinedPesStream {
     demux_thread: DemuxThread,
 
     pending_frames: std::collections::VecDeque<PesFrame>,
+    /// One PES's parsed frames, reused for every PES (`CodecParser::parse_into`).
+    parsed: Vec<super::codec::Frame>,
     eof: bool,
     // The terminal read error (kind, rendered code), repeated by every later read.
     failed: Option<(io::ErrorKind, String)>,
@@ -134,6 +136,7 @@ impl PipelinedPesStream {
             demux_rx,
             demux_thread,
             pending_frames: std::collections::VecDeque::new(),
+            parsed: Vec::new(),
             eof: false,
             failed: None,
             skip_parse: false,
@@ -248,7 +251,10 @@ impl PipelinedPesStream {
                     self.parsers.iter_mut().find(|(pid, _)| *pid == pes.pid)
                 {
                     let is_video = self.is_video.get(track).copied().unwrap_or(false);
-                    for frame in parser.parse(&pes) {
+                    let pid = pes.pid;
+                    let mut parsed = std::mem::take(&mut self.parsed);
+                    parser.parse_into(pes, &mut parsed);
+                    for frame in parsed.drain(..) {
                         // B1: after a concealed/lost gap, drop forward to the next video
                         // keyframe so no dangling-reference frame is emitted. Read PER-FRAME
                         // (post-gap picture); audio/subtitle admit, no-gate track emits as-is.
@@ -262,7 +268,7 @@ impl PipelinedPesStream {
                                     tracing::warn!(
                                         target: "mux",
                                         track,
-                                        pid = pes.pid,
+                                        pid,
                                         dropped,
                                         "B1: resynced at keyframe after concealed gap"
                                     );
@@ -276,6 +282,7 @@ impl PipelinedPesStream {
                                 .push_back(PesFrame::from_codec_frame(track, frame));
                         }
                     }
+                    self.parsed = parsed;
                 }
             }
         }
@@ -358,9 +365,10 @@ impl PipelinedPesStream {
                 Some(m) => pkts.into_iter().flat_map(|p| m.push(p)).collect(),
                 None => pkts,
             };
-            for pes in &pkts {
-                if let Some((_, parser)) = self.parsers.iter_mut().find(|(p, _)| *p == pid) {
-                    for frame in parser.parse(pes) {
+            if let Some((_, parser)) = self.parsers.iter_mut().find(|(p, _)| *p == pid) {
+                for pes in pkts {
+                    parser.parse_into(pes, &mut self.parsed);
+                    for frame in self.parsed.drain(..) {
                         self.pending_frames
                             .push_back(PesFrame::from_codec_frame(track, frame));
                     }
@@ -438,10 +446,10 @@ impl PipelinedPesStream {
                             tail = tail.into_iter().flat_map(|p| m.push(p)).collect();
                             tail.extend(m.flush());
                         }
-                        for pes in &tail {
-                            frames.extend(parser.parse(pes));
+                        for pes in tail {
+                            parser.parse_into(pes, &mut frames);
                         }
-                        frames.extend(parser.flush());
+                        parser.flush_into(&mut frames);
                         for frame in frames {
                             let emit = match resync.get_mut(track) {
                                 Some(gate) => gate.admit(
