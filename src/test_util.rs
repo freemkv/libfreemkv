@@ -412,6 +412,31 @@ pub fn decrypt_unit(unit: &mut [u8], unit_key: &[u8; 16]) {
     crate::aacs::content::decrypt_unit(unit, unit_key)
 }
 
+/// The whole-disc decrypting reader a key set builds over `inner`, keying each
+/// `[start, end)` of `ranges` (one stream file each, its unit grid anchored at
+/// `start`) with `unit_key`. For benches and tests that time the real read path.
+pub fn keyed_reader<S: SectorSource>(
+    inner: S,
+    unit_key: [u8; 16],
+    ranges: &[(u32, u32)],
+) -> crate::whole_disc::WholeDiscReader<S> {
+    let keys = crate::decrypt::DecryptKeys::Aacs {
+        unit_keys: vec![(0, unit_key)],
+        format: crate::disc::ContentFormat::BdTs,
+    };
+    let map =
+        crate::decrypt::AacsKeyMap::from_ranges(ranges.iter().map(|&(s, e)| (s, e, 0)).collect());
+    let spans: Vec<crate::whole_disc::UnitSpan> = ranges
+        .iter()
+        .map(|&(s, e)| (s, e.saturating_sub(s), s as u64))
+        .collect();
+    let content = crate::whole_disc::merge_ranges(spans.iter().map(|&(s, n, _)| (s, n)).collect());
+    let keying = crate::sector::Keying::ring(keys, Arc::new(map), None);
+    let dec = crate::sector::DecryptingSectorSource::new(inner, keying)
+        .with_content_ranges(Arc::from(content));
+    crate::whole_disc::UnitAligned::new(dec, spans)
+}
+
 /// Encrypt one 6144-byte aligned unit in place with a CPS unit key — the exact
 /// inverse of [`decrypt_unit`]. The test-side door for building ciphertext
 /// fixtures, so no consumer test needs the internal one. Returns `false` if the

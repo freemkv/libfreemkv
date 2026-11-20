@@ -183,3 +183,34 @@ fn encrypted_bd_image_pads_a_partial_final_unit() {
         assert_ne!(unit(&img.image, lba), unit(&img.plain, lba), "unit {u}");
     }
 }
+
+// The keyed reader decrypts its file on the file's own grid, from any offset, and
+// leaves the rest of the image (another keyed file, clear sectors) untouched.
+#[test]
+fn keyed_reader_decrypts_its_ranges_from_any_offset() {
+    let img = fixture();
+    let (start, sectors) = img.files[0];
+    let mut r = keyed_reader(img.source(), K1, &[(start, start + sectors)]);
+    let mut want = img.plain.clone();
+    let at = start as usize * SECTOR_BYTES;
+    for p in want[at..at + sectors as usize * SECTOR_BYTES].chunks_mut(BD_SOURCE_PACKET_BYTES) {
+        p[0] &= 0x3F;
+    }
+    for (lba, n) in [(start, sectors), (start + 1, 7), (start - 2, 5)] {
+        let mut buf = vec![0u8; n as usize * SECTOR_BYTES];
+        let got = r
+            .read_sectors(lba, n as u16, &mut buf, false)
+            .expect("read");
+        assert_eq!(got, buf.len());
+        let from = lba as usize * SECTOR_BYTES;
+        assert!(buf == want[from..from + buf.len()], "lba {lba} +{n}");
+    }
+    let (other, _) = img.files[1];
+    let mut buf = vec![0u8; ALIGNED_UNIT_LEN];
+    r.read_sectors(other, 3, &mut buf, false).expect("read");
+    assert_eq!(
+        buf,
+        unit(&img.image, other),
+        "another file stays ciphertext"
+    );
+}
