@@ -365,8 +365,7 @@ impl UdfFs {
         let cap_hint = (entry.size as usize)
             .min(limit)
             .min(MAX_FILE_BYTES as usize)
-            .div_ceil(SECTOR_BYTES)
-            * SECTOR_BYTES;
+            .next_multiple_of(SECTOR_BYTES);
         let mut data = Vec::with_capacity(cap_hint);
         'extents: for ext in extents {
             let (data_lba, data_len) = (ext.lba, ext.len);
