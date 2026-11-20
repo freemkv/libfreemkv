@@ -607,3 +607,55 @@ fn debus_bounded_by_reported_n_and_capacity_delegates() {
         "bytes beyond the reported n must stay ciphertext"
     );
 }
+
+// Unit-aligned reads measure every head in their own buffer: nothing goes into the cache,
+// and every unit is still decided right (clear units untouched, flagged ones de-bussed).
+#[test]
+fn host_key_in_buffer_heads_are_not_cached() {
+    let rdk = [0x66u8; 16];
+    let units = 40u32;
+    let mut clear = clear_content(units as usize * 3);
+    for u in (0..units as usize).filter(|u| u % 3 == 0) {
+        clear[u * 3 * SECTOR_BYTES] &= !0xC0;
+    }
+    let mut wire = clear.clone();
+    for u in (0..units as usize).filter(|u| u % 3 != 0) {
+        let at = u * 3 * SECTOR_BYTES;
+        encrypt_bus(&mut wire[at..at + 3 * SECTOR_BYTES], &rdk);
+    }
+    let map = Arc::new(BusMap::from_files(vec![vec![(300, units * 3)]]));
+    let mut g = BusGate::new(map);
+    for chunk in 0..(units / 4) as usize {
+        let at = chunk * 12 * SECTOR_BYTES;
+        let mut b = wire[at..at + 12 * SECTOR_BYTES].to_vec();
+        g.debus(&mut b, &rdk, 300 + chunk as u32 * 12, &mut |_| {
+            unreachable!("every head is in its own buffer")
+        });
+        assert!(b == clear[at..at + 12 * SECTOR_BYTES], "chunk {chunk}");
+    }
+    assert!(g.cpi.is_empty(), "in-buffer heads are not remembered");
+}
+
+// A read that continues mid-unit uses the decision carried in `last`: no head re-read.
+#[test]
+fn host_key_a_continuing_read_reuses_the_last_unit_decision() {
+    let rdk = [0x67u8; 16];
+    let clear = clear_content(6); // LBAs 300..306, two units, both flagged
+    let mut wire = clear.clone();
+    for unit in wire.chunks_mut(3 * SECTOR_BYTES) {
+        encrypt_bus(unit, &rdk);
+    }
+    let map = Arc::new(BusMap::from_files(vec![vec![(300, 6)]]));
+    let mut g = BusGate::new(map);
+    let mut first = wire[..4 * SECTOR_BYTES].to_vec();
+    g.debus(&mut first, &rdk, 300, &mut |_| {
+        unreachable!("heads in buffer")
+    });
+    let mut rest = wire[4 * SECTOR_BYTES..].to_vec();
+    g.debus(&mut rest, &rdk, 304, &mut |_| {
+        unreachable!("`last` covers unit 1")
+    });
+    first.extend_from_slice(&rest);
+    assert_eq!(first, clear);
+    assert!(g.cpi.is_empty());
+}

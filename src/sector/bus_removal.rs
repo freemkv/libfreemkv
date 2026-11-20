@@ -20,8 +20,9 @@ use super::SectorSource;
 // the TP_extra_header copy-permission indicator.
 const UNIT_SECTORS: u64 = 3;
 const CPI_MASK: u8 = 0xC0;
-// Bound on remembered per-unit decisions (cleared when full).
-const CPI_CACHE_MAX: usize = 1 << 16;
+// Bound on remembered per-unit decisions (cleared when full). Only heads read outside a
+// buffer are remembered, which unit-aligned reads almost never need.
+const CPI_CACHE_MAX: usize = 1 << 12;
 
 #[derive(Debug, Clone, Copy)]
 struct Span {
@@ -321,24 +322,25 @@ impl BusGate {
                 let head = loc
                     .head_in_span
                     .or_else(|| self.map.file_lba(loc.file, loc.unit * UNIT_SECTORS));
-                let byte0 = match head {
-                    Some(h) if h >= base_lba && ((h - base_lba) as usize) < n => {
-                        Some(buf[(h - base_lba) as usize * SECTOR_BYTES])
-                    }
-                    Some(h) => head_byte0(h),
-                    None => None,
+                let in_buf = head.filter(|&h| h >= base_lba && ((h - base_lba) as usize) < n);
+                let byte0 = match (in_buf, head) {
+                    (Some(h), _) => Some(buf[(h - base_lba) as usize * SECTOR_BYTES]),
+                    (None, Some(h)) => head_byte0(h),
+                    (None, None) => None,
                 };
                 // An unreadable head is a guess, not a measurement: it is not
                 // remembered, so a later read that has the head decides for real.
                 // An unmapped head can never be measured, so that guess is stable.
                 let e = byte0.is_none_or(|b| b & CPI_MASK != 0);
-                if byte0.is_some() || head.is_none() {
+                // A head in the buffer is free to measure again, so only `last` keeps it.
+                if in_buf.is_none() {
+                    if byte0.is_none() && head.is_some() {
+                        return e;
+                    }
                     if self.cpi.len() >= CPI_CACHE_MAX {
                         self.cpi.clear();
                     }
                     self.cpi.insert(key, e);
-                } else {
-                    return e;
                 }
                 e
             }
