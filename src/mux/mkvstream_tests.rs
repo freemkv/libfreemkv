@@ -82,12 +82,12 @@ fn mvc_merge_pairs_base_and_dependent_by_pts() {
     let dep = lp(&[&SUBSET_SPS, &DEP_PPS, &DEP_SLICE]);
 
     // Base arrives first (SSIF order): buffered, nothing emitted yet.
-    let e = m.ingest(&mvc_frame(0, 100, true, lp(&[&[0x65, 1, 2]])));
+    let e = m.ingest(mvc_frame(0, 100, true, lp(&[&[0x65, 1, 2]])));
     assert!(e.is_empty(), "base held until its dependent arrives");
 
     // Dependent arrives → base is emitted, remapped to the base track, with
     // the dependent AU as its BlockAdditional; params are captured.
-    let e = m.ingest(&mvc_frame(2, 100, false, dep.clone()));
+    let e = m.ingest(mvc_frame(2, 100, false, dep.clone()));
     assert_eq!(e.len(), 1, "the paired base frame is emitted");
     assert_eq!(e[0].0.track, 0, "remapped to the base muxer track");
     assert_eq!(
@@ -98,15 +98,15 @@ fn mvc_merge_pairs_base_and_dependent_by_pts() {
     assert!(m.captured_params.is_some(), "mvcC params captured");
 
     // Audio passes straight through (remapped, no additional).
-    let e = m.ingest(&mvc_frame(1, 100, true, vec![0xAA]));
+    let e = m.ingest(mvc_frame(1, 100, true, vec![0xAA]));
     assert_eq!(e.len(), 1);
     assert_eq!(e[0].0.track, 1);
     assert!(e[0].1.is_none());
 
     // Dependent-before-base (reordered) also pairs.
     let dep2 = lp(&[&DEP_SLICE]);
-    assert!(m.ingest(&mvc_frame(2, 200, false, dep2.clone())).is_empty());
-    let e = m.ingest(&mvc_frame(0, 200, false, lp(&[&[0x61, 3, 4]])));
+    assert!(m.ingest(mvc_frame(2, 200, false, dep2.clone())).is_empty());
+    let e = m.ingest(mvc_frame(0, 200, false, lp(&[&[0x61, 3, 4]])));
     assert_eq!(e.len(), 1);
     assert_eq!(e[0].1.as_deref(), Some(dep2.as_slice()));
 }
@@ -116,7 +116,7 @@ fn mvc_merge_flushes_unpaired_base_at_eof() {
     let mut m = empty_merge();
     // Base with no dependent ever → held, then flushed unpaired at EOF.
     assert!(
-        m.ingest(&mvc_frame(0, 10, true, vec![0, 0, 0, 1]))
+        m.ingest(mvc_frame(0, 10, true, vec![0, 0, 0, 1]))
             .is_empty()
     );
     let tail = m.flush();
@@ -156,7 +156,7 @@ fn mvc_merge_flushes_oldest_base_once_past_window() {
     let mut emitted = 0usize;
     for pts in 0..n {
         emitted += m
-            .ingest(&mvc_frame(0, pts as i64, false, vec![0, 0, 0, 1]))
+            .ingest(mvc_frame(0, pts as i64, false, vec![0, 0, 0, 1]))
             .len();
     }
     assert_eq!(emitted, 8, "the {n} bases beyond the window flush unpaired");
@@ -170,12 +170,12 @@ fn mvc_merge_flushes_oldest_base_once_past_window() {
 fn mvc_merge_drops_the_dependent_of_a_dropped_base() {
     let mut m = empty_merge();
     assert!(
-        m.ingest(&mvc_frame(2, 1, false, lp(&[&DEP_SLICE])))
+        m.ingest(mvc_frame(2, 1, false, lp(&[&DEP_SLICE])))
             .is_empty()
     );
     let dep = lp(&[&DEP_SLICE, &DEP_PPS]);
-    assert!(m.ingest(&mvc_frame(2, 3, false, dep.clone())).is_empty());
-    let e = m.ingest(&mvc_frame(0, 3, true, vec![0x65, 1]));
+    assert!(m.ingest(mvc_frame(2, 3, false, dep.clone())).is_empty());
+    let e = m.ingest(mvc_frame(0, 3, true, vec![0x65, 1]));
     assert_eq!(e.len(), 1);
     assert_eq!(e[0].1.as_deref(), Some(dep.as_slice()));
     assert!(m.flush().is_empty());
@@ -188,7 +188,7 @@ fn mvc_merge_dep_overflow_drops_old_keeps_newest() {
     // Fill dep_by_pts to the bound with unpaired dependents (unique PTS).
     for pts in 0..(MVC_PAIR_WINDOW * 4) {
         assert!(
-            m.ingest(&mvc_frame(2, pts as i64, false, lp(&[&DEP_SLICE])))
+            m.ingest(mvc_frame(2, pts as i64, false, lp(&[&DEP_SLICE])))
                 .is_empty()
         );
     }
@@ -196,7 +196,7 @@ fn mvc_merge_dep_overflow_drops_old_keeps_newest() {
     // One more overflows: the drifted buffer is cleared BUT the newest survives
     // so its (soon-to-arrive) base can still pair.
     let dep_new = lp(&[&DEP_SLICE]);
-    m.ingest(&mvc_frame(2, 9_999, false, dep_new.clone()));
+    m.ingest(mvc_frame(2, 9_999, false, dep_new.clone()));
     assert_eq!(m.dep_by_pts.len(), 1, "old cleared, newest kept");
     assert!(m.dep_by_pts.contains_key(&9_999));
     assert_eq!(
@@ -205,7 +205,7 @@ fn mvc_merge_dep_overflow_drops_old_keeps_newest() {
         "old buffer counted once"
     );
     // The surviving dependent pairs with its base.
-    let e = m.ingest(&mvc_frame(0, 9_999, false, vec![0x61, 1]));
+    let e = m.ingest(mvc_frame(0, 9_999, false, vec![0x61, 1]));
     assert_eq!(e.len(), 1);
     assert_eq!(e[0].1.as_deref(), Some(dep_new.as_slice()));
 }
@@ -333,6 +333,49 @@ fn a_3d_title_writes_the_mvc_mapping_and_block_additions() {
     assert_eq!(base.len(), 2, "both base frames written once");
     assert_eq!(r.errors(), 2, "one BlockAdditions per paired base frame");
     assert!(r.lost_bytes() >= 2 * dep.len() as u64);
+}
+
+// `write_owned` moves frames through the MVC merge and the pre-activation buffer instead
+// of cloning them: audio buffered before the first IDR, both pairing orders, a lone
+// dependent and an unpaired base at EOF all give the same file as `write`.
+#[test]
+fn write_owned_is_byte_identical_to_write_on_a_3d_title() {
+    let dep = |i: u8| lp(&[&SUBSET_SPS, &DEP_PPS, &[0x74, 0x11, i]]);
+    let mut frames = vec![
+        mvc_frame(2, 0, true, vec![0xA0; 64]),
+        mvc_frame(2, 32_000_000, true, vec![0xA1; 64]),
+    ];
+    for i in 0..13u8 {
+        let pts = i as i64 * 41_708_333;
+        let base = mvc_frame(0, pts, i == 0, lp(&[&[0x65, 0x88, i], &[i; 300]]));
+        match i {
+            12 => frames.push(base),
+            _ if i % 2 == 0 => frames.extend([base, mvc_frame(1, pts, i == 0, dep(i))]),
+            _ => frames.extend([mvc_frame(1, pts, false, dep(i)), base]),
+        }
+        frames.push(mvc_frame(2, 64_000_000 + pts, true, vec![i; 64]));
+    }
+    frames.push(mvc_frame(1, 999_000_000_000, false, dep(99)));
+    let mux = |owned: bool| {
+        let out = SharedOut::new();
+        let mut s = MkvStream::create(Box::new(out.clone()), &mvc_title(), None).unwrap();
+        for f in &frames {
+            match owned {
+                true => s.write_owned(f.clone()).unwrap(),
+                false => s.write(f).unwrap(),
+            }
+        }
+        s.finish().unwrap();
+        out.bytes()
+    };
+    let borrowed = mux(false);
+    let mut r = MkvStream::open(Cursor::new(borrowed.clone())).unwrap();
+    assert_eq!(drain(&mut r).iter().filter(|f| f.track == 0).count(), 13);
+    assert!(r.errors() >= 12, "one BlockAdditions per paired base frame");
+    assert!(
+        mux(true) == borrowed,
+        "write_owned output differs from write"
+    );
 }
 
 // set_codec_private takes a stream index: through the MVC map before the header
@@ -3289,11 +3332,11 @@ fn a_dependent_view_pairs_only_with_the_base_frame_of_the_same_pts() {
     let mut m = empty_merge();
     let dep = lp(&[&SUBSET_SPS, &DEP_PPS, &DEP_SLICE]);
     // Two base frames buffered, oldest first.
-    assert!(m.ingest(&mvc_frame(0, 100, true, vec![0x11])).is_empty());
-    assert!(m.ingest(&mvc_frame(0, 200, false, vec![0x22])).is_empty());
+    assert!(m.ingest(mvc_frame(0, 100, true, vec![0x11])).is_empty());
+    assert!(m.ingest(mvc_frame(0, 200, false, vec![0x22])).is_empty());
     // A dependent for the SECOND one arrives. It must attach to the pts=200
     // base — not to the oldest unpaired base it happens to find first.
-    let e = m.ingest(&mvc_frame(2, 200, false, dep.clone()));
+    let e = m.ingest(mvc_frame(2, 200, false, dep.clone()));
     assert!(
         e.is_empty(),
         "the pts=100 base is still unpaired, so nothing drains yet"

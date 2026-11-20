@@ -10,6 +10,7 @@ use super::hevc::{
     append_length_prefixed_as_annex_b_sized, avcc_to_annex_b, hvcc_to_annex_b, nal_length_size,
 };
 use crate::disc::Codec;
+use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::io::{self, Write};
 
@@ -388,6 +389,28 @@ impl<W: Write> TsMuxer<W> {
         keyframe: bool,
         data: &[u8],
     ) -> io::Result<()> {
+        self.write_frame_data(track, pts_ns, keyframe, Cow::Borrowed(data))
+    }
+
+    /// [`write_frame`](Self::write_frame) for a frame the caller gives up: a frame the
+    /// start-up hold keeps is moved into it instead of copied. Same output.
+    pub(crate) fn write_frame_owned(
+        &mut self,
+        track: usize,
+        pts_ns: i64,
+        keyframe: bool,
+        data: Vec<u8>,
+    ) -> io::Result<()> {
+        self.write_frame_data(track, pts_ns, keyframe, Cow::Owned(data))
+    }
+
+    fn write_frame_data(
+        &mut self,
+        track: usize,
+        pts_ns: i64,
+        keyframe: bool,
+        data: Cow<'_, [u8]>,
+    ) -> io::Result<()> {
         if track >= self.pids.len() {
             return Err(crate::error::Error::MuxTrackRange {
                 track,
@@ -419,13 +442,13 @@ impl<W: Write> TsMuxer<W> {
         // The deriver sees exactly the PTS the header carries (design §2.3 rule 3);
         // dropped frames never reach it (rule 2).
         if is_video {
-            self.push_dts(track, pts_90k as i64, data);
+            self.push_dts(track, pts_90k as i64, &data);
         }
 
         if self.hold.is_empty() && !self.dts_pending() {
-            return self.emit(track, pts_90k, keyframe, data);
+            return self.emit(track, pts_90k, keyframe, &data);
         }
-        self.hold_push(track, pts_90k, keyframe, data);
+        self.hold_push(track, pts_90k, keyframe, data.into_owned());
         if self.dts_pending() && self.hold_over_cap() {
             for d in self.dts.iter_mut().flatten() {
                 d.release_cap();
@@ -460,7 +483,7 @@ impl<W: Write> TsMuxer<W> {
         self.dts.iter().flatten().any(DtsDeriver::pending)
     }
 
-    fn hold_push(&mut self, track: usize, pts_90k: u64, keyframe: bool, data: &[u8]) {
+    fn hold_push(&mut self, track: usize, pts_90k: u64, keyframe: bool, data: Vec<u8>) {
         self.hold_bytes += data.len();
         let (lo, hi) = self.hold_span.unwrap_or((pts_90k, pts_90k));
         self.hold_span = Some((lo.min(pts_90k), hi.max(pts_90k)));
@@ -468,7 +491,7 @@ impl<W: Write> TsMuxer<W> {
             track,
             pts_90k,
             keyframe,
-            data: data.to_vec(),
+            data,
         });
     }
 

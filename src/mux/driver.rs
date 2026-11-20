@@ -1031,7 +1031,7 @@ impl Sink<PesFrame> for WriteSink {
 
     fn apply(&mut self, frame: PesFrame) -> Result<Flow, Error> {
         self.apply_late_configs()?;
-        self.output.write(&frame).map_err(Error::from)?;
+        self.output.write_owned(frame).map_err(Error::from)?;
         self.bytes
             .store(self.output.bytes_written(), Ordering::Relaxed);
         Ok(Flow::Continue)

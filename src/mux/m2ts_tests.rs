@@ -1093,3 +1093,46 @@ fn pmt_stream_types_follow_the_hdmv_table() {
     assert_eq!(stream_type(&secondary_audio(Codec::DtsHdHr)), 0xA2);
     assert_eq!(stream_type(&secondary_audio(Codec::Ac3)), 0x81);
 }
+
+// Mux `frames` through `write` or `write_owned` and return the whole file.
+fn mux_frames(title: &DiscTitle, frames: &[PesFrame], owned: bool) -> Vec<u8> {
+    let shared = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+    let mut stream = M2tsStream::create(SharedSink(shared.clone()), title).unwrap();
+    for f in frames {
+        match owned {
+            true => stream.write_owned(f.clone()).unwrap(),
+            false => stream.write(f).unwrap(),
+        }
+    }
+    stream.finish().unwrap();
+    drop(stream);
+    shared.lock().unwrap().clone()
+}
+
+// `write_owned` moves frames into the muxer's DTS start-up hold instead of copying them:
+// reordered H.264 (the hold fires) with AC-3 alongside is byte-identical to `write`.
+#[test]
+fn write_owned_is_byte_identical_to_write() {
+    use crate::mux::decode_ts::test_es as es;
+    let sps = es::sps_with_reorder(2);
+    let mut title = make_title();
+    if let DiscStream::Video(v) = &mut title.streams[0] {
+        v.codec = Codec::H264;
+    }
+    title.streams.push(ac3_audio(0x1100));
+    title.codec_privates = vec![Some(es::avcc(&sps.nal())), None];
+    let order = [0i64, 3, 1, 2];
+    let mut frames = Vec::new();
+    for i in 0..96i64 {
+        let shown = (i / 4) * 4 + order[(i % 4) as usize];
+        let au = es::length_prefixed(&[es::h264_slice(&sps, i == 0, 0, i as u32, None)]);
+        let pts = 1_000_000_000 + shown * 41_666_667;
+        frames.push(frame(0, pts, i == 0, au));
+        let ac3 = vec![0x0B, 0x77, i as u8, 0x10, 0x40, 0x00, 0xAA];
+        frames.push(frame(1, 1_000_000_000 + i * 32_000_000, true, ac3));
+    }
+    let borrowed = mux_frames(&title, &frames, false);
+    let (_, ts) = ts_after_header(&borrowed);
+    assert_eq!(pes_times(&ts, VIDEO_PID).len(), 96);
+    assert!(mux_frames(&title, &frames, true) == borrowed);
+}

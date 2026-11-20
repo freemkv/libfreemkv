@@ -884,6 +884,36 @@ fn a_sequence_header_from_codec_private_is_restored() {
     assert!(video.starts_with(&seq));
 }
 
+// `write_owned` moves each frame's payload instead of cloning it: the program stream is
+// byte-identical to `write`, with LPCM, subpictures, a codec_private sequence header
+// and empty frames all in play.
+#[test]
+fn write_owned_is_byte_identical_to_write() {
+    let mut fx = fixture(&Opts {
+        audio_lead_ms: 200,
+        ..Opts::default()
+    });
+    let seq = seq_header(720, 576, 3, 112, false);
+    fx.title.codec_privates[0] = Some(seq);
+    for f in fx.frames.iter_mut().filter(|f| f.track == 0 && f.keyframe) {
+        let at = replay::picture_start(&f.data);
+        f.data.drain(..at);
+    }
+    let at = fx.frames.iter().position(|f| f.track == 0).unwrap();
+    let mut empty = fx.frames[at].clone();
+    empty.data.clear();
+    fx.frames.insert(at + 1, empty);
+    let borrowed = run(&fx).out;
+    let mut sink = MpgSink::create(Vec::new(), &fx.title).expect("create");
+    for f in fx.frames.iter().cloned() {
+        sink.write_owned(f).expect("write_owned");
+    }
+    sink.finish().expect("finish");
+    let owned = sink.mux.take().expect("mux").into_writer();
+    assert!(borrowed.len() > 100_000, "{} bytes", borrowed.len());
+    assert!(owned == borrowed, "write_owned output differs from write");
+}
+
 #[test]
 fn mpg_urls_parse() {
     let u = crate::mux::resolve::parse_url("mpg:///out/x.mpg");

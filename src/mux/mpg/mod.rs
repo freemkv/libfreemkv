@@ -662,6 +662,41 @@ impl<W: Write + Send> MpgSink<W> {
 
 impl<W: Write + Send> PesSink for MpgSink<W> {
     fn write(&mut self, frame: &PesFrame) -> io::Result<()> {
+        self.write_frame(frame, None)
+    }
+
+    fn write_owned(&mut self, mut frame: PesFrame) -> io::Result<()> {
+        let data = std::mem::take(&mut frame.data);
+        self.write_frame(&frame, Some(data))
+    }
+
+    fn finish(&mut self) -> io::Result<()> {
+        if self.finished {
+            return match self.failed {
+                true => Err(crate::error::Error::StreamClosed.into()),
+                false => Ok(()),
+            };
+        }
+        self.finished = true;
+        let r = self.finish_inner();
+        self.failed = r.is_err();
+        r
+    }
+
+    fn info(&self) -> &DiscTitle {
+        &self.title
+    }
+
+    fn undelivered_streams(&self) -> Vec<usize> {
+        // An extension whose base is not carried, once its packets arrived (J23).
+        self.excluded.seen()
+    }
+}
+
+impl<W: Write + Send> MpgSink<W> {
+    // One frame; `owned` is its payload when the caller gave it up (then `frame.data` is
+    // empty and is not read), so a kept frame is moved, not cloned.
+    fn write_frame(&mut self, frame: &PesFrame, mut owned: Option<Vec<u8>>) -> io::Result<()> {
         if self.finished {
             return Err(crate::error::Error::StreamClosed.into());
         }
@@ -670,7 +705,7 @@ impl<W: Write + Send> PesSink for MpgSink<W> {
             return Ok(());
         };
         // B1: an empty frame (a Matroska empty Block) carries no access unit.
-        if frame.data.is_empty() {
+        if owned.as_deref().unwrap_or(&frame.data).is_empty() {
             return Ok(());
         }
         let is_video = out == self.video_out;
@@ -700,7 +735,7 @@ impl<W: Write + Send> PesSink for MpgSink<W> {
         self.frames += 1;
         if is_video {
             self.armed = true;
-            let mut data = frame.data.clone();
+            let mut data = owned.take().unwrap_or_else(|| frame.data.clone());
             if !self.params_prepended {
                 self.params_prepended = true;
                 // 13818-2 decoding starts at a sequence header; a source that moved it to
@@ -723,7 +758,7 @@ impl<W: Write + Send> PesSink for MpgSink<W> {
             self.pending_video.push_back((rel, mark, data));
             self.drain_video()?;
         } else if matches!(self.outs[out].spec.payload, Payload::Lpcm { .. }) {
-            for au in self.lpcm_aus(out, rel, &frame.data, false) {
+            for au in self.lpcm_aus(out, rel, owned.as_deref().unwrap_or(&frame.data), false) {
                 self.accept(out, au)?;
             }
         } else {
@@ -731,7 +766,7 @@ impl<W: Write + Send> PesSink for MpgSink<W> {
                 pts: rel,
                 dts: None,
                 mark: 0,
-                data: frame.data.clone(),
+                data: owned.unwrap_or_else(|| frame.data.clone()),
                 lpcm_bits: 0,
             };
             self.accept(out, au)?;
@@ -744,30 +779,6 @@ impl<W: Write + Send> PesSink for MpgSink<W> {
         Ok(())
     }
 
-    fn finish(&mut self) -> io::Result<()> {
-        if self.finished {
-            return match self.failed {
-                true => Err(crate::error::Error::StreamClosed.into()),
-                false => Ok(()),
-            };
-        }
-        self.finished = true;
-        let r = self.finish_inner();
-        self.failed = r.is_err();
-        r
-    }
-
-    fn info(&self) -> &DiscTitle {
-        &self.title
-    }
-
-    fn undelivered_streams(&self) -> Vec<usize> {
-        // An extension whose base is not carried, once its packets arrived (J23).
-        self.excluded.seen()
-    }
-}
-
-impl<W: Write + Send> MpgSink<W> {
     fn finish_inner(&mut self) -> io::Result<()> {
         self.deriver.finish();
         self.drain_video()?;
