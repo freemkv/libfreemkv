@@ -401,8 +401,8 @@ fn cpi_section_present_still_parses() {
 // parse_cpi — low-level fixtures
 // ─────────────────────────────────────────────────────────────────────
 
-// The scan reads only the header: `packet_count` over the first HEADER_BYTES gives the
-// same count and the same errors as a full `parse`.
+/// The scan reads only the header: `packet_count` over the first HEADER_BYTES gives the
+/// same count and the same errors as a full `parse`.
 #[test]
 fn packet_count_from_the_header_matches_a_full_parse() {
     let pi = build_program_info(&[(0x1200, vec![0x90u8, b'f', b'r', b'a'])]);
