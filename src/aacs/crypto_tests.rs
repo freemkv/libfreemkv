@@ -72,3 +72,30 @@ fn batched_cbc_decrypt_inverts_cbc_encrypt_across_batch_boundaries() {
         assert_eq!(data, plain, "{blocks} blocks must round-trip");
     }
 }
+
+// The out-of-place batch decrypt matches a block-at-a-time CBC decrypt, and leaves a
+// trailing partial block untouched (the decrypt-only schedule and `Aes128` agree).
+#[test]
+fn batched_cbc_decrypt_matches_block_at_a_time_and_skips_a_partial_tail() {
+    for len in [16usize, 16 * 32 + 5, 16 * 65, 6128] {
+        let data: Vec<u8> = (0..len).map(|i| (i * 13 + 1) as u8).collect();
+        let cipher = Aes128::new(&K.into());
+        let mut want = data.clone();
+        let mut prev = AACS_IV;
+        for c in want.chunks_exact_mut(16) {
+            let ct: [u8; 16] = c.try_into().unwrap();
+            let mut b: Array<u8, _> = ct.into();
+            cipher.decrypt_block(&mut b);
+            c.iter_mut()
+                .zip(b.iter().zip(prev))
+                .for_each(|(d, (x, v))| *d = x ^ v);
+            prev = ct;
+        }
+        let mut got = data.clone();
+        cbc_decrypt_blocks(&new_decrypt_cipher(&K), &mut got);
+        assert_eq!(got, want, "{len} bytes");
+        let mut also = data.clone();
+        cbc_decrypt_blocks(&cipher, &mut also);
+        assert_eq!(also, want, "{len} bytes under Aes128");
+    }
+}

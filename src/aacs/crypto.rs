@@ -143,28 +143,27 @@ pub(crate) fn cbc_decrypt_blocks<C: BlockCipherDecrypt<BlockSize = U16>>(
     let mut blocks = [aes::Block::default(); BATCH];
     for chunk in data[..len].chunks_mut(16 * BATCH) {
         let n = chunk.len() / 16;
-        for (b, c) in blocks.iter_mut().zip(chunk.as_chunks::<16>().0) {
-            b.copy_from_slice(c);
-        }
-        cipher.decrypt_blocks(&mut blocks[..n]);
+        // Out of place, straight from the ciphertext: no copy of it into `blocks` first.
+        let (ciphertext, _) = aes::Block::slice_as_chunks(chunk);
+        cipher
+            .decrypt_blocks_b2b(ciphertext, &mut blocks[..n])
+            .expect("one output block per ciphertext block");
         // The next batch chains off this batch's last CIPHERTEXT block.
         let mut last = [0u8; 16];
         last.copy_from_slice(&chunk[(n - 1) * 16..]);
         // Walk backwards so each block's preceding ciphertext is still intact.
-        for i in (0..n).rev() {
-            let iv = if i == 0 {
-                prev
-            } else {
-                let mut p = [0u8; 16];
-                p.copy_from_slice(&chunk[(i - 1) * 16..i * 16]);
-                p
-            };
-            for (d, (x, v)) in chunk[i * 16..(i + 1) * 16]
-                .iter_mut()
-                .zip(blocks[i].iter().zip(iv.iter()))
-            {
+        for i in (1..n).rev() {
+            let (before, here) = chunk.split_at_mut(i * 16);
+            let iv = &before[(i - 1) * 16..];
+            for (d, (x, v)) in here[..16].iter_mut().zip(blocks[i].iter().zip(iv)) {
                 *d = x ^ v;
             }
+        }
+        for (d, (x, v)) in chunk[..16]
+            .iter_mut()
+            .zip(blocks[0].iter().zip(prev.iter()))
+        {
+            *d = x ^ v;
         }
         prev = last;
     }
