@@ -258,10 +258,9 @@ impl Disc {
                 n
             } else {
                 let clpi_path = format!("/BDMV/CLIPINF/{}.clpi", play_item.clip_id);
-                // A `.clpi` that cannot be read or parsed is NOT a benign miss:
-                // `duration_ticks` already claims the full runtime, so drop the
-                // title instead of silently shipping it missing bytes.
-                // Only the header is read: the packet count is all the scan uses.
+                // Only the header is read (the packet count). A `.clpi` that cannot be
+                // read or parsed is NOT a benign miss: `duration_ticks` already claims
+                // the full runtime, so drop the title rather than ship it short.
                 let n = match udf_fs
                     .read_file_prefix(reader, &clpi_path, clpi::HEADER_BYTES)
                     .and_then(|head| clpi::packet_count(&head))
