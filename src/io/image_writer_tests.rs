@@ -393,10 +393,7 @@ fn the_next_read_overlaps_the_current_write() {
     );
     // A serial copy would time out on the first write; the overlapped one completes.
     let r = copy_out(&mut src, Box::new(Waits(rx)), total, &Ctx::default());
-    assert!(
-        matches!(r, Ok(_)),
-        "every write saw the next read start: {r:?}"
-    );
+    assert!(r.is_ok(), "every write saw the next read start: {r:?}");
 }
 
 // An AACS whole-disc copy through the keyed reader, whatever each file's grid, writes the
