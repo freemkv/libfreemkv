@@ -259,7 +259,7 @@ impl std::fmt::Debug for ClipId {
 
 impl std::fmt::Display for ClipId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
+        f.pad(&self.0)
     }
 }
 
@@ -422,7 +422,7 @@ impl std::fmt::Debug for Lang {
 
 impl std::fmt::Display for Lang {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
+        f.pad(self.as_str())
     }
 }
 
