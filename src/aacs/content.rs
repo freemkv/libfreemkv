@@ -6,11 +6,11 @@ use aes::Aes128;
 #[cfg(test)]
 use aes::cipher::{Array, KeyInit};
 
-use super::crypto::{aes_cbc_decrypt, aes_cbc_encrypt, aes_ecb_encrypt};
+use super::crypto::{aes_cbc_encrypt, aes_ecb_encrypt};
 // Only this module's test fixtures build CBC ciphertext by hand now — the
 // production paths get the IV from `aes_cbc_encrypt` / `aes_cbc_decrypt`.
 #[cfg(test)]
-use super::crypto::AACS_IV;
+use super::crypto::{AACS_IV, aes_cbc_decrypt};
 
 // ── AACS constants ──────────────────────────────────────────────────────────
 
@@ -329,6 +329,12 @@ fn is_clean_ps(unit: &[u8]) -> bool {
 /// on [`aacs_unit_encrypted`] first. Block Key = AES-128E(Kcu, seed) ⊕ seed, then AES-128-CBC
 /// decrypt bytes 16..6144 under the AACS IV.
 pub(crate) fn decrypt_unit(unit: &mut [u8], unit_key: &[u8; 16]) {
+    decrypt_unit_with(unit, &crate::aacs::crypto::unit_key_cipher(unit_key));
+}
+
+/// [`decrypt_unit`] under the unit key's prebuilt encrypt schedule
+/// ([`unit_key_cipher`](crate::aacs::crypto::unit_key_cipher)): one schedule per key, not per unit.
+pub(crate) fn decrypt_unit_with(unit: &mut [u8], unit_key: &aes::Aes128Enc) {
     if unit.len() < ALIGNED_UNIT_LEN {
         return;
     }
@@ -342,12 +348,13 @@ pub(crate) fn decrypt_unit(unit: &mut [u8], unit_key: &[u8; 16]) {
 
     let mut header = [0u8; 16];
     header.copy_from_slice(&unit[..16]);
-    let derived = aes_ecb_encrypt(unit_key, &header);
+    let derived = crate::aacs::crypto::aes_ecb_encrypt_with(unit_key, &header);
     let mut decrypt_key = [0u8; 16];
     for i in 0..16 {
         decrypt_key[i] = derived[i] ^ header[i];
     }
-    aes_cbc_decrypt(&decrypt_key, &mut unit[16..ALIGNED_UNIT_LEN]);
+    let block_key = crate::aacs::crypto::new_decrypt_cipher(&decrypt_key);
+    crate::aacs::crypto::cbc_decrypt_blocks(&block_key, &mut unit[16..ALIGNED_UNIT_LEN]);
 
     for (p, &is_pad) in pad.iter().enumerate().take(npkt) {
         if is_pad {

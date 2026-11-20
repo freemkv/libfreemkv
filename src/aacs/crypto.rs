@@ -7,8 +7,9 @@
 //! primitives live in one place instead of being scattered across the
 //! content / keys / variant modules.
 
-use aes::Aes128;
+use aes::cipher::consts::U16;
 use aes::cipher::{Array, BlockCipherDecrypt, BlockCipherEncrypt, KeyInit};
+use aes::{Aes128, Aes128Dec, Aes128Enc};
 
 /// Fixed IV used by AACS for all AES-CBC operations. `[C]` §2.1.2 (default CBC IV, `iv0`).
 pub(crate) const AACS_IV: [u8; 16] = [
@@ -38,6 +39,34 @@ fn new_cipher(key: &[u8; 16]) -> Aes128 {
     #[cfg(test)]
     KEY_EXPANSIONS.with(|c| c.set(c.get() + 1));
     Aes128::new(&(*key).into())
+}
+
+// Per-thread count of unit-key schedules built (test-only): a read builds one per key it uses.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static UNIT_KEY_SCHEDULES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The encrypt-only key schedule of a CPS unit key, built once and reused for every unit
+/// under it ([`aes_ecb_encrypt_with`]; KS-4: Block Key = AES-128E(Kcu, seed) ⊕ seed).
+pub(crate) fn unit_key_cipher(key: &[u8; 16]) -> Aes128Enc {
+    #[cfg(test)]
+    UNIT_KEY_SCHEDULES.with(|c| c.set(c.get() + 1));
+    Aes128Enc::new(&(*key).into())
+}
+
+/// [`aes_ecb_encrypt`] under an already-expanded encrypt schedule.
+pub(crate) fn aes_ecb_encrypt_with(cipher: &Aes128Enc, data: &[u8; 16]) -> [u8; 16] {
+    let mut block: Array<u8, _> = (*data).into();
+    cipher.encrypt_block(&mut block);
+    block.into()
+}
+
+/// A decrypt-only key schedule for [`cbc_decrypt_blocks`] (a unit's one-off block key).
+pub(crate) fn new_decrypt_cipher(key: &[u8; 16]) -> Aes128Dec {
+    #[cfg(test)]
+    KEY_EXPANSIONS.with(|c| c.set(c.get() + 1));
+    Aes128Dec::new(&(*key).into())
 }
 
 /// AES-128-ECB encrypt a single 16-byte block. `[C]` §2.1.1 (`AES-128E`).
@@ -102,7 +131,10 @@ pub(crate) fn aes_cbc_decrypt(key: &[u8; 16], data: &mut [u8]) {
 
 // AES-128-CBC decrypt in place under AACS_IV with an already-expanded key schedule. Split out
 // of aes_cbc_decrypt for callers that share one key across several regions.
-pub(crate) fn cbc_decrypt_blocks(cipher: &Aes128, data: &mut [u8]) {
+pub(crate) fn cbc_decrypt_blocks<C: BlockCipherDecrypt<BlockSize = U16>>(
+    cipher: &C,
+    data: &mut [u8],
+) {
     // CBC decrypt parallelises: AES-decrypt a batch of blocks in one call (the
     // backend pipelines them), then XOR each with its preceding ciphertext.
     const BATCH: usize = 32;

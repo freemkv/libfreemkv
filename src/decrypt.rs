@@ -513,6 +513,14 @@ fn apply_aacs_map(
     let tally: Vec<[AtomicUsize; 2]> = unit_keys.iter().map(|_| Default::default()).collect();
     // A failing FMTS unit another held key opens: a wrong mapped key, never damage.
     let opened_elsewhere = std::sync::atomic::AtomicBool::new(false);
+    // Each key's encrypt schedule, built the first time a unit of this read needs it (KS-4).
+    let schedules: Vec<std::sync::OnceLock<aes::Aes128Enc>> = unit_keys
+        .iter()
+        .map(|_| std::sync::OnceLock::new())
+        .collect();
+    let cipher = |idx: usize| {
+        schedules[idx].get_or_init(|| aacs::crypto::unit_key_cipher(&unit_keys[idx].1))
+    };
 
     let decrypt_one = |idx_in_buf: usize, chunk: &mut [u8]| {
         let unit_lba = base_lba.saturating_add((idx_in_buf as u32) * unit_sectors);
@@ -565,13 +573,13 @@ fn apply_aacs_map(
         // Bounds already proven above; index directly. Bus encryption was already
         // removed by the drive's single de-bus point before this buffer arrived —
         // this path only applies the CPS unit key.
-        let key = &unit_keys[key_idx].1;
+        let key = cipher(key_idx);
         if phase == Phase::Verify {
             // KU design §5.3 (no public FMTS spec, KS-25/KS-26): keep a unit only if it
             // verifies; KS-3 [BD] §3.10.1 "A new CBC cipher chain is started for each Aligned Unit".
             let mut ciphertext = [0u8; aacs::content::ALIGNED_UNIT_LEN];
             ciphertext.copy_from_slice(chunk);
-            aacs::content::decrypt_unit(chunk, key);
+            aacs::content::decrypt_unit_with(chunk, key);
             if aacs::content::is_clean(chunk, format) {
                 aacs::content::clear_copy_permission_indicator(chunk, format);
             } else {
@@ -583,27 +591,23 @@ fn apply_aacs_map(
         if matches!(phase, Phase::Even | Phase::Odd) {
             let mut ciphertext = [0u8; aacs::content::ALIGNED_UNIT_LEN];
             ciphertext.copy_from_slice(chunk);
-            aacs::content::decrypt_unit(chunk, key);
+            aacs::content::decrypt_unit_with(chunk, key);
             let clean = aacs::content::is_clean(chunk, format);
             tally[key_idx][clean as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if !clean {
-                let opens = |k: &[u8; 16]| {
+                let opens = |j: usize| {
                     let mut c = ciphertext;
-                    aacs::content::decrypt_unit(&mut c, k);
+                    aacs::content::decrypt_unit_with(&mut c, cipher(j));
                     aacs::content::is_clean(&c, format)
                 };
-                if unit_keys
-                    .iter()
-                    .enumerate()
-                    .any(|(j, (_, k))| j != key_idx && opens(k))
-                {
+                if (0..unit_keys.len()).any(|j| j != key_idx && opens(j)) {
                     opened_elsewhere.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
                 chunk.fill(0);
                 return;
             }
         } else {
-            aacs::content::decrypt_unit(chunk, key);
+            aacs::content::decrypt_unit_with(chunk, key);
         }
         // KS-5 [BD] §3.10.2: CPI "shall be set to 00₂ if the data is not encrypted": a unit
         // we decrypted (damaged or not) is no longer ciphertext (KU design §5.4, K-13).

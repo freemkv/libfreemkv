@@ -1747,3 +1747,54 @@ fn hddvd_packs_decrypt_the_same_on_the_pool() {
     assert_eq!(r.unwrap().blanked, 0);
     assert!(buf == plain, "every pack decrypted on the pool");
 }
+
+// One unit-key schedule per key a read uses, not one per unit (KS-4's AES-128E(Kcu, seed)
+// runs under the same Kcu for every unit of a CPS range).
+#[test]
+fn a_mapped_read_builds_one_unit_key_schedule_per_key() {
+    use crate::aacs::crypto::UNIT_KEY_SCHEDULES;
+    use crate::disc::ContentFormat;
+    let (k1, k2, unused) = ([0x7Au8; 16], [0x7Bu8; 16], [0x7Cu8; 16]);
+    let ul = aacs::content::ALIGNED_UNIT_LEN;
+    let n = 10; // below the fan-out threshold: decrypted on this thread
+    let mut plain = Vec::new();
+    let mut buf = Vec::new();
+    for i in 0..n {
+        let mut c = clear_ts_unit();
+        c[0] |= 0xC0;
+        c[1] = i as u8;
+        plain.extend_from_slice(&aacs::content::cpi_cleared(c.clone()));
+        aacs_encrypt_unit_for_test(&mut c, if i < 4 { &k1 } else { &k2 });
+        buf.extend_from_slice(&c);
+    }
+    let keys = DecryptKeys::Aacs {
+        unit_keys: vec![(0, k1), (1, unused), (2, k2)],
+        format: ContentFormat::BdTs,
+    };
+    let map = AacsKeyMap::from_ranges(vec![(0, 12, 0), (12, 30, 2)]);
+    UNIT_KEY_SCHEDULES.with(|c| c.set(0));
+    decrypt_sectors_mapped(&mut buf, &keys, 0, &map).expect("decrypts");
+    assert_eq!(
+        UNIT_KEY_SCHEDULES.with(|c| c.get()),
+        2,
+        "k1 and k2, once each"
+    );
+    assert!(buf == plain);
+}
+
+// The prebuilt-schedule unit decrypt is the per-call one, byte for byte.
+#[test]
+fn decrypt_unit_with_a_prebuilt_schedule_matches_decrypt_unit() {
+    for (salt, key) in [(1u8, [0x10u8; 16]), (77, [0xEF; 16]), (200, [0x00; 16])] {
+        let mut c = clear_ts_unit();
+        c[0] |= 0xC0;
+        c.iter_mut().skip(16).step_by(7).for_each(|b| *b ^= salt);
+        aacs_encrypt_unit_for_test(&mut c, &key);
+        let mut a = c.clone();
+        aacs::content::decrypt_unit(&mut a, &key);
+        let schedule = aacs::crypto::unit_key_cipher(&key);
+        let mut b = c.clone();
+        aacs::content::decrypt_unit_with(&mut b, &schedule);
+        assert_eq!(a, b, "salt {salt}");
+    }
+}
