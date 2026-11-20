@@ -21,6 +21,10 @@ const SG_DXFER_NONE: i32 = -1;
 const SG_DXFER_TO_DEV: i32 = -2;
 const SG_DXFER_FROM_DEV: i32 = -3;
 const SG_FLAG_Q_AT_HEAD: u32 = 0x10;
+// sg(4): size this fd's reserved buffer, which a command no larger than it reuses.
+const SG_SET_RESERVED_SIZE: u32 = 0x2275;
+/// The reserve: the largest transfer this transport issues (`max_transfer_bytes`, 1 MiB).
+const SG_RESERVED_BYTES: libc::c_int = 1 << 20;
 
 /// Width of `sg_io_hdr.cmdp` as far as SG_IO is concerned: `cmd_len` is a
 /// single byte and every SPC-4/MMC command this crate issues is 6, 10, 12 or
@@ -153,6 +157,7 @@ impl SgIoTransport {
             let err = std::io::Error::last_os_error();
             return Err((Self::map_open_error(&err, &device), err.raw_os_error()));
         }
+        reserve_sg_buffer(fd);
         Ok(SgIoTransport {
             fd,
             device_path: device,
@@ -185,6 +190,8 @@ impl SgIoTransport {
                 errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
                 "reopen after transport failure failed"
             );
+        } else {
+            reserve_sg_buffer(fd);
         }
         fd
     }
@@ -757,6 +764,19 @@ fn node_number(name: &str) -> u32 {
         .unwrap_or(u32::MAX)
 }
 
+// Size the sg reserve buffer to the largest read, so a read reuses it instead of the driver
+// allocating and freeing kernel pages per command. Best effort: a non-sg node refuses it.
+fn reserve_sg_buffer(fd: i32) -> bool {
+    let size: libc::c_int = SG_RESERVED_BYTES;
+    // SAFETY: SG_SET_RESERVED_SIZE reads one int through the pointer during the call only.
+    let ok =
+        unsafe { libc::ioctl(fd, SG_SET_RESERVED_SIZE as _, &size as *const libc::c_int) } == 0;
+    if !ok {
+        tracing::trace!(target: "freemkv::scsi", fd, "SG_SET_RESERVED_SIZE refused");
+    }
+    ok
+}
+
 /// Send TEST UNIT READY directly — no transport, no reset, no side effects.
 pub(super) fn disc_presence(path: &Path) -> Result<super::PresenceProbe> {
     let device = SgIoTransport::resolve_to_sg(path);
@@ -816,3 +836,7 @@ mod raw_command_cdb_guard_tests;
 #[cfg(test)]
 #[path = "linux_enumerate_tests.rs"]
 mod enumerate_tests;
+
+#[cfg(test)]
+#[path = "linux_reserve_tests.rs"]
+mod reserve_tests;
