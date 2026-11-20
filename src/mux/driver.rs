@@ -872,11 +872,20 @@ fn drive_mux(
     })
 }
 
-// Late `(track, codec_private)` pairs from the reader, drained by the sink.
-type LateConfigs = Arc<std::sync::Mutex<Vec<(usize, Vec<u8>)>>>;
+// Late `(track, codec_private)` pairs from the reader, drained by the sink. `queued` lets
+// the sink skip the lock on every frame that finds nothing queued, which is almost all.
+#[derive(Default)]
+struct LateQueue {
+    queued: AtomicBool,
+    configs: std::sync::Mutex<Vec<(usize, Vec<u8>)>>,
+}
 
-fn lock_late(q: &LateConfigs) -> std::sync::MutexGuard<'_, Vec<(usize, Vec<u8>)>> {
-    q.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+type LateConfigs = Arc<LateQueue>;
+
+fn lock_late(q: &LateQueue) -> std::sync::MutexGuard<'_, Vec<(usize, Vec<u8>)>> {
+    q.configs
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 // Move tracks whose codec_private has now resolved from `pending` to the queue.
@@ -884,6 +893,7 @@ fn collect_late_configs(stream: &dyn PesSource, pending: &mut Vec<usize>, out: &
     pending.retain(|&track| match stream.codec_private(track) {
         Some(cp) => {
             lock_late(out).push((track, cp));
+            out.queued.store(true, Ordering::Release);
             false
         }
         None => true,
@@ -1011,6 +1021,9 @@ impl WriteSink {
     }
 
     fn apply_late_configs(&mut self) -> Result<(), Error> {
+        if !self.late_configs.queued.swap(false, Ordering::Acquire) {
+            return Ok(());
+        }
         let late = std::mem::take(&mut *lock_late(&self.late_configs));
         for (track, cp) in late {
             if !self
