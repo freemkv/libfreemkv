@@ -360,7 +360,7 @@ impl M2tsMeta {
                     language: language.clone(),
                     forced: *forced,
                     qualifier: qualifier_from_id(qualifier),
-                    codec_data: decode_codec_private(codec_private),
+                    codec_data: decode_codec_private(codec_private).map(Into::into),
                 }),
             })
             .collect();

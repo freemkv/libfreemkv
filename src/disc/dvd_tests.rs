@@ -1286,6 +1286,15 @@ fn scan_dvd_titles_multiple_vobsub_tracks_distinct_pids() {
             "each VobSub track shares the PGC palette codec_data"
         );
     }
+    // Shared, not copied: every track points at the one palette buffer.
+    let first = subs[0].codec_data.as_ref().expect("palette");
+    for s in &subs[1..] {
+        let data = s.codec_data.as_ref().expect("palette");
+        assert!(
+            std::sync::Arc::ptr_eq(first, data),
+            "palette copied per track"
+        );
+    }
 }
 
 /// Subtitle streams map to Codec::DvdSub with palette codec_data when a
@@ -1337,7 +1346,8 @@ fn scan_dvd_titles_subtitle_palette_codec_data() {
         sub.codec_data.is_some(),
         "non-zero palette must yield codec_data"
     );
-    let idx = String::from_utf8(sub.codec_data.clone().expect("codec_data")).expect("utf8");
+    let idx =
+        String::from_utf8(sub.codec_data.as_deref().expect("codec_data").to_vec()).expect("utf8");
     assert!(
         idx.starts_with("size: 720x480\npalette: "),
         "the .idx carries the NTSC coded frame size, then the palette: {idx:?}"

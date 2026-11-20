@@ -286,10 +286,10 @@ impl Disc {
                 // coded video frame (720x480 NTSC / 720x576 PAL) so players place/scale the
                 // subpicture correctly; format_palette omits it on unresolved (0,0).
                 let (vid_w, vid_h) = ts.video.resolution.pixels().unwrap_or((0, 0));
-                let codec_data = dvd_title
+                let codec_data: Option<std::sync::Arc<[u8]>> = dvd_title
                     .palette
                     .as_ref()
-                    .map(|pal| crate::mux::codec::dvdsub::format_palette(pal, vid_w, vid_h));
+                    .map(|pal| crate::mux::codec::dvdsub::format_palette(pal, vid_w, vid_h).into());
 
                 // Logical stream i routes to the physical id this PGC's SPST_CTL names (not
                 // 0x20+i: anamorphic discs interleave wide/letterbox/pan-scan variants).

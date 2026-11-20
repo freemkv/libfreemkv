@@ -485,7 +485,7 @@ pub(crate) fn scan(head: &[u8]) -> Option<Scan> {
                         codec_data: map
                             .as_ref()
                             .and_then(|m| m.palette.as_ref())
-                            .map(|p| idx_text(p, video_res)),
+                            .map(|p| idx_text(p, video_res).into()),
                     }),
                     _ => {
                         tracing::warn!(target: "mux", sub_id = sub, "mpg: private_stream_1 sub-stream of an unhandled kind; left out");

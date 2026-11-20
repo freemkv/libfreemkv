@@ -433,7 +433,7 @@ pub struct SubtitleStream {
     /// Callers translate this to display text in their own locale.
     pub qualifier: LabelQualifier,
     /// Pre-formatted codec private data (e.g. VobSub .idx palette header)
-    pub codec_data: Option<Vec<u8>>,
+    pub codec_data: Option<std::sync::Arc<[u8]>>,
 }
 
 /// Video/audio codec.

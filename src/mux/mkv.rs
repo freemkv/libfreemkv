@@ -538,7 +538,7 @@ impl MkvTrack {
             codec_id,
             language: language_or_und(&s.language),
             name: String::new(),
-            codec_private: s.codec_data.clone(),
+            codec_private: s.codec_data.as_deref().map(<[u8]>::to_vec),
             is_default: false,
             is_forced: s.forced,
             pixel_width: 0,

@@ -127,7 +127,7 @@ fn fixture(o: &Opts) -> Fx {
             language: if k == 0 { "eng".into() } else { "nld".into() },
             forced: k == 0,
             qualifier: LabelQualifier::None,
-            codec_data: Some(palette.clone()),
+            codec_data: Some(palette.clone().into()),
         }));
     }
     let title = DiscTitle {
