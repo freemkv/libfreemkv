@@ -89,7 +89,7 @@ fn build_stored_zip(name: &str, payload: &[u8], declared_size: u32) -> Vec<u8> {
 }
 
 fn open(bytes: Vec<u8>) -> Jar {
-    ZipArchive::new(Cursor::new(bytes)).expect("valid zip")
+    ZipArchive::new(Cursor::new(bytes.into())).expect("valid zip")
 }
 
 // Pins the exact 64 MiB value as a literal (not derived from the
@@ -542,4 +542,124 @@ fn try_each_class_bounds_total_inflation() {
     let mut budget = PARSE_INFLATE_BUDGET;
     for_each_class_budgeted(&mut jar, &mut budget, |_, _| visited += 1);
     assert_eq!(visited, 2, "3 x 50 MiB exceeds the 128 MiB inflate budget");
+}
+
+// Inside one jar cache, every parser that opens a jar shares one read of it: a second
+// whole-jar visit and a detect read nothing more; outside the cache each visit reads.
+#[test]
+fn jar_cache_reads_each_jar_once_per_scan() {
+    use crate::udf::fixture::{DirSpec, MemDisc, build_udf_skeleton, file_with, lay_dir};
+    use std::io::Write as _;
+    let mut buf = Vec::new();
+    {
+        let mut w = zip::ZipWriter::new(Cursor::new(&mut buf));
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        w.start_file("assets/bg.png", opts).expect("start_file");
+        w.write_all(&vec![0x5Au8; 256 * 1024]).expect("write");
+        w.start_file("com/dbp/B.class", opts).expect("start_file");
+        w.write_all(MINIMAL_CLASS).expect("write");
+        w.finish().expect("finish");
+    }
+    let dir = |name: &str, icb, files, subdirs| DirSpec {
+        name: name.to_string(),
+        icb_lba: icb,
+        dir_data_lba: icb + 1,
+        files,
+        subdirs,
+    };
+    let jar_dir = dir(
+        "JAR",
+        30,
+        vec![file_with("00000.jar", 32, 4000, buf, true)],
+        vec![],
+    );
+    let root = dir("", 10, vec![], vec![dir("BDMV", 20, vec![], vec![jar_dir])]);
+    let mut disc = MemDisc::new();
+    build_udf_skeleton(&mut disc, 10);
+    lay_dir(&mut disc, &root);
+    let udf = crate::udf::read_filesystem(&mut disc).expect("fs");
+    let visit = |disc: &mut MemDisc| {
+        let mut counting = Counting(disc, 0);
+        let names = for_each_jar(&mut counting, &udf, |_, j| {
+            Some(has_path_prefix(j, "com/dbp/"))
+        });
+        assert_eq!(names, Some(true));
+        counting.1
+    };
+    let uncached = (visit(&mut disc), visit(&mut disc));
+    assert!(uncached.0 > 0 && uncached.1 == uncached.0, "{uncached:?}");
+    with_jar_cache(|| {
+        assert_eq!(
+            visit(&mut disc),
+            uncached.0,
+            "the first visit reads the jar"
+        );
+        assert_eq!(visit(&mut disc), 0, "a second visit re-read the jar");
+        let mut counting = Counting(&mut disc, 0);
+        assert!(any_jar_has_prefix(&mut counting, &udf, "com/dbp/"));
+        assert!(!any_jar_has_prefix(&mut counting, &udf, "com/foxbd/"));
+        assert_eq!(counting.1, 0, "a detect re-read a cached jar");
+    });
+    assert_eq!(visit(&mut disc), uncached.0, "the cache outlived its scope");
+}
+
+// A kept sweep replays exactly as a fresh sweep of the jar: same classes offered in the
+// same order, same budget left, the same stopping point when the budget runs out.
+#[test]
+fn kept_class_sweep_replays_like_a_fresh_sweep() {
+    use std::io::Write as _;
+    let mut buf = Vec::new();
+    {
+        let mut w = zip::ZipWriter::new(Cursor::new(&mut buf));
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        for n in ["a/A.class", "b/B.class", "notes.txt", "c/C.class"] {
+            w.start_file(n, opts).expect("start_file");
+            w.write_all(MINIMAL_CLASS).expect("write");
+        }
+        w.finish().expect("finish");
+    }
+    let len = MINIMAL_CLASS.len() as u64;
+    for start in [u64::MAX, 2 * len, 2 * len + 1, len - 1, 0] {
+        let mut fresh_budget = start;
+        let mut fresh = Vec::new();
+        for_each_class_budgeted(&mut open(buf.clone()), &mut fresh_budget, |n, _| {
+            fresh.push(n.to_string())
+        });
+        let mut kept_budget = start;
+        let mut first = Vec::new();
+        let sweep = ClassSweep::record(&mut open(buf.clone()), &mut kept_budget, |n, _| {
+            first.push(n.to_string())
+        });
+        assert_eq!(
+            (&first, kept_budget),
+            (&fresh, fresh_budget),
+            "record at {start}"
+        );
+        // A second pass charges the budget the first one left, as a fresh re-sweep would.
+        let mut again = Vec::new();
+        for_each_class_budgeted(&mut open(buf.clone()), &mut fresh_budget, |n, _| {
+            again.push(n.to_string())
+        });
+        let mut replayed = Vec::new();
+        sweep.for_each(&mut kept_budget, |n, _| replayed.push(n.to_string()));
+        assert_eq!(
+            (&replayed, kept_budget),
+            (&again, fresh_budget),
+            "replay at {start}"
+        );
+        let fresh_hit = try_class_budgeted(
+            &mut open(buf.clone()),
+            "b/B.class",
+            &mut fresh_budget,
+            |_| Some(()),
+        );
+        let kept_hit = sweep.try_class("b/B.class", &mut kept_budget, |_| Some(()));
+        assert_eq!(
+            (kept_hit, kept_budget),
+            (fresh_hit, fresh_budget),
+            "by name at {start}"
+        );
+    }
 }

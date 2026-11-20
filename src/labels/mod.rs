@@ -323,6 +323,15 @@ pub fn apply(
     udf: &UdfFs,
     titles: &mut [DiscTitle],
 ) -> Option<FeaturePlaylistHint> {
+    // Every detector and parser below shares one read of each jar.
+    jar::with_jar_cache(|| apply_with_jar_cache(reader, udf, titles))
+}
+
+fn apply_with_jar_cache(
+    reader: &mut dyn SectorSource,
+    udf: &UdfFs,
+    titles: &mut [DiscTitle],
+) -> Option<FeaturePlaylistHint> {
     let (labels, winner_hint) =
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| extract(reader, udf))) {
             Ok(r) => r,

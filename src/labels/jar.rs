@@ -10,7 +10,9 @@
 use super::class_reader::ClassFile;
 use crate::sector::SectorSource;
 use crate::udf::UdfFs;
+use std::cell::RefCell;
 use std::io::{Cursor, Read, Seek, SeekFrom};
+use std::sync::Arc;
 use zip::ZipArchive;
 
 // Cap on bytes read from one `.class` entry — the jar's declared size is attacker-controlled,
@@ -21,10 +23,108 @@ const MAX_CLASS_BYTES: u64 = 64 * 1024 * 1024;
 /// per-entry cap alone lets hostile high-ratio entries drive unbounded inflation.
 pub(crate) const PARSE_INFLATE_BUDGET: u64 = 128 * 1024 * 1024;
 
-/// In-memory zip archive: backed by a `Vec<u8>` read from UDF. Owns
-/// the buffer; callers pass it to [`has_path_prefix`], [`for_each_class_budgeted`],
-/// etc.
-pub type Jar = ZipArchive<Cursor<Vec<u8>>>;
+/// A jar's bytes, shared: every parser that opens the jar during one scan reads the same
+/// buffer (see [`with_jar_cache`]).
+#[derive(Clone)]
+pub struct SharedBytes(Arc<Vec<u8>>);
+
+impl From<Vec<u8>> for SharedBytes {
+    fn from(v: Vec<u8>) -> Self {
+        SharedBytes(Arc::new(v))
+    }
+}
+
+impl AsRef<[u8]> for SharedBytes {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+/// In-memory zip archive over a jar read from UDF. Cloning shares the bytes and the
+/// parsed central directory; callers pass it to [`has_path_prefix`],
+/// [`for_each_class_budgeted`], etc.
+pub type Jar = ZipArchive<Cursor<SharedBytes>>;
+
+// A whole jar read once: its bytes, and the archive when they are a zip.
+#[derive(Clone)]
+struct LoadedJar {
+    bytes: SharedBytes,
+    jar: Option<Jar>,
+}
+
+// Cap on the bytes the per-scan jar cache holds; a jar past it is read per use, as before.
+const MAX_CACHED_JAR_BYTES: usize = 128 * 1024 * 1024;
+
+#[derive(Default)]
+struct JarCache {
+    jars: std::collections::HashMap<String, LoadedJar>,
+    bytes: usize,
+}
+
+thread_local! {
+    // The active per-scan jar cache, set only inside `with_jar_cache`.
+    static JAR_CACHE: RefCell<Option<JarCache>> = const { RefCell::new(None) };
+}
+
+/// Run `f` with a per-scan jar cache: inside it each top-level jar is read from disc and
+/// its central directory parsed once, however many detectors and parsers open it.
+/// Reentrant: a nested call shares the outer cache. A failed read is not cached.
+pub(crate) fn with_jar_cache<R>(f: impl FnOnce() -> R) -> R {
+    struct Reset(bool);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            if self.0 {
+                JAR_CACHE.with(|c| *c.borrow_mut() = None);
+            }
+        }
+    }
+    let outer = JAR_CACHE.with(|c| {
+        let mut c = c.borrow_mut();
+        let fresh = c.is_none();
+        if fresh {
+            *c = Some(JarCache::default());
+        }
+        fresh
+    });
+    let _reset = Reset(outer);
+    f()
+}
+
+// The whole jar at `/BDMV/JAR/<name>`: from the active cache, else read (and cached).
+fn load_jar(reader: &mut dyn SectorSource, udf: &UdfFs, name: &str) -> Option<LoadedJar> {
+    let path = format!("/BDMV/JAR/{name}");
+    let hit = JAR_CACHE.with(|c| {
+        c.borrow()
+            .as_ref()
+            .and_then(|cache| cache.jars.get(&path).cloned())
+    });
+    if hit.is_some() {
+        return hit;
+    }
+    let bytes = SharedBytes::from(udf.read_file(reader, &path).ok()?);
+    let jar = ZipArchive::new(Cursor::new(bytes.clone())).ok();
+    let loaded = LoadedJar { bytes, jar };
+    JAR_CACHE.with(|c| {
+        if let Some(cache) = c.borrow_mut().as_mut() {
+            let len = loaded.bytes.0.len();
+            if cache.bytes.saturating_add(len) <= MAX_CACHED_JAR_BYTES {
+                cache.bytes += len;
+                cache.jars.insert(path, loaded.clone());
+            }
+        }
+    });
+    Some(loaded)
+}
+
+// The cached archive for jar `name`, only when the active cache already holds one.
+fn cached_jar(name: &str) -> Option<Jar> {
+    let path = format!("/BDMV/JAR/{name}");
+    JAR_CACHE.with(|c| {
+        c.borrow()
+            .as_ref()
+            .and_then(|cache| cache.jars.get(&path).and_then(|l| l.jar.clone()))
+    })
+}
 
 /// Open every top-level `*.jar` entry in `/BDMV/JAR/` and yield each
 /// `(entry_name, Jar)` to `f`. Returns the first `Some(R)` the callback
@@ -41,11 +141,7 @@ where
 {
     let jar_dir = udf.find_dir("/BDMV/JAR")?;
     for entry in jar_dir.entries.iter().filter(|e| is_jar(e)) {
-        let path = format!("/BDMV/JAR/{}", entry.name);
-        let Ok(bytes) = udf.read_file(reader, &path) else {
-            continue;
-        };
-        let Ok(mut archive) = ZipArchive::new(Cursor::new(bytes)) else {
+        let Some(mut archive) = load_jar(reader, udf, &entry.name).and_then(|l| l.jar) else {
             continue;
         };
         if let Some(r) = f(&entry.name, &mut archive) {
@@ -84,18 +180,34 @@ pub(crate) fn visit_jars_limited<R, F>(
     reader: &mut dyn SectorSource,
     udf: &UdfFs,
     in_memory_max: u64,
+    f: F,
+) -> Option<R>
+where
+    F: FnMut(&str, Option<&mut DiscJar<'_>>) -> Option<R>,
+{
+    visit_jars_skipping(reader, udf, in_memory_max, &|_| false, f)
+}
+
+// `visit_jars_limited` over the jars `skip` refuses; a skipped jar is neither read nor offered.
+fn visit_jars_skipping<R, F>(
+    reader: &mut dyn SectorSource,
+    udf: &UdfFs,
+    in_memory_max: u64,
+    skip: &dyn Fn(&str) -> bool,
     mut f: F,
 ) -> Option<R>
 where
     F: FnMut(&str, Option<&mut DiscJar<'_>>) -> Option<R>,
 {
     let jar_dir = udf.find_dir("/BDMV/JAR")?;
-    for entry in jar_dir.entries.iter().filter(|e| is_jar(e)) {
-        let path = format!("/BDMV/JAR/{}", entry.name);
+    for entry in jar_dir
+        .entries
+        .iter()
+        .filter(|e| is_jar(e) && !skip(&e.name))
+    {
         let src: Option<(Box<dyn ReadSeek + '_>, Option<u64>)> = if entry.size <= in_memory_max {
-            udf.read_file(reader, &path)
-                .ok()
-                .map(|b| (Box::new(Cursor::new(b)) as Box<dyn ReadSeek>, None))
+            load_jar(reader, udf, &entry.name)
+                .map(|l| (Box::new(Cursor::new(l.bytes)) as Box<dyn ReadSeek>, None))
         } else {
             udf.extents_abs_at(reader, entry.meta_lba)
                 .ok()
@@ -359,11 +471,25 @@ const DETECT_IN_MEMORY_JAR_BYTES: u64 = CHUNK_SECTORS * 2048;
 pub fn any_jar_has_prefix(reader: &mut dyn SectorSource, udf: &UdfFs, prefix: &str) -> bool {
     // A jar the in-place open cannot handle (unrecorded extent, ZIP64, odd tail) still
     // detects through the whole-file read `for_each_jar` uses.
+    // A jar another detector or parser already loaded is checked from the cache, unread.
+    let Some(jar_dir) = udf.find_dir("/BDMV/JAR") else {
+        return false;
+    };
+    let mut cached = Vec::new();
+    for e in jar_dir.entries.iter().filter(|e| is_jar(e)) {
+        if let Some(j) = cached_jar(&e.name) {
+            if has_path_prefix(&j, prefix) {
+                return true;
+            }
+            cached.push(e.name.as_str());
+        }
+    }
     let mut unopened: Vec<String> = Vec::new();
-    let hit = visit_jars_limited(
+    let hit = visit_jars_skipping(
         reader,
         udf,
         DETECT_IN_MEMORY_JAR_BYTES,
+        &|name| cached.iter().any(|c| *c == name),
         |name, jar| match jar {
             Some(j) => has_path_prefix(j, prefix).then_some(()),
             None => {
@@ -375,17 +501,13 @@ pub fn any_jar_has_prefix(reader: &mut dyn SectorSource, udf: &UdfFs, prefix: &s
     if hit.is_some() {
         return true;
     }
-    let Some(jar_dir) = udf.find_dir("/BDMV/JAR") else {
-        return false;
-    };
     jar_dir
         .entries
         .iter()
         .filter(|e| e.size <= IN_MEMORY_JAR_BYTES && unopened.contains(&e.name))
         .any(|e| {
-            udf.read_file(reader, &format!("/BDMV/JAR/{}", e.name))
-                .ok()
-                .and_then(|b| ZipArchive::new(Cursor::new(b)).ok())
+            load_jar(reader, udf, &e.name)
+                .and_then(|l| l.jar)
                 .is_some_and(|z| has_path_prefix(&z, prefix))
         })
 }
@@ -471,46 +593,160 @@ fn try_each_entry<Z: Read + Seek, R>(
     budget: &mut u64,
     mut f: impl FnMut(&str, &[u8]) -> Option<R>,
 ) -> Option<R> {
+    walk_entries(archive, want, cap, budget, |_, name, bytes, read_ok| {
+        if read_ok { f(name, bytes) } else { None }
+    })
+}
+
+fn budget_spent(had_budget: bool, entry: usize) {
+    if had_budget {
+        tracing::warn!(entry, "jar: inflate budget exhausted, sweep truncated");
+    }
+}
+
+// `try_each_entry`, also offering each charged entry whose read failed (`read_ok` false),
+// with its zip index. One name and one byte buffer are reused across entries.
+fn walk_entries<Z: Read + Seek, R>(
+    archive: &mut ZipArchive<Z>,
+    want: impl Fn(&str) -> bool,
+    cap: u64,
+    budget: &mut u64,
+    mut f: impl FnMut(usize, &str, &[u8], bool) -> Option<R>,
+) -> Option<R> {
     let had_budget = *budget > 0;
-    let spent = |i: usize| {
-        if had_budget {
-            tracing::warn!(entry = i, "jar: inflate budget exhausted, sweep truncated");
-        }
-    };
+    let mut name = String::new();
+    let mut bytes = Vec::new();
     for i in 0..archive.len() {
         match archive.name_for_index(i) {
             Some(Ok(n)) if want(&n) => {}
             _ => continue,
         }
         if *budget == 0 {
-            spent(i);
+            budget_spent(had_budget, i);
             return None;
         }
         let Ok(entry) = archive.by_index(i) else {
             continue;
         };
         // A name that is not valid text names no entry a parser looks for.
-        let Ok(name) = entry.name().map(|n| n.into_owned()) else {
+        let Ok(n) = entry.name() else {
             continue;
         };
-        let mut bytes = Vec::new();
+        name.clear();
+        name.push_str(&n);
+        drop(n);
+        bytes.clear();
         let read = entry
             .take(cap.min(budget.saturating_add(1)))
             .read_to_end(&mut bytes);
         if bytes.len() as u64 > *budget {
             *budget = 0;
-            spent(i);
+            budget_spent(had_budget, i);
             return None;
         }
         *budget -= bytes.len() as u64;
-        if read.is_err() {
-            continue;
-        }
-        if let Some(r) = f(&name, &bytes) {
+        if let Some(r) = f(i, &name, &bytes, read.is_ok()) {
             return Some(r);
         }
     }
     None
+}
+
+/// One budgeted sweep of a jar's `.class` entries, kept so later passes reuse it: each
+/// class is inflated and parsed once, and every replay charges its budget exactly as a
+/// fresh sweep of the jar would (same order, sizes and stopping point).
+pub(crate) struct ClassSweep {
+    entries: Vec<SweptClass>,
+}
+
+// One charged `.class` entry; `class` is `None` when its read or parse failed.
+struct SweptClass {
+    index: usize,
+    name: String,
+    len: u64,
+    class: Option<ClassFile>,
+}
+
+impl ClassSweep {
+    /// Sweep `archive` as [`for_each_class_budgeted`] does, calling `f` on each class,
+    /// and keep the sweep.
+    pub(crate) fn record<Z: Read + Seek>(
+        archive: &mut ZipArchive<Z>,
+        budget: &mut u64,
+        mut f: impl FnMut(&str, &ClassFile),
+    ) -> Self {
+        let mut entries = Vec::new();
+        let is_class = |n: &str| n.ends_with(".class");
+        let _: Option<()> = walk_entries(
+            archive,
+            is_class,
+            MAX_CLASS_BYTES,
+            budget,
+            |i, name, bytes, ok| {
+                let class = if ok {
+                    ClassFile::parse(bytes).ok()
+                } else {
+                    None
+                };
+                if let Some(c) = &class {
+                    f(name, c);
+                }
+                entries.push(SweptClass {
+                    index: i,
+                    name: name.to_string(),
+                    len: bytes.len() as u64,
+                    class,
+                });
+                None
+            },
+        );
+        ClassSweep { entries }
+    }
+
+    /// [`for_each_class_budgeted`] over the kept sweep.
+    pub(crate) fn for_each(&self, budget: &mut u64, mut f: impl FnMut(&str, &ClassFile)) {
+        let _: Option<()> = self.replay(
+            budget,
+            |_| true,
+            |name, class| {
+                f(name, class);
+                None
+            },
+        );
+    }
+
+    /// [`try_class_budgeted`] over the kept sweep.
+    pub(crate) fn try_class<R>(
+        &self,
+        entry_name: &str,
+        budget: &mut u64,
+        mut f: impl FnMut(&ClassFile) -> Option<R>,
+    ) -> Option<R> {
+        self.replay(budget, |n| n == entry_name, |_, class| f(class))
+    }
+
+    // The budget is only ever lower than when the sweep was kept, so a kept size (cut at
+    // that budget + 1) still exceeds this budget exactly when the real entry would.
+    fn replay<R>(
+        &self,
+        budget: &mut u64,
+        want: impl Fn(&str) -> bool,
+        mut f: impl FnMut(&str, &ClassFile) -> Option<R>,
+    ) -> Option<R> {
+        let had_budget = *budget > 0;
+        for e in self.entries.iter().filter(|e| want(&e.name)) {
+            if e.len > *budget || *budget == 0 {
+                *budget = 0;
+                budget_spent(had_budget, e.index);
+                return None;
+            }
+            *budget -= e.len;
+            if let Some(r) = e.class.as_ref().and_then(|c| f(&e.name, c)) {
+                return Some(r);
+            }
+        }
+        None
+    }
 }
 
 #[cfg(test)]

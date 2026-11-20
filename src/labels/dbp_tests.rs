@@ -50,7 +50,7 @@ fn build_jar_bytes(entries: &[(&str, Vec<u8>)]) -> Vec<u8> {
 }
 
 fn build_jar(entries: &[(&str, Vec<u8>)]) -> jar::Jar {
-    zip::ZipArchive::new(Cursor::new(build_jar_bytes(entries))).expect("valid zip")
+    zip::ZipArchive::new(Cursor::new(build_jar_bytes(entries).into())).expect("valid zip")
 }
 
 // An in-memory disc holding one `/BDMV/JAR/<name>` jar per entry.
