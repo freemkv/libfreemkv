@@ -391,11 +391,11 @@ fn the_next_read_overlaps_the_current_write() {
             short_after: None,
         },
     );
-    // The last batch has no read after it: its write would wait out the timeout.
+    // A serial copy would time out on the first write; the overlapped one completes.
     let r = copy_out(&mut src, Box::new(Waits(rx)), total, &Ctx::default());
     assert!(
-        matches!(r, Err(Error::Halted)),
-        "only the final write times out: {r:?}"
+        matches!(r, Ok(_)),
+        "every write saw the next read start: {r:?}"
     );
 }
 
