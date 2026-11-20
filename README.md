@@ -12,15 +12,13 @@
 
 Rust library for 4K UHD / Blu-ray / DVD optical drives. Drive access, disc scanning, stream labels, AACS decryption, CSS decryption, and content reading in one crate. Drive-level unlocking is handled internally; consumers work with disc access and decryption only.
 
-DVDs (CSS) decrypt out of the box. Blu-ray and UHD (AACS) require disc-specific volume unique keys, supplied by the consumer (e.g. via [freemkv-keysources](https://github.com/freemkv/freemkv-keysources), which owns `keydb.cfg` lookup/download); libfreemkv itself never reads `keydb.cfg` or downloads keys, and no AACS key material is compiled in.
+DVDs (CSS) decrypt out of the box. Blu-ray and UHD (AACS) require disc-specific volume unique keys, supplied by the consumer (e.g. via [freemkv-keysources](https://github.com/freemkv/freemkv-keysources), which owns `keydb.cfg` lookup and download). libfreemkv itself never reads `keydb.cfg` or downloads keys, and no AACS key material is compiled in.
 
-**12+ MB/s** sustained read speeds on BD. Drive prep (`init()`) handles unlocking internally via the `freemkv-unlock` crate — clients never see it; when no drive unlock applies, the library rips via the host-certificate AACS handshake.
+Drive prep (`init()`) handles unlocking internally via the `freemkv-unlock` crate, and clients never see it. When no drive unlock applies, the library rips via the host-certificate AACS handshake.
 
-Multi-lingual by design — the library outputs structured data and numeric error codes, never English text. Build any UI or localization on top.
+The library outputs structured data and numeric error codes, never English text, so any UI or localization can be built on top.
 
-**[Source & API](https://github.com/freemkv/libfreemkv)** · **[Changelog](CHANGELOG.md)**
-
-Part of the [freemkv](https://github.com/freemkv) project.
+[Changelog](CHANGELOG.md). Part of the [freemkv](https://github.com/freemkv) project.
 
 ## Install
 
@@ -31,114 +29,130 @@ Consumed by git tag (not published to crates.io):
 libfreemkv = { git = "https://github.com/freemkv/libfreemkv", tag = "vX.Y.Z" }
 ```
 
+Cargo features:
+
+- `rip` (default): the full library, including disc parsing, decryption and muxing.
+- `scsi` (default): the SCSI transport and error types only. Use
+  `default-features = false, features = ["scsi"]` for a transport-only build.
+- `test-util`: `libfreemkv::test_util` fixtures for consumers' tests. Dev-dependency use only.
+- `keyproof`: exposes `aacs::content::unit_key_opens`, a one-bit key check that never returns plaintext. Off by default.
+
 ## Quick Start
 
 ```rust
-use libfreemkv::{Drive, Disc, ScanOptions};
-use std::path::Path;
+use libfreemkv::{Disc, ScanOptions, find_drive};
 
-// Open drive — identified via INQUIRY
-let mut drive = Drive::open(Path::new("/dev/sg4"))?;
-drive.wait_ready()?;              // wait for disc
+// Find and open an optical drive
+let mut drive = find_drive().expect("no optical drive found");
+drive.wait_ready()?;               // wait for disc
 drive.init()?;                     // unlock + prep (handled internally)
-drive.probe_disc()?;               // probe disc surface for optimal speeds
 
-// Scan disc — UDF, playlists, streams, AACS (all automatic)
+// Scan disc: UDF, playlists, streams, AACS
 let disc = Disc::scan(&mut drive, &ScanOptions::default())?;
 
 for title in &disc.titles {
-    println!("{} — {} streams", title.duration_display(), title.streams.len());
+    println!("{} - {} streams", title.duration_display(), title.streams.len());
 }
 
-// Stream pipeline — read PES frames from any source, write to any output
+// Stream pipeline: read PES frames from any source, write to any output
 let opts = libfreemkv::InputOptions::default();
 let ctx = libfreemkv::Ctx::default(); // halt, events, loss counters for the run
 let mut input = libfreemkv::input("iso://Disc.iso", &opts, &ctx)?;
 let title = input.info().clone();
-let mut output = libfreemkv::output("mkv://Movie.mkv", &title)?;
-while let Ok(Some(frame)) = input.read() {
+let mut output = libfreemkv::output("mkv://Movie.mkv", &title, None)?;
+while let Some(frame) = input.read()? {
     output.write(&frame)?;
 }
 output.finish()?;
 ```
 
+To open a specific device instead of the first drive, use `Drive::open(Path::new("/dev/sg4"))`.
+`Drive::probe_disc()` probes the disc surface for the best read speeds.
+
 ### Multi-pass recovery rip
 
 The sweep/patch strategy, ddrescue mapfile, damage classification and
-multipass loop live in the
-`freemkv-engine` crate as `freemkv_engine::recovery::{copy, sweep, patch}`.
+multipass loop live in the `freemkv-engine` crate (`freemkv_engine::{copy, sweep, patch}`).
 
 libfreemkv keeps the layers underneath: the raw single-shot read
 (`Drive::read`) and the SCSI-fact translation (`SenseFamily`) that the engine's
-strategy is built on. The dependency runs engine → libfreemkv, so this crate
-cannot call into it; front-ends get recovery from the engine directly.
+strategy is built on. The dependency runs engine to libfreemkv, so this crate
+cannot call into it. Front-ends get recovery from the engine directly.
 
 ## What It Does
 
-- **Drive access** — open, identify, internal unlock + prep, speed control, eject
-- **12+ MB/s reads** — auto-detects kernel transfer limits, sustained full speed
-- **Disc scanning** — UDF 2.50 filesystem, MPLS playlists, CLPI clip info
-- **Stream labels** — 7 BD-J format parsers (Paramount, Criterion, Pixelogic, CTRM, DBP, Deluxe, Fox)
-- **AACS decryption** — transparent key resolution and content decrypt (1.0 + 2.0 bus decryption)
-- **Content reading** — adaptive batch reads with automatic decryption
-- **Stream I/O** — unified stream pipeline for reading and writing any format
+- **Drive access:** open, identify, internal unlock and prep, speed control, eject
+- **Disc scanning:** UDF 2.50 filesystem, MPLS playlists, CLPI clip info, DVD IFO
+- **Stream labels:** 7 BD-J format parsers (Paramount, Criterion, Pixelogic, CTRM, DBP, Deluxe, Fox)
+- **AACS decryption:** content decryption from supplied keys (1.0 and 2.0 bus decryption)
+- **Content reading:** adaptive batch reads with automatic decryption
+- **Stream I/O:** one stream pipeline for reading and writing any format
 
 ### Streams
 
-| Stream | Input | Output | Transport |
+URLs use the `scheme://path` format. Bare paths are rejected.
+
+| Scheme | Input | Output | Transport |
 |--------|-------|--------|-----------|
 | `disc://` | Yes | -- | Optical drive via SCSI (live Read policy: adaptive batches, recovery read, skip or fail) |
-| `iso://` / `dir://` | Yes | -- | Disc image file or folder (image Read policy; written by `freemkv_engine::recovery`) |
-| MkvStream | Yes | Yes | Matroska container |
-| M2tsStream | Yes | Yes | BD transport stream with FMKV metadata header |
-| NetworkStream | Yes (listen) | Yes (connect) | TCP with FMKV metadata header |
-| StdioStream | Yes (stdin) | Yes (stdout) | Raw byte pipe |
-| NullStream | -- | Yes | Discard sink (byte counter for benchmarks) |
+| `iso://` / `dir://` | Yes | Yes | Disc image file or folder (image Read policy) |
+| `mkv://` (MkvStream) | Yes | Yes | Matroska container |
+| `mp4://` | Yes | Yes | MP4 container |
+| `mpg://` | Yes | Yes | MPEG program stream |
+| `m2ts://` (M2tsStream) | Yes | Yes | BD transport stream with FMKV metadata header |
+| `network://` (NetworkStream) | Yes (listen) | Yes (connect) | TCP with FMKV metadata header |
+| `stdio://` (StdioStream) | Yes (stdin) | Yes (stdout) | Raw byte pipe |
+| `null://` (NullStream) | -- | Yes | Discard sink (byte counter for benchmarks) |
 
-Inputs implement `PesSource` (`read()`) and outputs `PesSink` (`write()`); a format that is both implements both. `open_source()` / `input()` open every input URL (`disc://` included) and `output()` every output URL. All URLs use the `scheme://path` format — bare paths are rejected.
+There are also output-only schemes for per-track files (`demux://`, `video://`, `audio://`, `sub://`) and for
+side files (`fvi://`, `chapters://`, `json://`).
+
+Inputs implement `PesSource` (`read()`) and outputs `PesSink` (`write()`); a format that is both implements both. `open_source()` / `input()` open every input URL (`disc://` included) and `output()` every output URL.
 
 ### Keys
 
 DVDs (CSS) decrypt out of the box, with no external key file needed.
 
-Blu-rays and UHD (AACS) require Unit Keys passed in via `ScanOptions`/`KeySpec`. libfreemkv does not read `keydb.cfg` or fetch keys itself — that's the consumer's job (see [freemkv-keysources](https://github.com/freemkv/freemkv-keysources)). No AACS key material is compiled into the binary.
+Blu-rays and UHD (AACS) require Unit Keys passed in via `ScanOptions`/`KeySpec`. libfreemkv does not read `keydb.cfg` or fetch keys itself. That is the consumer's job (see [freemkv-keysources](https://github.com/freemkv/freemkv-keysources)). No AACS key material is compiled into the binary.
 
 ## Architecture
 
 ```text
-Drive                  — open, identify, init, single-shot read
-  ├── ScsiTransport    — SG_IO (Linux), IOKit (macOS), SPTI (Windows)
-  └── unlock_bridge    — private seam to the freemkv-unlock crate
+Drive                  - open, identify, init, single-shot read
+  ├── ScsiTransport    - SG_IO (Linux), IOKit (macOS), SPTI (Windows)
+  └── unlock_bridge    - private seam to the freemkv-unlock crate
                          (firmware / AACS cert / CSS bus-auth unlockers)
 
-Disc                   — scan titles, streams, AACS/CSS state
-  ├── UDF reader       — Blu-ray UDF 2.50 with metadata partitions
-  ├── MPLS parser      — playlists → titles + clips + streams
-  ├── CLPI parser      — clip info → EP map → sector extents
-  ├── IFO parser       — DVD title sets, PGC chains, cell addresses
-  ├── Labels           — 7 BD-J format parsers (detect + parse)
-  ├── AACS             — key resolution + content decryption
-  └── CSS              — DVD CSS (bus auth → player-key disc crack → known-plaintext title-key attack)
+Disc                   - scan titles, streams, AACS/CSS state
+  ├── UDF reader       - Blu-ray UDF 2.50 with metadata partitions
+  ├── MPLS parser      - playlists → titles + clips + streams
+  ├── CLPI parser      - clip info → EP map → sector extents
+  ├── IFO parser       - DVD title sets, PGC chains, cell addresses
+  ├── Labels           - 7 BD-J format parsers (detect + parse)
+  ├── AACS             - key resolution + content decryption
+  └── CSS              - DVD CSS (bus auth → player-key disc crack → known-plaintext title-key attack)
 
-Streams                — one PES pipeline
-  ├── Source           — open_source(url): drive, image, folder, file, socket, pipe
-  ├── Read stage       — extents → chunks under the source's ReadPolicy (live | image)
-  ├── Decrypt stage    — AACS / CSS, content-detected, damage blanked and counted
-  ├── Demux            — TS / PS → PES (one demux for every sector source)
-  ├── PesSource/PesSink — read()/write() PES frames
-  ├── MkvStream        — MKV mux/demux
-  ├── M2tsStream       — BD transport stream
-  ├── NetworkStream    — TCP with FMKV metadata header
-  ├── StdioStream      — stdin/stdout pipe
-  └── NullStream       — discard sink
+Streams                - one PES pipeline
+  ├── Source           - open_source(url): drive, image, folder, file, socket, pipe
+  ├── Read stage       - extents → chunks under the source's ReadPolicy (live | image)
+  ├── Decrypt stage    - AACS / CSS, content-detected, damage blanked and counted
+  ├── Demux            - TS / PS → PES (one demux for every sector source)
+  ├── PesSource/PesSink - read()/write() PES frames
+  ├── MkvStream        - MKV mux/demux
+  ├── Mp4Sink          - MP4 output
+  ├── M2tsStream       - BD transport stream
+  ├── NetworkStream    - TCP with FMKV metadata header
+  ├── StdioStream      - stdin/stdout pipe
+  └── NullStream       - discard sink
 ```
 
 Build API documentation with `cargo doc --no-deps --open`. The public
 [FVI format specification](https://freemkv.org/docs/fvi-format/) describes exported video indexes.
+[TROUBLESHOOTING.md](TROUBLESHOOTING.md) covers common drive problems, such as USB-SATA bridge issues.
 
 ## Error Codes
 
-All errors are structured with numeric codes. No user-facing English text — applications format their own messages.
+All errors are structured with numeric codes. No user-facing English text; applications format their own messages.
 
 | Range | Category |
 |-------|----------|
@@ -166,14 +180,12 @@ Run `freemkv info disc:// --share` with the [freemkv CLI](https://github.com/fre
 
 ## What this is NOT
 
-To keep expectations honest:
-
 - **No bundled AACS or CSS keys.** No AACS key material is compiled into the
   crate. Blu-ray/UHD unit keys are supplied by the consumer at runtime (e.g. via
   [freemkv-keysources](https://github.com/freemkv/freemkv-keysources)'s
-  `keydb.cfg` lookup); libfreemkv never reads `keydb.cfg` or downloads keys.
+  `keydb.cfg` lookup). libfreemkv never reads `keydb.cfg` or downloads keys.
 - **Not published to crates.io.** The crate is `publish = false`. It is consumed
-  by git tag or path only (see [Install](#install)) — there is no crates.io
+  by git tag or path only (see [Install](#install)), so there is no crates.io
   version, docs.rs page, or download count.
 - **No independent security audit.** No external or third-party security audit
   has been performed. [SECURITY.md](SECURITY.md) is an assurance case authored by
@@ -186,10 +198,6 @@ To keep expectations honest:
 
 The minimum supported Rust version (MSRV) is **1.88**, declared as
 `rust-version` in [`Cargo.toml`](Cargo.toml) and enforced in CI on every change.
-
-## License
-
-MIT
 
 ## Validation
 
@@ -214,3 +222,7 @@ are separate. See [FFmpeg legal guidance](https://ffmpeg.org/legal.html).
 MKV remuxing preserves decoder delay and frame padding locally. Network/stdio
 PES serialization does not carry that metadata. Direct `PesFrame` constructors
 must set `discard_padding_ns` to zero unless preserving trimming.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
