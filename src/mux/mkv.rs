@@ -576,6 +576,59 @@ struct SeekPositionFixup {
     value_offset: u64, // absolute file offset of the 8-byte SeekPosition value
 }
 
+/// Per-track state keyed by muxer track index: one slot per track instead of a hashed
+/// map, since the frame path consults several on every frame. Iterates in track order.
+struct TrackMap<V> {
+    slots: Vec<Option<(usize, V)>>,
+    len: usize,
+}
+
+impl<V> TrackMap<V> {
+    fn new() -> Self {
+        Self {
+            slots: Vec::new(),
+            len: 0,
+        }
+    }
+
+    fn get(&self, track: &usize) -> Option<&V> {
+        self.slots.get(*track)?.as_ref().map(|(_, v)| v)
+    }
+
+    fn get_mut(&mut self, track: &usize) -> Option<&mut V> {
+        self.slots.get_mut(*track)?.as_mut().map(|(_, v)| v)
+    }
+
+    fn insert(&mut self, track: usize, value: V) -> Option<V> {
+        if self.slots.len() <= track {
+            self.slots.resize_with(track + 1, || None);
+        }
+        let old = self.slots[track].replace((track, value)).map(|(_, v)| v);
+        self.len += usize::from(old.is_none());
+        old
+    }
+
+    fn remove(&mut self, track: &usize) -> Option<V> {
+        let old = self.slots.get_mut(*track)?.take().map(|(_, v)| v);
+        self.len -= usize::from(old.is_some());
+        old
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn values(&self) -> impl Iterator<Item = &V> {
+        self.slots.iter().filter_map(|s| s.as_ref().map(|(_, v)| v))
+    }
+
+    fn iter_mut(&mut self) -> impl Iterator<Item = (&usize, &mut V)> {
+        self.slots
+            .iter_mut()
+            .filter_map(|s| s.as_mut().map(|(k, v)| (&*k, v)))
+    }
+}
+
 /// A `Write` over the muxer's writer that advances the muxer's logical position.
 struct Tally<'a, W> {
     w: &'a mut W,
@@ -625,7 +678,7 @@ pub struct MkvMuxer<W: Write + Seek> {
     /// PER TRACK, to enforce strictly-monotonic per-track timestamps —
     /// players and decoders reject non-monotonic DTS, and some audio PES PTS land on
     /// the same tick (or tick back one from rounding).
-    last_pts_ticks: std::collections::HashMap<usize, i64>,
+    last_pts_ticks: TrackMap<i64>,
     /// Per-track-index flag: true if the track is video. The strictly-monotonic
     /// block-timestamp nudge must be skipped for EVERY video track, not just
     /// track 0 — a title can carry a second video track (e.g. a Dolby Vision
@@ -670,7 +723,7 @@ pub struct MkvMuxer<W: Write + Seek> {
     origin_lead_ticks: i64,
     /// Per VobSub track: file offset of an open-ended block's 3-byte
     /// BlockDuration value, and that block's timestamp in ticks.
-    vobsub_open_end: std::collections::HashMap<usize, (u64, i64)>,
+    vobsub_open_end: TrackMap<(u64, i64)>,
     seek_fixups: Vec<SeekPositionFixup>,
     /// Absolute file offset of the CUES SeekHead entry (a fixed 21-byte Seek
     /// element). When `finish()` writes no Cues element (zero cue points), this
@@ -712,7 +765,7 @@ pub struct MkvMuxer<W: Write + Seek> {
     /// and `mc_header`). Each entry records the file offset of the 1-byte Channels value
     /// (to patch in place) and the IFO-claimed count (to warn on disagreement);
     /// `corrected` flips once patched so we only act on the first frame.
-    channel_fixups: std::collections::HashMap<usize, ChannelFixup>,
+    channel_fixups: TrackMap<ChannelFixup>,
     /// Deferred PGS forced-subtitle detection. A PGS subtitle track reserves a
     /// 1-byte `FlagForced` value up-front; as its display sets are written, the
     /// track is judged forced iff it displayed at least one subtitle and EVERY
@@ -721,7 +774,7 @@ pub struct MkvMuxer<W: Write + Seek> {
     /// so forced subs are flagged even on discs without vendor label metadata.
     /// A vendor forced flag is cleared only under the cross-track guard in
     /// `finish()` (see `super::codec::pgs::demotable`).
-    pgs_forced_fixups: std::collections::HashMap<usize, PgsForcedFixup>,
+    pgs_forced_fixups: TrackMap<PgsForcedFixup>,
     /// Deferred `FlagInterlaced` correction. A video track's scan type is written
     /// up-front from the FIRST coded picture, but MPEG-2 `progressive_frame` is a
     /// PER-picture flag (§6.3.10): the first picture (a progressive leader/logo on
@@ -730,7 +783,7 @@ pub struct MkvMuxer<W: Write + Seek> {
     /// offset and the `FieldOrder` element's span, then counts progressive vs
     /// interlaced pictures across the WHOLE track; at `finish()` the byte is
     /// rewritten to the MAJORITY scan (and a now-wrong FieldOrder Void'd).
-    flag_interlaced_fixups: std::collections::HashMap<usize, FlagInterlacedFixup>,
+    flag_interlaced_fixups: TrackMap<FlagInterlacedFixup>,
     /// `--log-level 3` opening-frame capture: the first ~100 coded frames per
     /// track are written (raw) to a `<output>.opening.bin` side file with a
     /// per-frame summary logged, so an opening-GOP / menu / mid-GOP-open issue is
@@ -739,9 +792,9 @@ pub struct MkvMuxer<W: Write + Seek> {
     opening_capture: Option<crate::diag::OpeningCapture>,
     /// Per track: file offset of a Void reserved for a CodecPrivate that was not
     /// known at header time (AAC), filled by [`Self::set_codec_private`].
-    codec_private_reserves: std::collections::HashMap<usize, u64>,
+    codec_private_reserves: TrackMap<u64>,
     /// Per MPEG-2 video track: the DefaultDuration measured from the kept frames.
-    frame_rate_fixups: std::collections::HashMap<usize, FrameRateFixup>,
+    frame_rate_fixups: TrackMap<FrameRateFixup>,
 }
 
 // Deferred DefaultDuration correction for an MPEG-2 video track: the header holds the
@@ -1113,16 +1166,11 @@ impl<W: Write + Seek> MkvMuxer<W> {
         let tracks_offset = tracks_start - segment_start;
         let tracks_pos = ebml::start_master(&mut writer, ebml::TRACKS)?;
         let mut track_uids: Vec<u64> = Vec::with_capacity(tracks.len());
-        let mut channel_fixups: std::collections::HashMap<usize, ChannelFixup> =
-            std::collections::HashMap::new();
-        let mut pgs_forced_fixups: std::collections::HashMap<usize, PgsForcedFixup> =
-            std::collections::HashMap::new();
-        let mut codec_private_reserves: std::collections::HashMap<usize, u64> =
-            std::collections::HashMap::new();
-        let mut flag_interlaced_fixups: std::collections::HashMap<usize, FlagInterlacedFixup> =
-            std::collections::HashMap::new();
-        let mut frame_rate_fixups: std::collections::HashMap<usize, FrameRateFixup> =
-            std::collections::HashMap::new();
+        let mut channel_fixups: TrackMap<ChannelFixup> = TrackMap::new();
+        let mut pgs_forced_fixups: TrackMap<PgsForcedFixup> = TrackMap::new();
+        let mut codec_private_reserves: TrackMap<u64> = TrackMap::new();
+        let mut flag_interlaced_fixups: TrackMap<FlagInterlacedFixup> = TrackMap::new();
+        let mut frame_rate_fixups: TrackMap<FrameRateFixup> = TrackMap::new();
         // Per track: whether it emitted a conforming `mvcC` BlockAdditionMapping.
         // Filled below from the SAME built record that drives the CodecPrivate
         // mvcC extension, so the three MVC signals never diverge.
@@ -1446,7 +1494,7 @@ impl<W: Write + Seek> MkvMuxer<W> {
             block_group_buf: Vec::new(),
             cluster_ts_ticks: 0,
             base_pts_ticks: None,
-            last_pts_ticks: std::collections::HashMap::new(),
+            last_pts_ticks: TrackMap::new(),
             track_is_video: tracks
                 .iter()
                 .map(|t| t.track_type == ebml::TRACK_TYPE_VIDEO)
@@ -1468,7 +1516,7 @@ impl<W: Write + Seek> MkvMuxer<W> {
             frame_count: 0,
             dropped_pre_cluster: 0,
             origin_lead_ticks: 0,
-            vobsub_open_end: std::collections::HashMap::new(),
+            vobsub_open_end: TrackMap::new(),
             seek_fixups,
             cues_seek_entry_pos,
             info_offset,
