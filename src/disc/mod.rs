@@ -244,6 +244,52 @@ pub struct Clip {
     pub marks_on_pes_clock: bool,
 }
 
+/// `Disc::canonical_title_order`'s keys, in its priority order (derived `Ord` compares
+/// fields top to bottom).
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+struct CanonicalKey {
+    oversize: bool,
+    size: std::cmp::Reverse<u64>,
+    duration: std::cmp::Reverse<TotalF64>,
+    richness: std::cmp::Reverse<(u8, u8, usize)>,
+    video: std::cmp::Reverse<usize>,
+    subtitles: std::cmp::Reverse<usize>,
+    playlist_id: u16,
+}
+
+/// `Disc::main_feature_order`'s keys: nav, authoring (both preferred), composite
+/// (demoted), plausible video (preferred), then the canonical order.
+type MainFeatureKey = (
+    std::cmp::Reverse<bool>,
+    std::cmp::Reverse<bool>,
+    bool,
+    std::cmp::Reverse<bool>,
+    CanonicalKey,
+);
+
+/// An `f64` ordered by `total_cmp`, as the title comparators order durations.
+struct TotalF64(f64);
+
+impl PartialEq for TotalF64 {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.total_cmp(&other.0).is_eq()
+    }
+}
+
+impl Eq for TotalF64 {}
+
+impl PartialOrd for TotalF64 {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for TotalF64 {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.total_cmp(&other.0)
+    }
+}
+
 /// Per-title classification for [`Disc::main_feature_order`]. All three fields
 /// are GLOBAL properties (they depend on the whole title list, not on a pairwise
 /// comparison), so they are precomputed once by [`Disc::rank_titles`] and
@@ -2646,7 +2692,7 @@ impl Disc {
         // "longest duration first" misranks branching UHDs (see `canonical_title_order`);
         // sort so `-t 1` / autorip / `.first()` converge on the real movie.
         let capacity_bytes = capacity as u64 * 2048;
-        titles.sort_by(|a, b| Self::canonical_title_order(a, b, capacity_bytes));
+        titles.sort_by_cached_key(|t| Self::canonical_key(t, capacity_bytes));
 
         // 4. Metadata + labels
         let meta_title = Self::read_meta_title(reader, &udf_fs);
@@ -2840,6 +2886,34 @@ impl Disc {
             .then_with(|| a.playlist_id.cmp(&b.playlist_id))
     }
 
+    // `canonical_title_order` as a sort key, so a sort computes each title's audio
+    // richness and stream counts once instead of in every comparison.
+    fn canonical_key(t: &DiscTitle, capacity_bytes: u64) -> CanonicalKey {
+        use std::cmp::Reverse;
+        CanonicalKey {
+            oversize: capacity_bytes > 0 && t.size_bytes > capacity_bytes,
+            size: Reverse(t.size_bytes),
+            duration: Reverse(TotalF64(t.duration_secs)),
+            richness: Reverse(Self::audio_richness(t)),
+            video: Reverse(t.video_streams().count()),
+            subtitles: Reverse(t.subtitle_streams().count()),
+            playlist_id: t.playlist_id,
+        }
+    }
+
+    // `main_feature_order` as a sort key: the rank flags, video plausibility, then the
+    // canonical key, each computed once per title.
+    fn main_feature_key(t: &DiscTitle, r: &TitleRank, capacity_bytes: u64) -> MainFeatureKey {
+        use std::cmp::Reverse;
+        (
+            Reverse(r.nav),
+            Reverse(r.authoring),
+            r.composite,
+            Reverse(t.has_probable_video()),
+            Self::canonical_key(t, capacity_bytes),
+        )
+    }
+
     /// The keys [`Self::main_feature_order`] layers ON TOP of
     /// [`Self::CANONICAL_TITLE_ORDER_KEYS`], highest priority first, as diagnostic tokens:
     /// `nav-feature` (disc's own HDMV nav pick, authoritative), `authoring-feature` (disc's
@@ -2982,8 +3056,7 @@ impl Disc {
         let ranks = Self::rank_titles(titles, hint, nav_feature);
         let mut decorated: Vec<(TitleRank, DiscTitle)> =
             ranks.into_iter().zip(std::mem::take(titles)).collect();
-        decorated
-            .sort_by(|(ra, a), (rb, b)| Self::main_feature_order(a, b, capacity_bytes, ra, rb));
+        decorated.sort_by_cached_key(|(r, t)| Self::main_feature_key(t, r, capacity_bytes));
         *titles = decorated.into_iter().map(|(_, t)| t).collect();
     }
 

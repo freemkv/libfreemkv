@@ -1637,6 +1637,69 @@ fn canonical_title_order_prefers_stream_richer_sibling_issue_45() {
     );
 }
 
+// The scan sorts by precomputed keys; they must order titles exactly as the public
+// comparators do, ties and oversize demotion included.
+#[test]
+fn cached_title_keys_order_like_the_comparators() {
+    let cap = 50_000_000_000u64;
+    let mut state = 0x853C_49E6_748F_EA9Bu64;
+    let mut next = |m: u64| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state % m
+    };
+    for _ in 0..50 {
+        let mut titles: Vec<DiscTitle> = (0..12u16)
+            .map(|id| {
+                let mut t = title_with_video(Codec::Hevc, Resolution::R2160p);
+                t.playlist_id = 800 + (next(6) as u16) * 10 + id;
+                t.size_bytes = [1, 2, 60_000][next(3) as usize] * 1_000_000;
+                t.duration_secs = [600.0, 7200.0, f64::NAN][next(3) as usize];
+                for _ in 0..next(3) {
+                    t.streams.push(Stream::Subtitle(SubtitleStream {
+                        pid: 0x1200,
+                        codec: Codec::Pgs,
+                        language: "eng".into(),
+                        forced: false,
+                        qualifier: LabelQualifier::None,
+                        codec_data: None,
+                    }));
+                }
+                if next(2) == 0 {
+                    t.streams.clear();
+                }
+                t
+            })
+            .collect();
+        let ranks: Vec<TitleRank> = (0..titles.len())
+            .map(|_| TitleRank {
+                nav: next(5) == 0,
+                authoring: next(4) == 0,
+                composite: next(3) == 0,
+            })
+            .collect();
+        let ids = |v: &[DiscTitle]| v.iter().map(|t| t.playlist_id).collect::<Vec<_>>();
+        let mut by_cmp = titles.clone();
+        by_cmp.sort_by(|a, b| Disc::canonical_title_order(a, b, cap));
+        let mut by_key = titles.clone();
+        by_key.sort_by_cached_key(|t| Disc::canonical_key(t, cap));
+        assert_eq!(ids(&by_key), ids(&by_cmp));
+        let mut dec_cmp: Vec<(TitleRank, DiscTitle)> =
+            ranks.iter().copied().zip(titles.clone()).collect();
+        dec_cmp.sort_by(|(ra, a), (rb, b)| Disc::main_feature_order(a, b, cap, ra, rb));
+        let mut dec_key: Vec<(TitleRank, DiscTitle)> = ranks
+            .iter()
+            .copied()
+            .zip(std::mem::take(&mut titles))
+            .collect();
+        dec_key.sort_by_cached_key(|(r, t)| Disc::main_feature_key(t, r, cap));
+        let pid =
+            |v: &[(TitleRank, DiscTitle)]| v.iter().map(|p| p.1.playlist_id).collect::<Vec<_>>();
+        assert_eq!(pid(&dec_key), pid(&dec_cmp));
+    }
+}
+
 // L088: canonical_title_order's final tiebreak (playlist_id) is a real sort
 // key, same as the other 6 — the const naming them must not omit it.
 #[test]

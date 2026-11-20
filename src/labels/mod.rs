@@ -983,7 +983,7 @@ fn extract(
     // One tie-break rule, one implementation. `select_result` regression-tests a
     // past bug where the LAST equal-confidence parser won instead of the first.
     // Array order encodes trust (hand-vetted parsers before generic BD-J ones).
-    let best = select_result(&candidates).map(|(n, r)| (*n, r.clone()));
+    let best = select_index(&candidates).map(|i| candidates.remove(i));
     let (_, evidence, mut labels, feature_playlist) = match best {
         Some((n, r)) => {
             tracing::info!(
@@ -1085,12 +1085,17 @@ fn type_tag(t: StreamLabelType) -> u8 {
 fn select_result<'a>(
     results: &'a [(&'static str, ParseResult)],
 ) -> Option<&'a (&'static str, ParseResult)> {
+    select_index(results).map(|i| &results[i])
+}
+
+// The index `select_result` picks, so `extract` can take the winner out instead of cloning it.
+fn select_index(results: &[(&'static str, ParseResult)]) -> Option<usize> {
     results
         .iter()
         .enumerate()
         .filter(|(_, (_, r))| !r.labels.is_empty())
         .max_by_key(|(idx, (_, r))| (r.confidence, std::cmp::Reverse(*idx)))
-        .map(|(_, entry)| entry)
+        .map(|(idx, _)| idx)
 }
 
 /// Diagnostic introspection — returns the parser that matched, the

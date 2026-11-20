@@ -9,7 +9,7 @@ use crate::disc::{ContentFormat, Disc, DiscFormat, Extent};
 use crate::error::{Error, Result};
 use crate::halt::Halt;
 use crate::sector::SectorSource;
-use crate::whole_disc::{UNIT, UnitSpan, probe_units, subtract_ranges, unit_head};
+use crate::whole_disc::{UNIT, UnitSpan, probe_units, unit_head};
 
 /// The identity a ring is bound to: [`KeyRing::is_for`](super::KeyRing::is_for) compares
 /// it. No key bytes; the Volume ID only as its fingerprint.
@@ -287,16 +287,8 @@ pub(crate) fn pieces(
                 .map(move |e| (t, e.start_lba, e.start_lba.saturating_add(e.sector_count)))
         })
         .collect();
-    let touches = |ranges: &[(u32, u32)]| -> Vec<usize> {
-        let mut t: Vec<usize> = title_ranges
-            .iter()
-            .filter(|&&(_, s, e)| super::overlaps(ranges, s, e))
-            .map(|&(t, _, _)| t)
-            .collect();
-        t.sort_unstable();
-        t.dedup();
-        t
-    };
+    let index = TitleRangeIndex::new(&title_ranges);
+    let touches = |ranges: &[(u32, u32)]| -> Vec<usize> { index.touching(ranges) };
     let mut claimed: Vec<(u32, u32)> = Vec::new();
     let mut out = Vec::new();
     let push = |spans: Vec<UnitSpan>, out: &mut Vec<Piece>| {
@@ -328,27 +320,132 @@ pub(crate) fn pieces(
         let mut off = 0u64;
         for &(lba, n) in file {
             let anchor = (lba as u64).saturating_sub(off % UNIT);
-            for (s, e) in subtract_ranges(&[(lba, n)], &claimed) {
+            for (s, e) in subtract_sorted(lba, n, &claimed) {
                 spans.push((s, e - s, anchor));
             }
             off += n as u64;
         }
-        claimed = sorted_ranges(claimed.into_iter().chain(ends).collect());
+        claimed = merge_into_sorted(&claimed, ends);
         if !spans.is_empty() {
             push(spans, &mut out);
         }
     }
     for &(_, s, e) in &title_ranges {
-        let left = subtract_ranges(&[(s, e - s)], &claimed);
+        let left = subtract_sorted(s, e - s, &claimed);
         if left.is_empty() {
             continue;
         }
         let spans = left.iter().map(|&(a, b)| (a, b - a, s as u64)).collect();
-        claimed = sorted_ranges(claimed.into_iter().chain(left).collect());
+        claimed = merge_into_sorted(&claimed, left);
         push(spans, &mut out);
     }
     out.sort_by_key(Piece::id);
     out
+}
+
+// `subtract_ranges(&[(start, count)], claimed)` for a `claimed` that `sorted_ranges` built
+// (sorted, disjoint, ends increasing): starts at the first range ending past `start` and
+// stops at the first starting at or past the end, instead of walking all of `claimed`.
+fn subtract_sorted(start: u32, count: u32, claimed: &[(u32, u32)]) -> Vec<(u32, u32)> {
+    let end = start.saturating_add(count);
+    let mut out = Vec::new();
+    let mut pos = start;
+    let from = claimed.partition_point(|&(_, ke)| ke <= start);
+    for &(ks, ke) in claimed[from..].iter().take_while(|&&(ks, _)| ks < end) {
+        if ke <= pos {
+            continue;
+        }
+        if ks > pos {
+            out.push((pos, ks));
+        }
+        pos = pos.max(ke);
+    }
+    if pos < end {
+        out.push((pos, end));
+    }
+    out
+}
+
+// `sorted_ranges(claimed ++ new)` for an already-sorted `claimed`: `new` is sorted and the
+// two are merged in one linear pass, not re-sorted together for every file.
+fn merge_into_sorted(claimed: &[(u32, u32)], mut new: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
+    new.sort_unstable();
+    let mut out: Vec<(u32, u32)> = Vec::with_capacity(claimed.len() + new.len());
+    let (mut a, mut b) = (claimed.iter().peekable(), new.iter().peekable());
+    loop {
+        let next = match (a.peek(), b.peek()) {
+            (Some(&&x), Some(&&y)) if x <= y => a.next().copied(),
+            (Some(_), Some(_)) | (None, Some(_)) => b.next().copied(),
+            (Some(_), None) => a.next().copied(),
+            (None, None) => break,
+        };
+        let Some((s, e)) = next else { break };
+        match out.last_mut() {
+            Some(last) if s <= last.1 => last.1 = last.1.max(e),
+            _ => out.push((s, e)),
+        }
+    }
+    out
+}
+
+// The selected titles' extents, deduplicated and sorted by start, with the largest end per
+// block of 64: a file's touching titles come from a binary search and the blocks that can
+// still overlap, not a scan of every title extent.
+struct TitleRangeIndex {
+    // (start, end, titles playing exactly that range), sorted by (start, end).
+    ranges: Vec<(u32, u32, Vec<usize>)>,
+    block_max_end: Vec<u32>,
+}
+
+const TITLE_INDEX_BLOCK: usize = 64;
+
+impl TitleRangeIndex {
+    fn new(title_ranges: &[(usize, u32, u32)]) -> Self {
+        let mut sorted: Vec<(u32, u32, usize)> =
+            title_ranges.iter().map(|&(t, s, e)| (s, e, t)).collect();
+        sorted.sort_unstable();
+        let mut ranges: Vec<(u32, u32, Vec<usize>)> = Vec::new();
+        for (s, e, t) in sorted {
+            match ranges.last_mut() {
+                Some(last) if (last.0, last.1) == (s, e) => last.2.push(t),
+                _ => ranges.push((s, e, vec![t])),
+            }
+        }
+        let block_max_end = ranges
+            .chunks(TITLE_INDEX_BLOCK)
+            .map(|b| b.iter().map(|r| r.1).max().unwrap_or(0))
+            .collect();
+        TitleRangeIndex {
+            ranges,
+            block_max_end,
+        }
+    }
+
+    // Sorted, deduplicated titles with an extent overlapping any of `query` (half-open).
+    fn touching(&self, query: &[(u32, u32)]) -> Vec<usize> {
+        let mut t = Vec::new();
+        for &(a, b) in query {
+            let hi = self.ranges.partition_point(|r| r.0 < b);
+            for (blk, &max_end) in self.block_max_end.iter().enumerate() {
+                let lo = blk * TITLE_INDEX_BLOCK;
+                if lo >= hi {
+                    break;
+                }
+                if max_end <= a {
+                    continue;
+                }
+                let block = &self.ranges[lo..hi.min(lo + TITLE_INDEX_BLOCK)];
+                for (s, e, titles) in block {
+                    if *s < b && a < *e {
+                        t.extend_from_slice(titles);
+                    }
+                }
+            }
+        }
+        t.sort_unstable();
+        t.dedup();
+        t
+    }
 }
 
 /// The one way key acquisition reads ciphertext (design KA6): whole aligned units from the

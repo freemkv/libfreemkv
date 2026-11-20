@@ -225,12 +225,12 @@ impl Disc {
         // BD playlists legally reference the same .m2ts clip_id from multiple
         // PlayItems; extents/packet count must be counted ONCE per unique clip
         // (mux reads in order) or a duplicate mux's the A/V twice, inflating size.
-        let mut seen_clips: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut seen_clips: std::collections::HashSet<&str> = std::collections::HashSet::new();
         // Byte offset of the next extent within the TITLE'S FEED (the concatenation
         // of `extents` in read order). Each clip's span is recorded so a frame's
         // source offset identifies its clip by lookup, not by ambiguous timestamps.
         let mut feed_pos: u64 = 0;
-        let mut spans: std::collections::HashMap<String, (u64, u64)> =
+        let mut spans: std::collections::HashMap<&str, (u64, u64)> =
             std::collections::HashMap::new();
         // `memo.pkts` memoizes the packet count per clip_id: neither a repeated PlayItem nor
         // another playlist may re-read/re-parse a .clpi (hostile MPLS floods would never finish).
@@ -276,7 +276,7 @@ impl Disc {
             // The clip is marked seen only after its .clpi parses. That ordering
             // used to matter because a transient failure must not permanently
             // suppress extents for a later PlayItem; kept as still-correct.
-            let first_ref = seen_clips.insert(play_item.clip_id.clone());
+            let first_ref = seen_clips.insert(play_item.clip_id.as_str());
 
             // Only fetch/push the physical extents and add to the
             // total size the first time this clip_id is seen.
@@ -350,7 +350,7 @@ impl Disc {
                     let span_start = feed_pos;
                     push_extents(&file_exts, &mut extents, &mut feed_pos);
                     if feed_pos > span_start {
-                        spans.insert(play_item.clip_id.clone(), (span_start, feed_pos));
+                        spans.insert(play_item.clip_id.as_str(), (span_start, feed_pos));
                     }
                     // A damaged CLPI reports no packet count: size the clip by its extents.
                     total_size += if pkt_count == 0 || from_ssif {
@@ -362,7 +362,7 @@ impl Disc {
             }
 
             clips.push(Clip {
-                feed_span: spans.get(&play_item.clip_id).copied(),
+                feed_span: spans.get(play_item.clip_id.as_str()).copied(),
                 marks_on_pes_clock: true,
                 clip_id: play_item.clip_id.clone(),
                 in_time: play_item.in_time,
@@ -487,9 +487,16 @@ impl Disc {
             }
         }
 
-        // Convert marks to chapters: mark_type 1 is an entry-mark; 2/0 aren't.
-        // Each mark's timestamp is in its own PlayItem's timebase, so position
-        // sums preceding durations plus offset (not play_items[0].in_time).
+        // Convert marks to chapters: mark_type 1 is an entry-mark; 2/0 aren't. Each mark's
+        // timestamp is in its own PlayItem's timebase: position = preceding durations (prefix
+        // sums, same order and empty-sum start as a per-mark sum) + offset.
+        let mut item_starts = Vec::with_capacity(parsed.play_items.len() + 1);
+        let mut acc: f64 = std::iter::empty::<f64>().sum();
+        item_starts.push(acc);
+        for p in &parsed.play_items {
+            acc += p.out_time.saturating_sub(p.in_time) as f64 / MPLS_TICKS_PER_SEC;
+            item_starts.push(acc);
+        }
         let chapters: Vec<Chapter> = parsed
             .marks
             .iter()
@@ -497,10 +504,7 @@ impl Disc {
             .filter_map(|m| {
                 let pi_idx = m.play_item_ref as usize;
                 let pi = parsed.play_items.get(pi_idx)?;
-                let preceding: f64 = parsed.play_items[..pi_idx]
-                    .iter()
-                    .map(|p| p.out_time.saturating_sub(p.in_time) as f64 / MPLS_TICKS_PER_SEC)
-                    .sum();
+                let preceding = item_starts[pi_idx];
                 let within = (m.timestamp as f64 - pi.in_time as f64) / MPLS_TICKS_PER_SEC;
                 let time_secs = preceding + within;
                 Some(Chapter {
