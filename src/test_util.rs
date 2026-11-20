@@ -432,6 +432,30 @@ pub fn damage_unit_seed(unit: &mut [u8]) {
     unit[4] = 0x00;
 }
 
+/// Bench seam for the live scan's metadata prefetch (`benches/scan.rs`): reads the UDF
+/// filesystem of `src`, bulk-loads the metadata partition and every file a live BD scan
+/// parses, as `Disc::scan` does, then reads each `/BDMV/PLAYLIST` and `/BDMV/CLIPINF` file
+/// back through the buffered reader. Returns `(prefetched ranges, bytes read back)`.
+pub fn prefetch_scan_files(src: &mut dyn SectorSource, batch: u16) -> Result<(usize, usize)> {
+    let fs = crate::udf::read_filesystem(src)?;
+    let mut buffered = crate::udf::BufferedSectorReader::new(src, batch);
+    buffered.prefetch(fs.metadata_start(), fs.metadata_sectors())?;
+    let bd = fs.find_dir("/BDMV").is_some();
+    let ranges =
+        fs.metadata_sector_ranges_for(&mut buffered, &|p| crate::disc::scan_parses(bd, p))?;
+    buffered.prefetch_ranges(&ranges)?;
+    let mut bytes = 0;
+    for dir in ["/BDMV/PLAYLIST", "/BDMV/CLIPINF"] {
+        let Some(d) = fs.find_dir(dir) else { continue };
+        for e in d.entries.iter().filter(|e| !e.is_dir) {
+            bytes += fs
+                .read_file(&mut buffered, &format!("{dir}/{}", e.name))?
+                .len();
+        }
+    }
+    Ok((ranges.len(), bytes))
+}
+
 #[path = "test_util_golden.rs"]
 mod golden;
 pub use golden::{BLESS_ENV, Golden};

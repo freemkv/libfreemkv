@@ -150,6 +150,11 @@ loom = "0.7"
 name = "sgio_read"
 harness = false
 
+# Synthetic-tree scan timing and allocation counts (no drive needed).
+[[bench]]
+name = "scan"
+harness = false
+
 # freemkv-unlock is off crates.io: resolve it from its GIT TAG. Consumers carry
 # the same patch; a gitignored .cargo/config.toml overrides it to a local path.
 [patch.crates-io]
