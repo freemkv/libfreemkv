@@ -5725,3 +5725,147 @@ fn scatter_block_group_matches_the_contiguous_build() {
     }
     assert_eq!(n, 7 * 5 * 4 * 3);
 }
+
+// A Cursor that counts every seek (position queries included) the muxer makes.
+struct SeekCounting {
+    cur: Cursor<Vec<u8>>,
+    seeks: usize,
+}
+
+impl Write for SeekCounting {
+    fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+        self.cur.write(b)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Seek for SeekCounting {
+    fn seek(&mut self, pos: io::SeekFrom) -> io::Result<u64> {
+        self.seeks += 1;
+        self.cur.seek(pos)
+    }
+}
+
+const UNKNOWN_SIZE: [u8; 8] = [0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
+
+// Body offset and raw 8-byte size field of every top-level Cluster, found by walking the
+// Segment's children in order (an unknown size is read as running to the next Cluster).
+fn cluster_fields(data: &[u8]) -> Vec<(usize, [u8; 8])> {
+    let mut out = Vec::new();
+    let mut at = find_id(data, ebml::CLUSTER).expect("a cluster");
+    while at + 12 <= data.len() && data[at..at + 4] == [0x1F, 0x43, 0xB6, 0x75] {
+        let field: [u8; 8] = data[at + 4..at + 12].try_into().unwrap();
+        out.push((at + 12, field));
+        at = match field {
+            UNKNOWN_SIZE => match data[at + 12..]
+                .windows(4)
+                .position(|w| w == [0x1F, 0x43, 0xB6, 0x75])
+            {
+                Some(n) => at + 12 + n,
+                None => break,
+            },
+            _ => {
+                at + 12
+                    + u64::from_be_bytes([
+                        0, field[1], field[2], field[3], field[4], field[5], field[6], field[7],
+                    ]) as usize
+            }
+        };
+    }
+    out
+}
+
+// The frame path asks the writer nothing: no seek and no position query from the first
+// frame to the last across many clusters, and its own position matches the writer's.
+#[test]
+fn frames_are_written_without_a_seek_and_the_position_is_tracked() {
+    let tracks = [make_video_track(), make_audio_track()];
+    let sink = SeekCounting {
+        cur: Cursor::new(Vec::new()),
+        seeks: 0,
+    };
+    let mut muxer = MkvMuxer::new(sink, &tracks, None, 0.0, &[]).unwrap();
+    muxer.writer.seeks = 0;
+    let frames = frames_for(30.0, 1.0);
+    for (i, (t, pts, kf, data)) in frames.iter().enumerate() {
+        let duration = (i % 3 == 0).then_some(20_000_000);
+        muxer
+            .write_frame(*t, *pts, *kf, data, duration, None)
+            .unwrap();
+    }
+    assert_eq!(muxer.writer.seeks, 0, "no seek or position query per frame");
+    assert!(
+        muxer.cluster_sizes.len() >= 10,
+        "{}",
+        muxer.cluster_sizes.len()
+    );
+    assert_eq!(muxer.pos, muxer.writer.cur.position());
+    muxer.finish().unwrap();
+}
+
+// A cut-short file (no `finish`) has every Cluster at the EBML unknown size: the crate's
+// own reader still reads every frame written. After `finish` every size is the exact body
+// length as a fixed 8-byte VINT, the Clusters tile the file and every Cue lands on one.
+#[test]
+fn cluster_sizes_are_unknown_until_finish_then_exact_and_seekable() {
+    let tracks = [make_video_track(), make_audio_track()];
+    let frames = frames_for(20.0, 1.0);
+    let mut muxer = MkvMuxer::new(Cursor::new(Vec::new()), &tracks, None, 0.0, &[]).unwrap();
+    for (t, pts, kf, data) in &frames {
+        muxer.write_frame(*t, *pts, *kf, data, None, None).unwrap();
+    }
+    let written = muxer.frame_count;
+    let cut = muxer.writer.get_ref().clone();
+    let fields = cluster_fields(&cut);
+    assert!(fields.len() >= 9, "{} clusters", fields.len());
+    assert!(fields.iter().all(|(_, f)| *f == UNKNOWN_SIZE));
+    let mut s = crate::mux::mkvstream::MkvStream::open(Cursor::new(cut.clone())).unwrap();
+    let mut read = 0u64;
+    while crate::pes::PesSource::read(&mut s).unwrap().is_some() {
+        read += 1;
+    }
+    assert_eq!(read, written, "a cut-short file reads back whole");
+
+    let (data, count) = mux_to_bytes(&tracks, &[], &frames);
+    assert_eq!(count, written);
+    let fields = cluster_fields(&data);
+    let kids = segment_children(&data);
+    let cues = kids.iter().find(|k| k.0 == ebml::CUES).expect("cues");
+    let cues_at = cues.1 - 12;
+    assert_eq!(
+        kids.iter().filter(|k| k.0 == ebml::CLUSTER).count(),
+        fields.len()
+    );
+    let mut next = fields[0].0 - 12;
+    for (body, f) in &fields {
+        assert_eq!(f[0], 0x01, "fixed 8-byte size VINT");
+        assert_ne!(*f, UNKNOWN_SIZE);
+        assert_eq!(body - 12, next, "clusters are contiguous");
+        let size = u64::from_be_bytes([0, f[1], f[2], f[3], f[4], f[5], f[6], f[7]]) as usize;
+        next = body + size;
+    }
+    assert_eq!(next, cues_at, "the last cluster ends where the Cues begin");
+    // From the first Cluster on, the finished file is the cut-short one, sizes filled in.
+    let mut patched = cut.clone();
+    for ((body, f), (cut_body, _)) in fields.iter().zip(cluster_fields(&cut)) {
+        assert_eq!(*body, cut_body);
+        patched[body - 8..*body].copy_from_slice(f);
+    }
+    let c0 = fields[0].0 - 12;
+    assert!(
+        data[c0..cut.len()] == patched[c0..],
+        "only the size fields differ"
+    );
+    let (_, seg_start) = locate_segment(&data);
+    let starts: Vec<usize> = fields.iter().map(|(b, _)| b - 12).collect();
+    let cues = parse_cues(&data);
+    assert!(!cues.is_empty());
+    for (_, _, pos) in cues {
+        assert!(
+            starts.contains(&(seg_start + pos as usize)),
+            "cue at {pos} is a cluster"
+        );
+    }
+}

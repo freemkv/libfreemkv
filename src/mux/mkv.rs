@@ -576,6 +576,30 @@ struct SeekPositionFixup {
     value_offset: u64, // absolute file offset of the 8-byte SeekPosition value
 }
 
+/// A `Write` over the muxer's writer that advances the muxer's logical position.
+struct Tally<'a, W> {
+    w: &'a mut W,
+    pos: &'a mut u64,
+}
+
+impl<W: Write> Write for Tally<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.w.write(buf)?;
+        *self.pos += n as u64;
+        Ok(n)
+    }
+
+    fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        self.w.write_all(buf)?;
+        *self.pos += buf.len() as u64;
+        Ok(())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.w.flush()
+    }
+}
+
 /// MKV muxer. Call write_frame() for each frame, then finish() at the end.
 pub struct MkvMuxer<W: Write + Seek> {
     writer: W,
@@ -583,6 +607,13 @@ pub struct MkvMuxer<W: Write + Seek> {
     cluster_open: bool,
     cluster_pos: u64,
     cluster_size_pos: u64,
+    /// Offset of the next byte written, kept by the frame path (every write goes through
+    /// `Tally`) so it never asks the writer: on a `BufWriter<File>` that is a flush and
+    /// an lseek. Patches seek back here.
+    pos: u64,
+    /// `(size field offset, body size)` of every closed Cluster, written by `finish()`.
+    /// Until then a Cluster carries the EBML unknown size, so a cut-short file still parses.
+    cluster_sizes: Vec<(u64, u64)>,
     cluster_ts_ticks: i64,
     /// Reusable scratch buffer for assembling ONE BlockGroup before it is written with a single
     /// `write_all`; building it in memory means its size is known before it reaches the file,
@@ -1403,12 +1434,15 @@ impl<W: Write + Seek> MkvMuxer<W> {
             ebml::end_master(&mut writer, chapters_pos)?;
         }
 
+        let pos = writer.stream_position()?;
         Ok(Self {
             writer,
             segment_start,
             cluster_open: false,
             cluster_pos: 0,
             cluster_size_pos: 0,
+            pos,
+            cluster_sizes: Vec::new(),
             block_group_buf: Vec::new(),
             cluster_ts_ticks: 0,
             base_pts_ticks: None,
@@ -1478,21 +1512,27 @@ impl<W: Write + Seek> MkvMuxer<W> {
         if rest >= 2 {
             el.extend_from_slice(&ebml::void_element(rest)?);
         }
-        let here = self.writer.stream_position()?;
         self.writer.seek(std::io::SeekFrom::Start(pos))?;
         self.writer.write_all(&el)?;
-        self.writer.seek(std::io::SeekFrom::Start(here))?;
+        self.writer.seek(std::io::SeekFrom::Start(self.pos))?;
         self.codec_private_reserves.remove(&track);
         Ok(true)
     }
 
     // Overwrite a 3-byte big-endian value at `pos`, then return to the end.
     fn patch_u24(&mut self, pos: u64, val: u64) -> io::Result<()> {
-        let end = self.writer.stream_position()?;
         self.writer.seek(io::SeekFrom::Start(pos))?;
         self.writer.write_all(&val.to_be_bytes()[5..])?;
-        self.writer.seek(io::SeekFrom::Start(end))?;
+        self.writer.seek(io::SeekFrom::Start(self.pos))?;
         Ok(())
+    }
+
+    // The frame path's writer: counts what it writes into `pos`.
+    fn out(&mut self) -> Tally<'_, W> {
+        Tally {
+            w: &mut self.writer,
+            pos: &mut self.pos,
+        }
     }
 
     /// Put the timeline origin `lead_ns` before the first video keyframe (the
@@ -1845,8 +1885,8 @@ impl<W: Write + Seek> MkvMuxer<W> {
         }
         // BlockDuration is the group's last element: its 3 value bytes end the write.
         if vobsub_open {
-            let end = self.writer.stream_position()?;
-            self.vobsub_open_end.insert(track_idx, (end - 3, pts_ticks));
+            self.vobsub_open_end
+                .insert(track_idx, (self.pos - 3, pts_ticks));
         }
         // Recorded per track (not a single global slot) so a later non-keyframe
         // references a keyframe on its OWN track — a shared slot produced cross-track
@@ -1901,12 +1941,26 @@ impl<W: Write + Seek> MkvMuxer<W> {
         if patches.is_empty() {
             return Ok(());
         }
-        let here = self.writer.stream_position()?;
         for (off, bytes) in patches {
             self.writer.seek(std::io::SeekFrom::Start(*off))?;
             self.writer.write_all(bytes)?;
         }
-        self.writer.seek(std::io::SeekFrom::Start(here))?;
+        self.writer.seek(std::io::SeekFrom::Start(self.pos))?;
+        Ok(())
+    }
+
+    // Write each closed Cluster's size over its unknown-size placeholder, in file order:
+    // the fixed 8-byte VINT a per-cluster `ebml::end_master` back-patch would have written.
+    fn patch_cluster_sizes(&mut self) -> io::Result<()> {
+        if self.cluster_sizes.is_empty() {
+            return Ok(());
+        }
+        for &(at, size) in &self.cluster_sizes {
+            self.writer.seek(std::io::SeekFrom::Start(at))?;
+            self.writer.write_all(&ebml::fixed_width_vint8(size))?;
+        }
+        self.writer.seek(std::io::SeekFrom::Start(self.pos))?;
+        self.cluster_sizes.clear();
         Ok(())
     }
 
@@ -1946,10 +2000,9 @@ impl<W: Write + Seek> MkvMuxer<W> {
                 "audio track {track}: IFO claimed {claimed} channels but the stored bitstream carries {actual}; trusting the bitstream",
             );
         }
-        let here = self.writer.stream_position()?;
         self.writer.seek(std::io::SeekFrom::Start(offset))?;
         self.writer.write_all(&[actual])?;
-        self.writer.seek(std::io::SeekFrom::Start(here))?;
+        self.writer.seek(std::io::SeekFrom::Start(self.pos))?;
         Ok(())
     }
 
@@ -2021,6 +2074,7 @@ impl<W: Write + Seek> MkvMuxer<W> {
         }
         // Close final cluster
         self.end_cluster()?;
+        self.patch_cluster_sizes()?;
 
         // Correct FlagForced for PGS tracks from what the mux saw (in-place rewrite).
         // PROMOTE (0->1) a track whose displays all carry `forced_on_flag`. DEMOTE
@@ -2280,17 +2334,24 @@ impl<W: Write + Seek> MkvMuxer<W> {
         if self.cluster_open {
             self.end_cluster()?;
         }
-        self.cluster_pos = self.writer.stream_position()?;
-        self.cluster_size_pos = ebml::start_master(&mut self.writer, ebml::CLUSTER)?;
-        ebml::write_uint(&mut self.writer, ebml::CLUSTER_TIMESTAMP, ts_ticks as u64)?;
+        self.cluster_pos = self.pos;
+        ebml::write_id(&mut self.out(), ebml::CLUSTER)?;
+        self.cluster_size_pos = self.pos;
+        ebml::write_unknown_size(&mut self.out())?;
+        ebml::write_uint(&mut self.out(), ebml::CLUSTER_TIMESTAMP, ts_ticks as u64)?;
         self.cluster_ts_ticks = ts_ticks;
         self.cluster_open = true;
         Ok(())
     }
 
+    // Record the closed Cluster's size for `finish()`; no seek back now.
     fn end_cluster(&mut self) -> io::Result<()> {
         if self.cluster_open {
-            ebml::end_master(&mut self.writer, self.cluster_size_pos)?;
+            let size = self.pos - self.cluster_size_pos - 8;
+            if size >= 0x0100_0000_0000_0000 {
+                return Err(crate::error::Error::MkvUnencodable.into());
+            }
+            self.cluster_sizes.push((self.cluster_size_pos, size));
             self.cluster_open = false;
         }
         Ok(())
@@ -2310,12 +2371,13 @@ impl<W: Write + Seek> MkvMuxer<W> {
         let flags: u8 = if keyframe { 0x80 } else { 0x00 };
 
         let block_size = track_vint.len() + 2 + 1 + data.len(); // vint + ts(2) + flags(1) + data
-        ebml::write_id(&mut self.writer, ebml::SIMPLE_BLOCK)?;
-        ebml::write_size(&mut self.writer, block_size as u64)?;
-        self.writer.write_all(track_vint)?;
-        self.writer.write_all(&relative_ts.to_be_bytes())?;
-        self.writer.write_all(&[flags])?;
-        self.writer.write_all(data)?;
+        let mut out = self.out();
+        ebml::write_id(&mut out, ebml::SIMPLE_BLOCK)?;
+        ebml::write_size(&mut out, block_size as u64)?;
+        out.write_all(track_vint)?;
+        out.write_all(&relative_ts.to_be_bytes())?;
+        out.write_all(&[flags])?;
+        out.write_all(data)?;
 
         Ok(())
     }
@@ -2347,11 +2409,12 @@ impl<W: Write + Seek> MkvMuxer<W> {
             discard_padding_ns,
         )
         .and_then(|head| {
-            self.writer.write_all(&buf[..head])?;
-            self.writer.write_all(data)?;
-            self.writer.write_all(&buf[head..])?;
+            let mut out = self.out();
+            out.write_all(&buf[..head])?;
+            out.write_all(data)?;
+            out.write_all(&buf[head..])?;
             match additional {
-                Some(a) => self.writer.write_all(a),
+                Some(a) => out.write_all(a),
                 None => Ok(()),
             }
         });

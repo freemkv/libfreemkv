@@ -149,7 +149,7 @@ pub fn start_master<W: Write + Seek>(w: &mut W, id: u32) -> io::Result<u64> {
 
 // Fixed-width 8-octet EBML VINT (0x01 marker + 56-bit big-endian payload, RFC 8794 §4.4) used
 // to back-patch a master element's size field.
-fn fixed_width_vint8(data_size: u64) -> [u8; 8] {
+pub(crate) fn fixed_width_vint8(data_size: u64) -> [u8; 8] {
     debug_assert!(data_size < 0x0100_0000_0000_0000);
     [
         0x01,
