@@ -190,14 +190,14 @@ pub fn end_master<W: Write + Seek>(w: &mut W, size_pos: u64) -> io::Result<()> {
 
 /// Start a master element **in an in-memory buffer**: append ID + the same
 /// 8-byte size placeholder [`start_master`] writes. Returns the buffer index of
-/// the size field, for [`end_master_buf`].
+/// the size field, for [`end_master_buf_with`].
 ///
 /// This is the seek-free twin of [`start_master`]/[`end_master`], producing byte-for-byte
 /// identical output.
 pub fn start_master_buf(buf: &mut Vec<u8>, id: u32) -> io::Result<usize> {
     write_id(buf, id)?;
     let size_pos = buf.len();
-    // 8-byte size placeholder (overwritten by end_master_buf)
+    // 8-byte size placeholder (overwritten by end_master_buf_with)
     buf.extend_from_slice(&[0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
     Ok(size_pos)
 }
@@ -207,11 +207,12 @@ pub fn start_master_buf(buf: &mut Vec<u8>, id: u32) -> io::Result<usize> {
 ///
 /// Errors rather than panicking if `size_pos` does not name a placeholder that
 /// is still inside the buffer, or if the body exceeds the 7-byte VINT payload.
+#[cfg(test)]
 pub fn end_master_buf(buf: &mut [u8], size_pos: usize) -> io::Result<()> {
     end_master_buf_with(buf, size_pos, 0)
 }
 
-/// [`end_master_buf`] for a body that continues past the buffer: `outside` more body
+/// `end_master_buf` for a body that continues past the buffer: `outside` more body
 /// bytes are written straight from their own slice after the buffer (scatter write).
 pub(crate) fn end_master_buf_with(buf: &mut [u8], size_pos: usize, outside: u64) -> io::Result<()> {
     let end = buf.len();

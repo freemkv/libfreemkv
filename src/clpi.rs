@@ -12,7 +12,9 @@ use crate::error::{Error, Result};
 /// Parsed CLPI clip info.
 #[derive(Debug)]
 pub(crate) struct ClipInfo {
-    /// Total source packets in the m2ts (each 192 bytes)
+    /// Total source packets in the m2ts (each 192 bytes). The scan reads it through
+    /// [`packet_count`]; only the tests read it here.
+    #[cfg(test)]
     pub source_packet_count: u32,
     /// Per-stream metadata from the ProgramInfo section (BD spec).
     /// Cross-validates the MPLS STN view — see `labels/clpi_audit.rs`.
@@ -56,7 +58,10 @@ pub(crate) fn packet_count(data: &[u8]) -> Result<u32> {
 /// Parse a CLPI file from raw bytes. A file too short to hold the packet count still
 /// parses (count 0); only a bad magic or a head under 16 bytes errors.
 pub fn parse(data: &[u8]) -> Result<ClipInfo> {
+    // Also the magic and length check the header offsets below rely on.
     let source_packet_count = packet_count(data)?;
+    #[cfg(not(test))]
+    let _ = source_packet_count;
 
     // Header offsets
     let prog_info_start = u32::from_be_bytes([data[12], data[13], data[14], data[15]]) as usize;
@@ -70,6 +75,7 @@ pub fn parse(data: &[u8]) -> Result<ClipInfo> {
     };
 
     Ok(ClipInfo {
+        #[cfg(test)]
         source_packet_count,
         streams,
     })
