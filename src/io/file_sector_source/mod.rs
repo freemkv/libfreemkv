@@ -1,5 +1,5 @@
 //! [`FileSectorSource`] — read 2048-byte sectors from an ISO file on
-//! disk via direct `seek + read_exact`, letting the kernel's own
+//! disk via one positioned read each (`pread`), letting the kernel's own
 //! readahead policy handle prefetch instead of an app-level buffer.
 //!
 //! Issues a sequential hint on open (Linux only; a no-op elsewhere),
@@ -28,6 +28,7 @@ pub(crate) use other as platform;
 pub(crate) use windows as platform;
 
 use std::fs::File;
+#[cfg(not(any(unix, windows)))]
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
@@ -61,7 +62,7 @@ fn resolve_read_drop_chunk(mib: Option<u64>) -> u64 {
 }
 
 /// SectorSource backed by a file (ISO image). Every `read_sectors`
-/// call is a direct `seek + read_exact` against the underlying file
+/// call is one positioned read (`pread`) against the underlying file
 /// — kernel readahead handles prefetch, and every
 /// `READ_DROP_CHUNK_BYTES_DEFAULT` bytes of consumed data the
 /// platform's `DONTNEED` hook drops the consumed window from the
@@ -171,16 +172,13 @@ impl SectorSource for FileSectorSource {
             return Ok(0);
         }
         let offset = lba as u64 * SECTOR_BYTES_U64;
-        self.file
-            .seek(SeekFrom::Start(offset))
-            .map_err(|e| Error::IoError { source: e })?;
         // A padded source reads what the file holds and zero-fills the rest of the sector.
         let real = match self.padded_len {
             // Clamp in u64 first: on a 32-bit target `as usize` would truncate the distance.
             Some(len) => len.saturating_sub(offset).min(bytes as u64) as usize,
             None => bytes,
         };
-        if let Err(e) = self.file.read_exact(&mut out[..real]) {
+        if let Err(e) = read_exact_at(&mut self.file, &mut out[..real], offset) {
             return Err(self.read_error(e, lba, offset + bytes as u64));
         }
         out[real..bytes].fill(0);
@@ -195,8 +193,12 @@ impl SectorSource for FileSectorSource {
         ) {
             platform::prefetch(&self.file, start, len);
         }
+        // Elsewhere only a stream-sized read asks for the next window: a metadata scan's
+        // single-sector reads would each pay a blocking readahead(2) for nothing.
         #[cfg(not(target_os = "macos"))]
-        platform::prefetch(&self.file, offset + bytes as u64, bytes as u64);
+        if bytes >= PREFETCH_MIN_BYTES {
+            platform::prefetch(&self.file, offset + bytes as u64, bytes as u64);
+        }
 
         // Periodic page-cache eviction on the read side: an 85 GB streaming ISO
         // read would otherwise pin the whole file in cache, starving concurrent
@@ -226,6 +228,38 @@ impl FileSectorSource {
             .map(|m| m.len())
             .unwrap_or(self.capacity as u64 * SECTOR_BYTES_U64);
         Error::ImageEndsBeforeRead { lba, have, want }
+    }
+}
+
+// Smallest read (outside macOS, which batches its own advice) that prefetches the next window.
+#[cfg(not(target_os = "macos"))]
+const PREFETCH_MIN_BYTES: usize = 256 * 1024;
+
+// Exactly `buf.len()` bytes at `offset` in one positioned read: no seek syscall first. Short
+// of them is `UnexpectedEof`, as `read_exact` reports it.
+fn read_exact_at(file: &mut File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::FileExt::read_exact_at(file, buf, offset)
+    }
+    #[cfg(windows)]
+    {
+        let mut done = 0;
+        while done < buf.len() {
+            let at = offset + done as u64;
+            match std::os::windows::fs::FileExt::seek_read(file, &mut buf[done..], at) {
+                Ok(0) => return Err(std::io::ErrorKind::UnexpectedEof.into()),
+                Ok(n) => done += n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        file.seek(SeekFrom::Start(offset))?;
+        file.read_exact(buf)
     }
 }
 

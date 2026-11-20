@@ -1,5 +1,5 @@
 use super::*;
-use std::io::Write;
+use std::io::{Seek, Write};
 use tempfile::tempdir;
 
 #[cfg(target_os = "macos")]
@@ -481,4 +481,26 @@ fn open_refuses_a_file_past_the_lba_space() {
         FileSectorSource::open_padded(&path),
         Err(Error::IsoTooLarge { .. })
     ));
+}
+
+// Each read is positioned on its own: wherever the file cursor was left, a read returns its
+// own sectors, small (no readahead) and stream-sized (with it) alike.
+#[test]
+fn reads_are_positioned_whatever_the_cursor() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("pread.iso");
+    make_iso(&path, 600);
+    let mut src = FileSectorSource::open(&path).unwrap();
+    for (lba, count) in [(7u32, 1u16), (300, 200), (2, 3), (590, 10)] {
+        src.file.seek(std::io::SeekFrom::Start(123_457)).unwrap();
+        let mut buf = vec![0xEEu8; count as usize * SECTOR_BYTES];
+        assert_eq!(
+            src.read_sectors(lba, count, &mut buf, false).unwrap(),
+            buf.len()
+        );
+        for (i, s) in buf.chunks(SECTOR_BYTES).enumerate() {
+            let want = ((lba as usize + i) & 0xff) as u8;
+            assert!(s.iter().all(|&b| b == want), "lba {lba} sector {i}");
+        }
+    }
 }
