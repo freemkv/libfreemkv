@@ -582,7 +582,7 @@ fn a_nine_hundred_clip_title_resolves_every_frame_correctly() {
     let clips: Vec<crate::disc::Clip> = (0..N)
         .map(|i| crate::disc::Clip {
             marks_on_pes_clock: true,
-            clip_id: format!("{i:05}"),
+            clip_id: format!("{i:05}").into(),
             in_time: i * CLIP_TICKS,
             out_time: (i + 1) * CLIP_TICKS,
             duration_secs: 10.0,
@@ -637,7 +637,7 @@ fn one_clip_file_behind_every_play_item_is_not_distinguishable_by_byte() {
     let clips: Vec<crate::disc::Clip> = (0..N)
         .map(|i| crate::disc::Clip {
             marks_on_pes_clock: true,
-            clip_id: "00001".to_string(), // the SAME file every time
+            clip_id: "00001".into(), // the SAME file every time
             in_time: i * SEG,
             out_time: (i + 1) * SEG,
             duration_secs: 600.0,
@@ -686,7 +686,7 @@ fn marks_that_do_not_advance_are_placed_by_provenance() {
     let clips: Vec<crate::disc::Clip> = (0..N)
         .map(|i| crate::disc::Clip {
             marks_on_pes_clock: true,
-            clip_id: format!("{i:05}"),
+            clip_id: format!("{i:05}").into(),
             in_time: 0,
             out_time: SEG,
             duration_secs: 600.0,
@@ -726,7 +726,7 @@ fn marks_that_do_not_advance_are_still_refused_without_spans() {
     let clips: Vec<crate::disc::Clip> = (0..N)
         .map(|i| crate::disc::Clip {
             marks_on_pes_clock: true,
-            clip_id: format!("{i:05}"),
+            clip_id: format!("{i:05}").into(),
             in_time: 0,
             out_time: SEG,
             duration_secs: 600.0,
@@ -746,7 +746,7 @@ fn a_restarting_clock_table_without_spans_is_still_refused() {
     let clips: Vec<crate::disc::Clip> = (0..N)
         .map(|i| crate::disc::Clip {
             marks_on_pes_clock: true,
-            clip_id: format!("{i:05}"),
+            clip_id: format!("{i:05}").into(),
             in_time: 0,
             out_time: CLIP_TICKS,
             duration_secs: 600.0,
@@ -784,7 +784,7 @@ fn seamless_branching_clips() -> Vec<crate::disc::Clip> {
         .map(|(i, &(in_time, out_time))| crate::disc::Clip {
             marks_on_pes_clock: true,
             feed_span: None,
-            clip_id: format!("{i:05}"),
+            clip_id: format!("{i:05}").into(),
             in_time,
             out_time,
             duration_secs: (out_time - in_time) as f64 / 45_000.0,
@@ -1099,7 +1099,7 @@ fn only_blu_ray_gets_a_mark_driven_plan() {
         .map(|(i, &(in_time, out_time))| crate::disc::Clip {
             marks_on_pes_clock: false,
             feed_span: None,
-            clip_id: format!("{i}"),
+            clip_id: format!("{i}").into(),
             in_time,
             out_time,
             duration_secs: 0.0,
@@ -1152,7 +1152,7 @@ fn a_restarting_clock_falls_back_to_inference() {
             .map(|(i, &(in_time, out_time))| crate::disc::Clip {
                 marks_on_pes_clock: true,
                 feed_span: None,
-                clip_id: format!("{i}"),
+                clip_id: format!("{i}").into(),
                 in_time,
                 out_time,
                 duration_secs: 0.0,
@@ -1190,7 +1190,7 @@ fn contiguous_clips_produce_a_constant_offset() {
         .map(|(i, &(in_time, out_time))| crate::disc::Clip {
             marks_on_pes_clock: true,
             feed_span: None,
-            clip_id: format!("{i}"),
+            clip_id: format!("{i}").into(),
             in_time,
             out_time,
             duration_secs: (out_time - in_time) as f64 / 45_000.0,

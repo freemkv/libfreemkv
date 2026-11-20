@@ -30,7 +30,7 @@ pub enum EpisodeEvidence {
 /// compare content without knowing the format. Units and scales compare only within one disc.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ContentSegment {
-    pub unit: String,
+    pub unit: super::ClipId,
     pub start: u64,
     pub end: u64,
 }
@@ -60,7 +60,7 @@ impl ContentSegment {
             .map(|extent| {
                 let start = u64::from(extent.start_lba);
                 (extent.sector_count > 0).then(|| Self {
-                    unit: String::new(),
+                    unit: Default::default(),
                     start,
                     end: start + u64::from(extent.sector_count),
                 })

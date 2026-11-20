@@ -204,11 +204,11 @@ pub use aacs::trace::KeyOrigin;
 pub use dirimage::DirImage;
 #[cfg(feature = "rip")]
 pub use disc::{
-    AacsState, AudioChannels, AudioStream, BusRoute, Clip, Codec, ColorSpace, ContentFormat, Disc,
-    DiscFormat, DiscId, DiscTitle, DriveCredentials, Extent, ExtractOptions, ExtractResult,
-    FileResult, FrameRate, HdrFormat, LabelPurpose, LabelQualifier, LayerMap, ProtectionLabel,
-    Resolution, SampleRate, ScanOptions, Stream, SubtitleStream, TrackPath, VideoStream,
-    imgburn_dvd_descriptor,
+    AacsState, AudioChannels, AudioStream, BusRoute, Clip, ClipId, Codec, ColorSpace,
+    ContentFormat, Disc, DiscFormat, DiscId, DiscTitle, DriveCredentials, Extent, ExtractOptions,
+    ExtractResult, FileResult, FrameRate, HdrFormat, LabelPurpose, LabelQualifier, LayerMap,
+    ProtectionLabel, Resolution, SampleRate, ScanOptions, Stream, SubtitleStream, TrackPath,
+    VideoStream, imgburn_dvd_descriptor,
 };
 #[cfg(feature = "rip")]
 pub use keysource::{DiscInputs, KeySource, read_encrypted_units};

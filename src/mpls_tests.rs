@@ -1442,7 +1442,7 @@ fn streams_come_only_from_first_play_item() {
 #[test]
 fn duration_ticks_sums_and_saturates_inverted_items() {
     let pi = |i, o| PlayItem {
-        clip_id: String::new(),
+        clip_id: Default::default(),
         in_time: i,
         out_time: o,
         connection_condition: 1,

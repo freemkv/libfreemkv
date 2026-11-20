@@ -219,11 +219,127 @@ pub struct DiscTitle {
     pub codec_privates: Vec<Option<Vec<u8>>>,
 }
 
+/// A clip's id (e.g. "00001"), interned by the scan: every title and content segment
+/// naming the clip shares one allocation. Reads as a `str` and compares with string
+/// types as the `String` it replaces did.
+#[derive(Clone, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ClipId(std::sync::Arc<str>);
+
+impl ClipId {
+    /// The id as a string slice.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for ClipId {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl AsRef<str> for ClipId {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::borrow::Borrow<str> for ClipId {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for ClipId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&*self.0, f)
+    }
+}
+
+impl std::fmt::Display for ClipId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl From<&str> for ClipId {
+    fn from(s: &str) -> Self {
+        ClipId(s.into())
+    }
+}
+
+impl From<String> for ClipId {
+    fn from(s: String) -> Self {
+        ClipId(s.into())
+    }
+}
+
+impl From<&String> for ClipId {
+    fn from(s: &String) -> Self {
+        ClipId(s.as_str().into())
+    }
+}
+
+impl From<std::sync::Arc<str>> for ClipId {
+    fn from(s: std::sync::Arc<str>) -> Self {
+        ClipId(s)
+    }
+}
+
+impl From<ClipId> for String {
+    fn from(id: ClipId) -> Self {
+        id.0.to_string()
+    }
+}
+
+impl PartialEq<str> for ClipId {
+    fn eq(&self, other: &str) -> bool {
+        &*self.0 == other
+    }
+}
+
+impl PartialEq<&str> for ClipId {
+    fn eq(&self, other: &&str) -> bool {
+        &*self.0 == *other
+    }
+}
+
+impl PartialEq<String> for ClipId {
+    fn eq(&self, other: &String) -> bool {
+        &*self.0 == other.as_str()
+    }
+}
+
+impl PartialEq<ClipId> for str {
+    fn eq(&self, other: &ClipId) -> bool {
+        self == &*other.0
+    }
+}
+
+impl PartialEq<ClipId> for &str {
+    fn eq(&self, other: &ClipId) -> bool {
+        *self == &*other.0
+    }
+}
+
+impl PartialEq<ClipId> for String {
+    fn eq(&self, other: &ClipId) -> bool {
+        self.as_str() == &*other.0
+    }
+}
+
+impl serde::Serialize for ClipId {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        s.serialize_str(&self.0)
+    }
+}
+
 /// A clip reference within a title.
 #[derive(Debug, Clone)]
 pub struct Clip {
-    /// Clip filename without extension (e.g. "00001")
-    pub clip_id: String,
+    /// Clip filename without extension (e.g. "00001"), shared by every title naming it.
+    pub clip_id: ClipId,
     /// In-time in 45kHz ticks
     pub in_time: u32,
     /// Out-time in 45kHz ticks

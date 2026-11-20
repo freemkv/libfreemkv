@@ -1093,7 +1093,7 @@ fn title_with(playlist: &str, duration_secs: f64, size_bytes: u64, n_clips: usiz
         .map(|i| Clip {
             marks_on_pes_clock: true,
             feed_span: None,
-            clip_id: format!("{i:05}"),
+            clip_id: format!("{i:05}").into(),
             in_time: 0,
             out_time: 1,
             duration_secs: 1.0,
@@ -1552,7 +1552,7 @@ fn canonical_title_order_picks_largest_feature() {
                 .map(|i| Clip {
                     marks_on_pes_clock: true,
                     feed_span: None,
-                    clip_id: format!("{i:05}"),
+                    clip_id: format!("{i:05}").into(),
                     in_time: 0,
                     out_time: 0,
                     duration_secs: 0.0,

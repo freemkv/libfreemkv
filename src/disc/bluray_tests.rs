@@ -2459,6 +2459,19 @@ fn scan_bluray_titles_resolves_shared_clip_extents_once() {
     assert_eq!(titles[0].extents, titles[1].extents);
     assert_eq!(titles[0].size_bytes, titles[1].size_bytes);
     assert!(!titles[0].extents.is_empty());
+    // The clip id is interned: both titles (and their content segments) share one string.
+    let (a, b) = (&titles[0].clips[0].clip_id, &titles[1].clips[0].clip_id);
+    assert_eq!(a, "00001");
+    assert!(
+        std::ptr::eq(a.as_str(), b.as_str()),
+        "clip id copied per title"
+    );
+    for seg in &titles[1].selection_evidence.segments {
+        assert!(
+            std::ptr::eq(a.as_str(), seg.unit.as_str()),
+            "segment unit copied"
+        );
+    }
 }
 
 // The scan reads only a .clpi's header sector: the CPI/EP map behind it is never read,

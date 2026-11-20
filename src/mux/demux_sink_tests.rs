@@ -1274,7 +1274,7 @@ fn a_filtered_export_whose_persisted_track_was_emptied_fails() {
         .map(|i| crate::disc::Clip {
             marks_on_pes_clock: true,
             feed_span: None,
-            clip_id: format!("0000{i}"),
+            clip_id: format!("0000{i}").into(),
             in_time: (100 + 100 * i) * 45_000,
             out_time: (200 + 100 * i) * 45_000,
             duration_secs: 100.0,

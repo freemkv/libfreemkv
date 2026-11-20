@@ -25,6 +25,8 @@ pub(super) struct ClipMemo<'a> {
     exts: std::collections::HashMap<String, (std::sync::Arc<[(u32, u32)]>, bool)>,
     stream: udf::FileIndex<'a>,
     ssif: udf::FileIndex<'a>,
+    // One shared id per clip: every title naming the clip points at the same string.
+    ids: std::collections::HashSet<ClipId>,
 }
 
 impl<'a> ClipMemo<'a> {
@@ -34,7 +36,18 @@ impl<'a> ClipMemo<'a> {
             exts: std::collections::HashMap::new(),
             stream: udf::FileIndex::of(udf_fs.find_dir("/BDMV/STREAM")),
             ssif: udf::FileIndex::of(udf_fs.find_dir("/BDMV/STREAM/SSIF")),
+            ids: std::collections::HashSet::new(),
         }
+    }
+
+    // The scan's one shared `ClipId` for `id`.
+    fn clip_id(&mut self, id: &str) -> ClipId {
+        if let Some(known) = self.ids.get(id) {
+            return known.clone();
+        }
+        let new = ClipId::from(id);
+        self.ids.insert(new.clone());
+        new
     }
 
     // A clip's extents from UDF allocation descriptors (dual-layer discs split files across
@@ -366,7 +379,7 @@ impl Disc {
             clips.push(Clip {
                 feed_span: spans.get(play_item.clip_id.as_str()).copied(),
                 marks_on_pes_clock: true,
-                clip_id: play_item.clip_id.clone(),
+                clip_id: memo.clip_id(&play_item.clip_id),
                 in_time: play_item.in_time,
                 out_time: play_item.out_time,
                 duration_secs: clip_dur,
