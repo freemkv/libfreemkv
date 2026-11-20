@@ -17,6 +17,60 @@ const MIN_TITLE_SECS: f64 = 30.0;
 // it: one second, about a GOP, where authoring trims an episode at a play-all join.
 const PLAY_ALL_END_SLACK_TICKS: u64 = 45_000;
 
+/// Per-scan clip memo: each `.clpi` packet count and each clip's stream extents, keyed by
+/// clip_id, plus the STREAM and STREAM/SSIF directories indexed once by name.
+pub(super) struct ClipMemo<'a> {
+    pkts: std::collections::HashMap<String, u32>,
+    // (extents, resolved from the .ssif): only clean resolutions are kept.
+    exts: std::collections::HashMap<String, (std::sync::Arc<[(u32, u32)]>, bool)>,
+    stream: udf::FileIndex<'a>,
+    ssif: udf::FileIndex<'a>,
+}
+
+impl<'a> ClipMemo<'a> {
+    pub(super) fn new(udf_fs: &'a udf::UdfFs) -> Self {
+        ClipMemo {
+            pkts: std::collections::HashMap::new(),
+            exts: std::collections::HashMap::new(),
+            stream: udf::FileIndex::of(udf_fs.find_dir("/BDMV/STREAM")),
+            ssif: udf::FileIndex::of(udf_fs.find_dir("/BDMV/STREAM/SSIF")),
+        }
+    }
+
+    // A clip's extents from UDF allocation descriptors (dual-layer discs split files across
+    // layers): STREAM/SSIF/<clip>.ssif (3D, both eyes), else STREAM/<clip>.{m2ts,fmts,ssif}.
+    // Returns (extents, from the SSIF, first non-absence failure code); Halted propagates.
+    fn resolve_extents(
+        &self,
+        reader: &mut dyn SectorSource,
+        udf_fs: &udf::UdfFs,
+        clip_id: &str,
+    ) -> Result<(Option<std::sync::Arc<[(u32, u32)]>>, bool, Option<u16>)> {
+        let candidates = std::iter::once((&self.ssif, "SSIF/", "ssif"))
+            .chain(CLIP_STREAM_EXTS.iter().map(|ext| (&self.stream, "", *ext)));
+        // ABSENCE is the only benign failure — the fallback exists for it. DiscRead,
+        // UdfAdChainTooLong or UdfEmbeddedData mean bytes are unresolved.
+        let mut unresolved: Option<u16> = None;
+        for (i, (dir, sub, ext)) in candidates.enumerate() {
+            let name = format!("{clip_id}.{ext}");
+            let Some(entry) = dir.get(&name) else {
+                continue;
+            };
+            let path = format!("/BDMV/STREAM/{sub}{name}");
+            match udf_fs.entry_extents(reader, entry, &path) {
+                Ok(exts) => return Ok((Some(exts.into()), i == 0, unresolved)),
+                // The operator cancelling: propagated before any classification.
+                Err(Error::Halted) => return Err(Error::Halted),
+                Err(Error::UdfNotFound { .. }) => {}
+                Err(e) => {
+                    unresolved.get_or_insert(e.code());
+                }
+            }
+        }
+        Ok((None, false, unresolved))
+    }
+}
+
 impl Disc {
     // Scan Blu-ray titles from MPLS playlists. `halt` is polled between playlists and once more
     // after the loop; a Halted read propagates instead of being swallowed.
@@ -26,13 +80,15 @@ impl Disc {
         halt: Option<&crate::halt::Halt>,
     ) -> Result<Vec<DiscTitle>> {
         let mut titles = Vec::new();
-        // clip_id -> packet count, shared across playlists so each .clpi is read once per scan.
-        let mut clip_pkts: std::collections::HashMap<String, u32> =
-            std::collections::HashMap::new();
+        // Packet counts and stream extents per clip, shared across playlists so each .clpi
+        // is read and each clip's extents resolved once per scan.
+        let mut memo = ClipMemo::new(udf_fs);
         // Cleared when a playlist that should be a title is lost or cut: any roster over
         // the rest is unproven.
         let mut complete = true;
         if let Some(playlist_dir) = udf_fs.find_dir("/BDMV/PLAYLIST") {
+            // The entry a path lookup of each name finds (the first of that name).
+            let by_name = udf::FileIndex::of(Some(playlist_dir));
             for entry in &playlist_dir.entries {
                 if halt.is_some_and(|h| h.is_cancelled()) {
                     return Err(Error::Halted);
@@ -41,8 +97,8 @@ impl Disc {
                     && entry.name.len() >= 5
                     && entry.name.as_bytes()[entry.name.len() - 5..].eq_ignore_ascii_case(b".mpls")
                 {
-                    let path = format!("/BDMV/PLAYLIST/{}", entry.name);
-                    let mpls_data = match udf_fs.read_file(reader, &path) {
+                    let file = by_name.get(&entry.name).unwrap_or(entry);
+                    let mpls_data = match udf_fs.read_entry(reader, file) {
                         Ok(data) => data,
                         // A cancel that lands on the LAST `.mpls` used to end
                         // the loop with nothing to show for it and still
@@ -66,7 +122,7 @@ impl Disc {
                         udf_fs,
                         &entry.name,
                         &mpls_data,
-                        &mut clip_pkts,
+                        &mut memo,
                         &mut complete,
                     )? {
                         titles.push(title);
@@ -101,19 +157,19 @@ impl Disc {
         filename: &str,
         data: &[u8],
     ) -> Result<Option<DiscTitle>> {
-        let mut clip_pkts = std::collections::HashMap::new();
-        Self::parse_playlist_memo(reader, udf_fs, filename, data, &mut clip_pkts, &mut true)
+        let mut memo = ClipMemo::new(udf_fs);
+        Self::parse_playlist_memo(reader, udf_fs, filename, data, &mut memo, &mut true)
     }
 
-    // As `parse_playlist`, with a caller-owned clip_id -> packet-count memo. Failures are never
-    // inserted, so a transient .clpi error is retried by the next playlist. Clears `complete`
+    // As `parse_playlist`, with a caller-owned per-clip memo. Failures are never inserted,
+    // so a transient .clpi or extent error is retried by the next playlist. Clears `complete`
     // when the playlist is unparseable, truncated or drops a clip; a sub-30s one is no loss.
     pub(super) fn parse_playlist_memo(
         reader: &mut dyn SectorSource,
         udf_fs: &udf::UdfFs,
         filename: &str,
         data: &[u8],
-        clip_pkts: &mut std::collections::HashMap<String, u32>,
+        memo: &mut ClipMemo<'_>,
         complete: &mut bool,
     ) -> Result<Option<DiscTitle>> {
         let parsed = match mpls::parse(data) {
@@ -129,7 +185,7 @@ impl Disc {
         if parsed.truncated {
             *complete = false;
         }
-        let title = Self::describe_playlist(reader, udf_fs, filename, &parsed, clip_pkts)?;
+        let title = Self::describe_playlist(reader, udf_fs, filename, &parsed, memo)?;
         // Below 30 s is filtered on purpose; any other miss lost a title.
         if title.is_none() && parsed.duration_ticks() as f64 / MPLS_TICKS_PER_SEC >= MIN_TITLE_SECS
         {
@@ -143,7 +199,7 @@ impl Disc {
         udf_fs: &udf::UdfFs,
         filename: &str,
         parsed: &mpls::Playlist,
-        clip_pkts: &mut std::collections::HashMap<String, u32>,
+        memo: &mut ClipMemo<'_>,
     ) -> Result<Option<DiscTitle>> {
         // Calculate duration from play items
         let duration_ticks: u64 = parsed
@@ -176,14 +232,14 @@ impl Disc {
         let mut feed_pos: u64 = 0;
         let mut spans: std::collections::HashMap<String, (u64, u64)> =
             std::collections::HashMap::new();
-        // `clip_pkts` memoizes the packet count per clip_id: neither a repeated PlayItem nor
+        // `memo.pkts` memoizes the packet count per clip_id: neither a repeated PlayItem nor
         // another playlist may re-read/re-parse a .clpi (hostile MPLS floods would never finish).
 
         for play_item in &parsed.play_items {
             let clip_dur =
                 play_item.out_time.saturating_sub(play_item.in_time) as f64 / MPLS_TICKS_PER_SEC;
 
-            let pkt_count: u32 = if let Some(&n) = clip_pkts.get(&play_item.clip_id) {
+            let pkt_count: u32 = if let Some(&n) = memo.pkts.get(&play_item.clip_id) {
                 n
             } else {
                 let clpi_path = format!("/BDMV/CLIPINF/{}.clpi", play_item.clip_id);
@@ -213,7 +269,7 @@ impl Disc {
                         return Ok(None);
                     }
                 };
-                clip_pkts.insert(play_item.clip_id.clone(), n);
+                memo.pkts.insert(play_item.clip_id.clone(), n);
                 n
             };
 
@@ -229,52 +285,23 @@ impl Disc {
                 // bytes are dropped downstream by PTS at the SeamPlan — see
                 // `SeamPlan::place` (src/mux/timeline.rs) `raw_ns >= in_ns && <= out_ns`.
                 let clpi_bytes = pkt_count as u64 * crate::consts::BD_SOURCE_PACKET_BYTES as u64;
+                // A clean resolution is memoized for every later playlist; a failed or
+                // fell-back one is retried (and logged) each time, as before the memo.
+                let (file_exts, from_ssif, unresolved) =
+                    match memo.exts.get(play_item.clip_id.as_str()) {
+                        Some((exts, ssif)) => (Some(std::sync::Arc::clone(exts)), *ssif, None),
+                        None => {
+                            let r = memo.resolve_extents(reader, udf_fs, &play_item.clip_id)?;
+                            if let (Some(exts), None) = (&r.0, r.2) {
+                                let hit = (std::sync::Arc::clone(exts), r.1);
+                                memo.exts.insert(play_item.clip_id.clone(), hit);
+                            }
+                            r
+                        }
+                    };
                 // The .ssif interleaves the dependent view, so the CLPI count (base
                 // view only) under-sizes what the extents deliver.
-                let mut from_ssif = false;
-
-                // Get stream file extents from UDF allocation descriptors (dual-
-                // layer discs split files across layers). Normally `.m2ts`; AACS 2.1
-                // uses `.fmts`, 3D interleaves both eyes in STREAM/SSIF/<clip>.ssif.
-                let ssif = format!("/BDMV/STREAM/SSIF/{}.ssif", play_item.clip_id);
-                // ABSENCE (`UdfNotFound`) is the only benign failure — the fallback
-                // exists for it. DiscRead/UdfAdChainTooLong/UdfEmbeddedData mean
-                // bytes are unresolved; `Halted` is the operator cancelling, propagated.
-                let mut unresolved: Option<u16> = None;
-                let mut halted = false;
-                let mut note = |e: &Error| {
-                    if matches!(e, Error::Halted) {
-                        halted = true;
-                    } else if !matches!(e, Error::UdfNotFound { .. }) {
-                        unresolved.get_or_insert(e.code());
-                    }
-                };
-                let file_exts = match udf_fs.file_extents(reader, &ssif) {
-                    Ok(exts) => {
-                        is_3d = true;
-                        from_ssif = true;
-                        Some(exts)
-                    }
-                    Err(e) => {
-                        note(&e);
-                        CLIP_STREAM_EXTS.iter().find_map(|ext| {
-                            let path = format!("/BDMV/STREAM/{}.{}", play_item.clip_id, ext);
-                            match udf_fs.file_extents(reader, &path) {
-                                Ok(exts) => Some(exts),
-                                Err(e) => {
-                                    note(&e);
-                                    None
-                                }
-                            }
-                        })
-                    }
-                };
-                // Propagate the cancel BEFORE the classification below, or the
-                // title is dropped (or emitted short) and the scan carries on
-                // as if the disc were at fault.
-                if halted {
-                    return Err(Error::Halted);
-                }
+                is_3d |= from_ssif;
                 // Nothing resolved AND a hole was the reason: drop the whole
                 // title, or the clip contributes no extents while durations/size
                 // still count it — data loss wearing the shape of a normal rip.
@@ -321,7 +348,7 @@ impl Disc {
                 // not closed since it's unclear that's always a defect (see hddvd.rs).
                 if let Some(file_exts) = file_exts {
                     let span_start = feed_pos;
-                    push_extents(file_exts, &mut extents, &mut feed_pos);
+                    push_extents(&file_exts, &mut extents, &mut feed_pos);
                     if feed_pos > span_start {
                         spans.insert(play_item.clip_id.clone(), (span_start, feed_pos));
                     }
@@ -577,8 +604,8 @@ impl Disc {
 
 /// Append each usable `(lba, sectors)` to `extents`, advancing `feed_pos` by its bytes. An extent
 /// with no sectors or at LBA 0 occupies no readable bytes and is skipped without moving `feed_pos`.
-fn push_extents(file_exts: Vec<(u32, u32)>, extents: &mut Vec<Extent>, feed_pos: &mut u64) {
-    for (lba, sectors) in file_exts {
+fn push_extents(file_exts: &[(u32, u32)], extents: &mut Vec<Extent>, feed_pos: &mut u64) {
+    for &(lba, sectors) in file_exts {
         if sectors > 0 && lba > 0 {
             extents.push(Extent {
                 start_lba: lba,

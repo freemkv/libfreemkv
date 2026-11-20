@@ -200,6 +200,28 @@ pub struct DirEntry {
     pub entries: Vec<DirEntry>,
 }
 
+/// A directory's files by ASCII-case-folded name, built once so repeated lookups are not
+/// linear scans. The first entry of a name wins, as the path lookup finds it.
+pub(crate) struct FileIndex<'a>(std::collections::HashMap<String, &'a DirEntry>);
+
+impl<'a> FileIndex<'a> {
+    /// The files (not subdirectories) of `dir`; empty when there is no such directory.
+    pub(crate) fn of(dir: Option<&'a DirEntry>) -> Self {
+        let mut map = std::collections::HashMap::new();
+        for e in dir.into_iter().flat_map(|d| &d.entries) {
+            if !e.is_dir {
+                map.entry(e.name.to_ascii_uppercase()).or_insert(e);
+            }
+        }
+        FileIndex(map)
+    }
+
+    /// The file named `name`, compared ASCII-case-insensitively.
+    pub(crate) fn get(&self, name: &str) -> Option<&'a DirEntry> {
+        self.0.get(&name.to_ascii_uppercase()).copied()
+    }
+}
+
 impl UdfFs {
     /// Test hook: relocate the physical partition (ICBs stay put via the metadata map).
     #[cfg(test)]
@@ -271,6 +293,16 @@ impl UdfFs {
         self.read_file_limited(reader, path, Some(max_bytes))
     }
 
+    /// [`Self::read_file`] of an entry the caller already holds (e.g. from a directory
+    /// listing), with no path lookup.
+    pub(crate) fn read_entry(
+        &self,
+        reader: &mut dyn SectorSource,
+        entry: &DirEntry,
+    ) -> Result<Vec<u8>> {
+        self.read_entry_limited(reader, entry, None)
+    }
+
     // Shared impl of read_file/read_file_prefix. When max_bytes is Some, reads
     // at most that many bytes and skips the MAX_FILE_BYTES cap (already bounded).
     fn read_file_limited(
@@ -280,7 +312,15 @@ impl UdfFs {
         max_bytes: Option<usize>,
     ) -> Result<Vec<u8>> {
         let entry = self.entry_at(path)?;
+        self.read_entry_limited(reader, entry, max_bytes)
+    }
 
+    fn read_entry_limited(
+        &self,
+        reader: &mut dyn SectorSource,
+        entry: &DirEntry,
+        max_bytes: Option<usize>,
+    ) -> Result<Vec<u8>> {
         // `max_bytes == None` => read the whole file; `Some(n)` => read at most
         // n bytes (rounded up to a sector) and skip the anti-DoS caps below.
         let limit = max_bytes.unwrap_or(usize::MAX);
@@ -899,8 +939,19 @@ impl UdfFs {
         reader: &mut dyn SectorSource,
         path: &str,
     ) -> Result<Vec<(u32, u32)>> {
-        let meta_lba = self.entry_at(path)?.meta_lba;
-        let abs = self.extents_abs_at(reader, meta_lba)?;
+        let entry = self.entry_at(path)?;
+        self.entry_extents(reader, entry, path)
+    }
+
+    /// [`Self::file_extents`] of an entry the caller already holds; `path` only names it
+    /// in an error.
+    pub(crate) fn entry_extents(
+        &self,
+        reader: &mut dyn SectorSource,
+        entry: &DirEntry,
+        path: &str,
+    ) -> Result<Vec<(u32, u32)>> {
+        let abs = self.extents_abs_at(reader, entry.meta_lba)?;
         // Refuse only a hole that OCCUPIES byte space (zero-length displaces
         // nothing, so `!recorded` alone wrongly drops fine titles). The hazard is
         // LENGTH: reading it splices undefined sectors in; dropping shifts later extents.
@@ -915,9 +966,13 @@ impl UdfFs {
     /// Resolve `path` to its directory entry. Shared by both extent
     /// resolvers so they cannot drift apart on lookup semantics.
     fn entry_at(&self, path: &str) -> Result<&DirEntry> {
-        let parts: Vec<&str> = path.trim_matches('/').split('/').collect();
+        let trimmed = path.trim_matches('/');
+        let (dirs, filename) = match trimmed.rsplit_once('/') {
+            Some((dirs, name)) => (Some(dirs), name),
+            None => (None, trimmed),
+        };
         let mut current = &self.root;
-        for part in &parts[..parts.len() - 1] {
+        for part in dirs.into_iter().flat_map(|d| d.split('/')) {
             current = current
                 .entries
                 .iter()
@@ -926,14 +981,6 @@ impl UdfFs {
                     path: part.to_string(),
                 })?;
         }
-        let filename = match parts.last() {
-            Some(f) => f,
-            None => {
-                return Err(Error::UdfNotFound {
-                    path: path.to_string(),
-                });
-            }
-        };
         current
             .entries
             .iter()

@@ -2442,6 +2442,25 @@ fn scan_bluray_titles_reads_shared_clpi_once_across_playlists() {
     assert_eq!(w.hits, 1, "shared .clpi re-read per playlist");
 }
 
+// N playlists naming one clip resolve its stream extents once per scan: the clip's
+// File Entry is read once, and every title gets the same extents.
+#[test]
+fn scan_bluray_titles_resolves_shared_clip_extents_once() {
+    let mut disc = MemDisc::new();
+    let udf = two_playlist_bd_fs(&mut disc);
+    let mut w = LbaWatch {
+        inner: disc,
+        lba: PART_START + 100,
+        hits: 0,
+    };
+    let titles = Disc::scan_bluray_titles(&mut w, &udf, None).expect("scan");
+    assert_eq!(titles.len(), 2);
+    assert_eq!(w.hits, 1, "shared clip's extents re-resolved per playlist");
+    assert_eq!(titles[0].extents, titles[1].extents);
+    assert_eq!(titles[0].size_bytes, titles[1].size_bytes);
+    assert!(!titles[0].extents.is_empty());
+}
+
 // The scan reads only a .clpi's header sector: the CPI/EP map behind it is never read,
 // and the packet count (so the title size) is the one a full parse gives.
 #[test]
@@ -2551,7 +2570,7 @@ fn push_extents_drops_empty_and_lba_zero_extents_without_advancing() {
     let mut extents = Vec::new();
     let mut pos = 0u64;
     push_extents(
-        vec![(100, 2), (200, 0), (0, 5), (300, 3)],
+        &[(100, 2), (200, 0), (0, 5), (300, 3)],
         &mut extents,
         &mut pos,
     );
@@ -2567,7 +2586,7 @@ fn push_extents_drops_empty_and_lba_zero_extents_without_advancing() {
 fn push_extents_drops_zero_sector_extent_alone() {
     let mut extents = Vec::new();
     let mut pos = 0u64;
-    push_extents(vec![(200, 0), (300, 1)], &mut extents, &mut pos);
+    push_extents(&[(200, 0), (300, 1)], &mut extents, &mut pos);
     assert_eq!(extents.len(), 1);
     assert_eq!(pos, 2048);
 }
@@ -2576,7 +2595,7 @@ fn push_extents_drops_zero_sector_extent_alone() {
 fn push_extents_drops_lba_zero_extent_alone() {
     let mut extents = Vec::new();
     let mut pos = 0u64;
-    push_extents(vec![(0, 4), (300, 1)], &mut extents, &mut pos);
+    push_extents(&[(0, 4), (300, 1)], &mut extents, &mut pos);
     assert_eq!(extents.len(), 1);
     assert_eq!(pos, 2048);
 }

@@ -4646,3 +4646,35 @@ fn metadata_partition_map_checks_type_length_and_identifier() {
         "not the metadata identifier"
     );
 }
+
+// The directory index finds a file as the path lookup does: ASCII-case-insensitively,
+// the first entry of a name, never a subdirectory.
+#[test]
+fn file_index_matches_the_path_lookup() {
+    let mut first = file_entry("00001.m2ts", 10, 2048);
+    first.size = 1;
+    let mut dup = file_entry("00001.M2TS", 11, 2048);
+    dup.size = 2;
+    let dir = DirEntry {
+        name: "STREAM".to_string(),
+        is_dir: true,
+        meta_lba: 1,
+        size: 0,
+        entries: vec![
+            DirEntry {
+                name: "SSIF".to_string(),
+                is_dir: true,
+                meta_lba: 2,
+                size: 0,
+                entries: Vec::new(),
+            },
+            first,
+            dup,
+        ],
+    };
+    let idx = FileIndex::of(Some(&dir));
+    assert_eq!(idx.get("00001.M2ts").map(|e| e.size), Some(1));
+    assert!(idx.get("ssif").is_none(), "a subdirectory is not a file");
+    assert!(idx.get("00002.m2ts").is_none());
+    assert!(FileIndex::of(None).get("00001.m2ts").is_none());
+}
