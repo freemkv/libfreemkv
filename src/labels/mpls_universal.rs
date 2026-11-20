@@ -61,6 +61,11 @@ pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> 
         if labels.len() >= MAX_MPLS_LABELS {
             break;
         }
+        // The scan already parsed most playlists: reuse its STN tables, no second read.
+        if let Some(p) = take_stashed(name) {
+            add_stream_labels(p.clip0.as_deref(), &p.streams, &mut labels, &mut seen);
+            continue;
+        }
         let path = format!("/BDMV/PLAYLIST/{}", name);
         let Ok(data) = udf.read_file(reader, &path) else {
             continue;
@@ -97,11 +102,87 @@ fn add_playlist_labels(
     labels: &mut Vec<StreamLabel>,
     seen: &mut HashSet<super::StreamId>,
 ) {
+    let clip0 = playlist.play_items.first().map(|pi| pi.clip_id.as_str());
+    add_stream_labels(clip0, &playlist.streams, labels, seen);
+}
+
+// What `parse` needs of one playlist the scan parsed: its first PlayItem's clip and its STN.
+pub(crate) struct PlaylistStreams {
+    clip0: Option<String>,
+    streams: Vec<crate::mpls::StreamEntry>,
+}
+
+// Cap on STN entries the stash holds; past it a playlist is read again, as before.
+const MAX_STASHED_ENTRIES: usize = 65_536;
+
+#[derive(Default)]
+struct Stash {
+    by_name: std::collections::HashMap<String, PlaylistStreams>,
+    entries: usize,
+}
+
+thread_local! {
+    // Active only inside a scan's `stash_scope`.
+    static STASH: std::cell::RefCell<Option<Stash>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Holds the playlist stash open; dropping it clears the stash.
+pub(crate) struct StashScope(bool);
+
+impl Drop for StashScope {
+    fn drop(&mut self) {
+        if self.0 {
+            STASH.with(|s| *s.borrow_mut() = None);
+        }
+    }
+}
+
+/// Open the per-scan playlist stash: the BD title scan stashes each playlist it parses
+/// and [`parse`] takes it instead of reading and parsing the `.mpls` again.
+pub(crate) fn stash_scope() -> StashScope {
+    StashScope(STASH.with(|s| {
+        let mut s = s.borrow_mut();
+        let fresh = s.is_none();
+        if fresh {
+            *s = Some(Stash::default());
+        }
+        fresh
+    }))
+}
+
+/// Keep `playlist`'s first clip and STN table under its file `name`, when a scope is open.
+pub(crate) fn stash_playlist(name: &str, playlist: crate::mpls::Playlist) {
+    STASH.with(|s| {
+        let mut s = s.borrow_mut();
+        let Some(stash) = s.as_mut() else { return };
+        let n = playlist.streams.len();
+        if stash.entries.saturating_add(n) > MAX_STASHED_ENTRIES {
+            return;
+        }
+        stash.entries += n;
+        let clip0 = playlist.play_items.into_iter().next().map(|pi| pi.clip_id);
+        let streams = playlist.streams;
+        stash
+            .by_name
+            .insert(name.to_string(), PlaylistStreams { clip0, streams });
+    });
+}
+
+fn take_stashed(name: &str) -> Option<PlaylistStreams> {
+    STASH.with(|s| s.borrow_mut().as_mut()?.by_name.remove(name))
+}
+
+fn add_stream_labels(
+    clip0: Option<&str>,
+    streams: &[crate::mpls::StreamEntry],
+    labels: &mut Vec<StreamLabel>,
+    seen: &mut HashSet<super::StreamId>,
+) {
     {
         // `Playlist::streams` is the FIRST play item's STN table, so every entry
         // here is a stream of that play item's clip, matching `disc::bluray`'s
         // `clips[0]` — that pairing is what makes the PID an identity.
-        let Some(clip_id) = playlist.play_items.first().map(|pi| pi.clip_id.clone()) else {
+        let Some(clip_id) = clip0.map(str::to_string) else {
             return;
         };
 
@@ -111,7 +192,7 @@ fn add_playlist_labels(
         let mut audio_idx: u16 = 0;
         let mut sub_idx: u16 = 0;
 
-        for entry in &playlist.streams {
+        for entry in streams {
             let Some(label_type) = label_type_for(entry) else {
                 continue;
             };

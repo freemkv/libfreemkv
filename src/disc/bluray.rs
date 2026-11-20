@@ -191,6 +191,8 @@ impl Disc {
         {
             *complete = false;
         }
+        // The labels pass reuses this STN table instead of reading the playlist again.
+        crate::labels::stash_playlist(filename, parsed);
         Ok(title)
     }
 

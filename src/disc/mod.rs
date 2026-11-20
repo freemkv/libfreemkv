@@ -2656,6 +2656,8 @@ impl Disc {
             Some((cap, bus)) => encrypt::resolve_aacs(cap, &bus),
             None => (None, None),
         };
+        // Playlists the title scan parses are kept for the labels pass below (one parse).
+        let _playlist_stash = crate::labels::stash_scope();
 
         // 3. Titles + container — dispatched by on-disc tree (HD-DVD/DVD peers,
         // FMTS shares the BD tree; FORMAT is a separate axis derived below). DVD

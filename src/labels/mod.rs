@@ -19,6 +19,7 @@ pub(crate) mod deluxe;
 pub(crate) mod fox;
 pub(crate) mod jar;
 mod mpls_universal;
+pub(crate) use mpls_universal::{stash_playlist, stash_scope};
 mod paramount;
 mod pixelogic;
 mod png_filenames;

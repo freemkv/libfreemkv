@@ -610,3 +610,60 @@ fn normalize_language_lowercases_and_trims() {
     // An unknown code keeps its trimmed lowercase form.
     assert_eq!(normalize_language(" XYZ "), "xyz");
 }
+
+// Inside a scan's stash scope `parse` takes the playlists the title scan parsed instead of
+// reading them again: the same tables give the same labels, and a stashed table is used.
+#[test]
+fn parse_reuses_the_scans_stashed_playlists() {
+    use crate::udf::fixture::*;
+    let files = vec![
+        file_with("00800.mpls", 32, 8200, mpls_bytes(b"00001", 0x1100), false),
+        file_with("00801.mpls", 33, 8300, b"not an mpls".to_vec(), false),
+        file_with("00802.mpls", 34, 8400, mpls_bytes(b"00002", 0x1101), false),
+    ];
+    let root = DirSpec {
+        name: String::new(),
+        icb_lba: 10,
+        dir_data_lba: 11,
+        files: Vec::new(),
+        subdirs: vec![DirSpec {
+            name: "BDMV".to_string(),
+            icb_lba: 20,
+            dir_data_lba: 21,
+            files: Vec::new(),
+            subdirs: vec![DirSpec {
+                name: "PLAYLIST".to_string(),
+                icb_lba: 30,
+                dir_data_lba: 31,
+                files,
+                subdirs: vec![],
+            }],
+        }],
+    };
+    let mut disc = MemDisc::new();
+    build_udf_skeleton(&mut disc, 10);
+    lay_dir(&mut disc, &root);
+    let udf = crate::udf::read_filesystem(&mut disc).expect("fs");
+    let fresh = format!("{:?}", parse(&mut disc, &udf).expect("labels").labels);
+    let parsed = |clip: &[u8; 5], pid| crate::mpls::parse(&mpls_bytes(clip, pid)).expect("mpls");
+    {
+        let _scope = stash_scope();
+        stash_playlist("00800.mpls", parsed(b"00001", 0x1100));
+        stash_playlist("00802.mpls", parsed(b"00002", 0x1101));
+        let reused = format!("{:?}", parse(&mut disc, &udf).expect("labels").labels);
+        assert_eq!(reused, fresh, "the stashed tables gave different labels");
+    }
+    {
+        let _scope = stash_scope();
+        stash_playlist("00800.mpls", parsed(b"00777", 0x1500));
+        let got = parse(&mut disc, &udf).expect("labels").labels;
+        assert!(
+            got.iter()
+                .any(|l| l.stream_id.as_ref().is_some_and(|id| id.clip_id == "00777")),
+            "the stashed table was not used: {got:?}"
+        );
+    }
+    stash_playlist("00800.mpls", parsed(b"00777", 0x1500));
+    let after = format!("{:?}", parse(&mut disc, &udf).expect("labels").labels);
+    assert_eq!(after, fresh, "the stash outlived its scope");
+}
