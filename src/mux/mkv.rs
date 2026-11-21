@@ -1919,15 +1919,12 @@ impl<W: Write + Seek> MkvMuxer<W> {
         // picture) or an MVC dependent view (a non-key base frame also gets its
         // ReferenceBlock, so a player never seeks to a P/B frame); else a SimpleBlock.
         if discard_padding_ns != 0 || block_additional.is_some() || duration_ticks.is_some() {
-            self.write_block_group(
-                track_idx + 1,
-                relative_ts,
-                data,
+            let extras = BlockExtras {
                 reference,
                 duration_ticks,
-                block_additional,
                 discard_padding_ns,
-            )?;
+            };
+            self.write_block_group(track_idx + 1, relative_ts, data, extras, block_additional)?;
         } else {
             self.write_simple_block(track_idx + 1, relative_ts, keyframe, data)?;
         }
@@ -2435,16 +2432,13 @@ impl<W: Write + Seek> MkvMuxer<W> {
     // Write a BlockGroup with no seek and no payload copy: its small head and trailer are
     // built in the reused scratch buffer, the frame and MVC dependent AU are written
     // straight from their slices in between: the same bytes as one contiguous write.
-    #[allow(clippy::too_many_arguments)]
     fn write_block_group(
         &mut self,
         track_num: usize,
         relative_ts: i16,
         data: &[u8],
-        reference: Option<i64>,
-        duration_ticks: Option<u64>,
+        extras: BlockExtras,
         additional: Option<&[u8]>,
-        discard_padding_ns: i64,
     ) -> io::Result<()> {
         let mut buf = std::mem::take(&mut self.block_group_buf);
         buf.clear();
@@ -2453,10 +2447,8 @@ impl<W: Write + Seek> MkvMuxer<W> {
             track_num,
             relative_ts,
             data.len(),
-            reference,
-            duration_ticks,
+            extras,
             additional.map(<[u8]>::len),
-            discard_padding_ns,
         )
         .and_then(|head| {
             let mut out = self.out();
@@ -2476,17 +2468,19 @@ impl<W: Write + Seek> MkvMuxer<W> {
     // Assemble a BlockGroup into `buf` minus its two payloads: the frame (`data_len`
     // bytes) goes at the returned split, the MVC dependent AU (`additional_len`, as
     // BlockAdditions > BlockMore { BlockAddID=2, BlockAdditional }) after the buffer.
-    #[allow(clippy::too_many_arguments)]
     fn build_block_group(
         buf: &mut Vec<u8>,
         track_num: usize,
         relative_ts: i16,
         data_len: usize,
-        reference: Option<i64>,
-        duration_ticks: Option<u64>,
+        extras: BlockExtras,
         additional_len: Option<usize>,
-        discard_padding_ns: i64,
     ) -> io::Result<usize> {
+        let BlockExtras {
+            reference,
+            duration_ticks,
+            discard_padding_ns,
+        } = extras;
         let (tv, tv_len) = track_vint(track_num);
         let track_vint = &tv[..tv_len];
         // The 0x80 Keyframe flag is SimpleBlock-only; inside a BlockGroup Block
@@ -2524,6 +2518,14 @@ impl<W: Write + Seek> MkvMuxer<W> {
         ebml::end_master_buf_with(buf, bg_pos, data_len as u64 + outside)?;
         Ok(head)
     }
+}
+
+// The BlockGroup elements beside the Block: ReferenceBlock, BlockDuration, DiscardPadding.
+#[derive(Clone, Copy)]
+struct BlockExtras {
+    reference: Option<i64>,
+    duration_ticks: Option<u64>,
+    discard_padding_ns: i64,
 }
 
 // ============================================================ Helpers.

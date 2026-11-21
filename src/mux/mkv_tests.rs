@@ -5709,8 +5709,13 @@ fn scatter_block_group_matches_the_contiguous_build() {
                     let want =
                         contiguous_block_group(track, -7, data, reference, duration, add, pad);
                     let mut buf = Vec::new();
+                    let extras = BlockExtras {
+                        reference,
+                        duration_ticks: duration,
+                        discard_padding_ns: pad,
+                    };
                     let head = MkvMuxer::<Cursor<Vec<u8>>>::build_block_group(
-                        &mut buf, track, -7, len, reference, duration, add_len, pad,
+                        &mut buf, track, -7, len, extras, add_len,
                     )
                     .unwrap();
                     let mut got = buf[..head].to_vec();
