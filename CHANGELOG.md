@@ -1,5 +1,24 @@
 # Changelog
 
+## [1.8.11] — UNRELEASED
+
+### Changed
+
+- Stream languages are held as `Lang` and clip ids as a shared `ClipId`. Generated stream labels, the episode roster, MKB and title-key data, and DVD VobSub palettes are shared instead of copied per title or stream.
+
+### Performance
+
+- Muxing: MKV cluster sizes are patched once at finish, and BlockGroups and SimpleBlock headers are written without scratch copies. Demux parsers work in place, and the TS and PS demuxers no longer copy payloads. Audio framers read through a cursor, and the AC-3, FLAC and TrueHD CRC checks use a table. Per-track MKV state uses slots instead of HashMaps.
+- ISO muxing reads 3 MiB batches instead of 16 MiB, and image reads overlap with the previous batch's decrypt.
+- Decrypt: AACS, HD DVD and CSS decrypt skip per-read allocations, build each unit key's AES schedule once per read, decrypt CBC batches from the ciphertext, and fan out across the pool only for large buffers.
+- Scans read only the CLPI header, read each BD-J jar once, memoize clip extents across playlists and keep the prefetch cache as contiguous runs. Quadratic work in key pieces, title sorts and chapter times is gone.
+- Wrong keys in acquisition proofs are rejected without a full decrypt.
+- ISO sectors are read with one positioned read and no readahead. `write_image` overlaps reads and writes, and DirImage sectors are written once.
+
+### Testing
+
+- Added decrypt, end-to-end ISO read, demux, MKV write, audio framer and scan benches, plus many pinning tests.
+
 ## [1.8.10] — 2026-11-17
 
 ### Added
