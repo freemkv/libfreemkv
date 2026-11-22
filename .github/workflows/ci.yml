@@ -79,7 +79,7 @@ jobs:
         with:
           toolchain: ${{ needs.resolve-msrv.outputs.v }}
           components: rustfmt
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           workspaces: libfreemkv
       - run: cargo fmt --check
@@ -105,7 +105,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ needs.resolve-msrv.outputs.v }}
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           workspaces: libfreemkv
       - run: cargo test --tests
@@ -151,7 +151,7 @@ jobs:
         with:
           toolchain: ${{ needs.resolve-msrv.outputs.v }}
           components: clippy
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           workspaces: libfreemkv
       - run: cargo test --lib --no-default-features --features scsi fd_handoff
@@ -236,7 +236,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           workspaces: |
             freemkv-keysources
@@ -272,13 +272,13 @@ jobs:
         with:
           toolchain: ${{ needs.resolve-msrv.outputs.v }}
           components: llvm-tools-preview
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           workspaces: libfreemkv
-      - uses: taiki-e/install-action@72f835688cb6c15903b796f704b01e652a2b8835 # cargo-llvm-cov
+      - uses: taiki-e/install-action@4ce04ff71051d1d43b3c1166c70c1e8a958d8dc9 # cargo-llvm-cov
       - run: cargo llvm-cov --workspace --lcov --output-path lcov.info
         working-directory: libfreemkv
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: coverage-lcov
           path: libfreemkv/lcov.info
