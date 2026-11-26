@@ -32,7 +32,7 @@ This is a hardware + firmware problem, not a software bug. The same drive connec
 ### Known Affected Bridges
 
 | Chipset | USB IDs | Notes |
-|---------|---------|-------|
+| --------- | --------- | ------- |
 | Initio INIC-3609 | `13fd:3609` | Very common in cheap SATA-to-USB enclosures. Highly problematic. |
 | Initio INIC-3619 | `13fd:3940` | Same firmware family as INIC-3609. |
 | Initio INIC-3069 | `13fd:0840` | Older variant, same residue bug. |
@@ -62,14 +62,14 @@ Here the vendor ID is `13fd` and the product ID is `0840`.
 **Step 2: Apply the quirk at runtime.**
 
 ```bash
-echo "13fd:0840:i" > /sys/module/usb_storage/parameters/quirks
+echo "13fd:0840:r" > /sys/module/usb_storage/parameters/quirks
 ```
 
-Replace `13fd:0840` with your device's actual IDs. The `:i` flag means `US_FL_IGNORE_RESIDUE`.
+Replace `13fd:0840` with your device's actual IDs. The `:r` flag means `US_FL_IGNORE_RESIDUE`.
 
 You can combine multiple flags. Common additions:
 
-- `:i` -- ignore residue (`US_FL_IGNORE_RESIDUE`)
+- `:r` -- ignore residue (`US_FL_IGNORE_RESIDUE`)
 - `:u` -- force BOT mode instead of UAS, for bridges with UAS bugs
 
 **Step 3: Reconnect the drive.** Unplug and replug the USB cable, or bind/unbind the device. The quirk is applied per-module-load, so existing sessions may need the drive reconnected.
@@ -81,7 +81,7 @@ Add the quirk to your kernel boot parameters so it survives reboots.
 Edit `/etc/default/grub` (GRUB) and add to `GRUB_CMDLINE_LINUX_DEFAULT`:
 
 ```
-GRUB_CMDLINE_LINUX_DEFAULT="quiet usb_storage.quirks=13fd:0840:i"
+GRUB_CMDLINE_LINUX_DEFAULT="quiet usb_storage.quirks=13fd:0840:r"
 ```
 
 Then rebuild the GRUB config:
@@ -93,13 +93,13 @@ sudo update-grub
 For systemd-boot, add to your loader entry or `/etc/kernel/cmdline`:
 
 ```
-usb_storage.quirks=13fd:0840:i
+usb_storage.quirks=13fd:0840:r
 ```
 
 Multiple devices can be separated by commas:
 
 ```
-usb_storage.quirks=13fd:0840:i,174c:5106:u
+usb_storage.quirks=13fd:0840:r,174c:5106:u
 ```
 
 ### Recommended Bridges
@@ -107,7 +107,7 @@ usb_storage.quirks=13fd:0840:i,174c:5106:u
 If you are buying a USB-SATA adapter or enclosure for optical drive use:
 
 | Bridge | USB IDs | Notes |
-|--------|---------|-------|
+| -------- | --------- | ------- |
 | ASMedia ASM1153 | `174c:1153` | Reliable. Widely available in SATA-USB 3.0 cables. |
 | JMicron JMS578 | `152d:0578` | Good firmware. Supports UASP. |
 | Icy Box IB-AC640-C3 | N/A | Uses a known-good bridge internally. Plug-and-play. |
@@ -196,6 +196,7 @@ dmesg | grep -i sg | tail -10
 ```
 
 Look for:
+
 - USB enumeration errors or failed port resets.
 - `sg_add` messages confirming the sg device was registered.
 - Permission denied or access errors.
@@ -269,7 +270,7 @@ Bus 002 Device 007: ID 152d:0578 JMicron Technology Corp. JMS578
 ### Step 2: Match the IDs
 
 | Vendor | Product ID | Chipset | Status |
-|--------|-----------|---------|--------|
+| -------- | ----------- | --------- | -------- |
 | `13fd` | `3609` | Initio INIC-3609 | Affected. Apply quirk. |
 | `13fd` | `3940` | Initio INIC-3619 | Affected. Apply quirk. |
 | `13fd` | `0840` | Initio INIC-3069 | Affected. Apply quirk. |
